@@ -1,0 +1,141 @@
+From db0edce6476dc67ececf93be2c39a35f02a893cd Mon Sep 17 00:00:00 2001
+From: vphone <vphone@localhost>
+Date: Mon, 9 Nov 2026 03:15:08 +0530
+Subject: [PATCH 5/6] tu: Implement VK_EXT_fragment_shader_interlock
+
+The hardware has no critical-section instruction. Vulkan defines the
+interlock's order through rasterization order, which is per primitive in
+primitive order. A pipeline with an interlock runs under SINGLE_PRIM_MODE
+(FLUSH_PER_OVERLAP in GMEM, FLUSH_PER_OVERLAP_AND_OVERWRITE in sysmem),
+which waits for an overlapping earlier primitive's pending work and
+invalidates UCHE. Begin/end interlock are memory barriers so a critical
+section's stores complete before the invocation does. An interlocked draw
+is preceded by a wait for idle and cache invalidate so that the order
+also holds across draws.
+
+Not exposed before a7xx; shading-rate interlock is not implemented.
+
+Generated-by: LLM
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc | 10 ++++++++++
+ src/freedreno/vulkan/tu_device.cc     |  8 ++++++++
+ src/freedreno/vulkan/tu_pipeline.cc   |  8 +++++++-
+ src/freedreno/vulkan/tu_shader.cc     | 10 ++++++++++
+ src/freedreno/vulkan/tu_shader.h      |  3 +++
+ 5 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index ca3fca595d5..3336dc1d81c 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -8674,6 +8674,16 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+    if (cmd->state.dirty & TU_CMD_DIRTY_FS)
+       tu_flush_dynamic_input_attachments<CHIP>(cmd);
+ 
++   /* SINGLE_PRIM_MODE orders overlapping primitives; rasterization order
++    * also runs across draws, so wait for the previous draw's critical
++    * sections and drop what the caches hold before an interlocked draw.
++    */
++   if (cmd->state.shaders[MESA_SHADER_FRAGMENT] &&
++       cmd->state.shaders[MESA_SHADER_FRAGMENT]->fs.uses_interlock) {
++      cmd->state.renderpass_cache.flush_bits |=
++         TU_CMD_FLAG_WAIT_FOR_IDLE | TU_CMD_FLAG_CACHE_INVALIDATE;
++   }
++
+    tu_emit_cache_flush_renderpass<CHIP>(cmd);
+ 
+   if (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index ccd1494fbad..530d945b808 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -346,6 +346,7 @@ get_device_extensions(const struct tu_physical_device *device,
+       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
+       .EXT_fragment_density_map = true,
+       .EXT_fragment_density_map_offset = true,
++      .EXT_fragment_shader_interlock = device->info->chip >= 7,
+       .EXT_global_priority = true,
+       .EXT_global_priority_query = true,
+       .EXT_graphics_pipeline_library = true,
+@@ -869,6 +870,13 @@ tu_get_features(struct tu_physical_device *pdevice,
+    features->robustImageAccess2 = true;
+    features->nullDescriptor = true;
+ 
++   /* VK_EXT_fragment_shader_interlock */
++   features->fragmentShaderSampleInterlock =
++      pdevice->vk.supported_extensions.EXT_fragment_shader_interlock;
++   features->fragmentShaderPixelInterlock =
++      pdevice->vk.supported_extensions.EXT_fragment_shader_interlock;
++   features->fragmentShaderShadingRateInterlock = false;
++
+    /* VK_EXT_shader_atomic_float */
+    features->shaderBufferFloat32Atomics = true;
+    features->shaderBufferFloat32AtomicAdd = false;
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 5b5dbab8edc..27ce7cdbf4d 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3823,7 +3823,8 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+     */
+    enum a6xx_single_prim_mode sysmem_prim_mode =
+       (raster_order_attachment_access || feedback_loops ||
+-       fs->fs.dynamic_input_attachments_used) ?
++       fs->fs.dynamic_input_attachments_used ||
++       fs->fs.uses_interlock) ?
+       FLUSH_PER_OVERLAP_AND_OVERWRITE : NO_FLUSH;
+ 
+    if (sysmem_prim_mode == FLUSH_PER_OVERLAP_AND_OVERWRITE)
+@@ -4466,6 +4467,11 @@ tu_pipeline_builder_parse_rasterization_order(
+       pipeline->ds.raster_order_attachment_access ||
+       TU_DEBUG(RAST_ORDER);
+ 
++   /* VK_EXT_fragment_shader_interlock: order overlapping primitives. */
++   if (pipeline->shaders[MESA_SHADER_FRAGMENT] &&
++       pipeline->shaders[MESA_SHADER_FRAGMENT]->fs.uses_interlock)
++      raster_order_attachment_access = true;
++
+    /* VK_EXT_blend_operation_advanced would also require ordered access
+     * when implemented in the future.
+     */
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 1c9cc0f1030..1cf56093886 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3634,6 +3634,9 @@ tu_lower_nir(struct tu_device *dev,
+       NIR_PASS(_, nir, tu_nir_lower_layered_fdm, &info->per_layer_viewport);
+    }
+ 
++   if (nir->info.stage == MESA_SHADER_FRAGMENT)
++      NIR_PASS(_, nir, lower_interlock);
++
+    /* Note that nir_opt_barrier_modes here breaks tests such as
+     * dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_atomic.atomicwrite.device.payload_local.image.guard_local.buffer.vert
+     */
+@@ -3791,6 +3794,13 @@ tu_shader_create(struct tu_device *dev,
+    }
+ 
+    struct ir3_const_allocations const_allocs = {};
++   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
++      shader->fs.uses_interlock = nir->info.fs.pixel_interlock_ordered ||
++                                  nir->info.fs.pixel_interlock_unordered ||
++                                  nir->info.fs.sample_interlock_ordered ||
++                                  nir->info.fs.sample_interlock_unordered;
++   }
++
+    NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
+             key->read_only_input_attachments, key->dynamic_renderpass,
+             &const_allocs);
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index e729d44d4a0..1f418049b45 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -108,6 +108,9 @@ struct tu_shader
+ 
+          uint16_t dynamic_input_attachments_used;
+ 
++         /* The shader uses VK_EXT_fragment_shader_interlock. */
++         bool uses_interlock;
++
+          struct {
+             uint32_t status;
+             bool force_late_z;

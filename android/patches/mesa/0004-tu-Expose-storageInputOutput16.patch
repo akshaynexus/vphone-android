@@ -1,0 +1,146 @@
+From 5bfe80a92565e12735e12e28685ff24b8989083b Mon Sep 17 00:00:00 2001
+From: vphone <vphone@localhost>
+Date: Mon, 9 Nov 2026 03:15:08 +0530
+Subject: [PATCH 4/6] tu: Expose storageInputOutput16
+
+Stage IO in Adreno is 32-bit apart from smooth FS inputs and float FS
+color outputs, which have half registers (the path GL mediump uses).
+Everything else is stored as 32 bits, which occupies the same locations
+and components, and converted at the access. Transform feedback can only
+capture 32-bit and 64-bit components (VUID-StandaloneSpirv-Offset-04692).
+
+Generated-by: LLM
+---
+ src/freedreno/vulkan/tu_device.cc |  2 +-
+ src/freedreno/vulkan/tu_shader.cc | 98 +++++++++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index cdf4e1999ae..ccd1494fbad 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -509,7 +509,7 @@ tu_get_features(struct tu_physical_device *pdevice,
+    features->storageBuffer16BitAccess            = pdevice->info->props.storage_16bit;
+    features->uniformAndStorageBuffer16BitAccess  = false;
+    features->storagePushConstant16               = false;
+-   features->storageInputOutput16                = false;
++   features->storageInputOutput16                = pdevice->info->chip >= 7;
+    features->multiview                           = true;
+    /* Multiview + GS seems to hang on a6xx. We also don't yet support the
+     * required emulation of multiview masks with geometry shaders on early
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 103790a4433..1c9cc0f1030 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2083,6 +2083,102 @@ tu_nir_lower_view_to_zero(nir_shader *shader)
+                                         lower_view_to_zero, NULL);
+ }
+ 
++/* OpBegin/EndInvocationInterlockEXT. Rasterization-order exclusion between
++ * primitives comes from SINGLE_PRIM_MODE (see tu6_emit_prim_mode_sysmem and
++ * tu_pipeline_builder_parse_rasterization_order), which waits for overlapping
++ * prior work and invalidates UCHE, and tu6_draw_common orders interlocked
++ * draws against each other. What remains is in the shader: a store in the
++ * critical section must have reached memory before the invocation ends, and
++ * nothing may move across either boundary.
++ */
++static bool
++lower_interlock_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_begin_invocation_interlock &&
++       intr->intrinsic != nir_intrinsic_end_invocation_interlock)
++      return false;
++
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_barrier(b, .execution_scope = SCOPE_NONE,
++               .memory_scope = SCOPE_QUEUE_FAMILY,
++               .memory_semantics = NIR_MEMORY_ACQ_REL,
++               .memory_modes = nir_var_mem_ssbo | nir_var_image |
++                               nir_var_mem_global);
++   nir_instr_remove(&intr->instr);
++   return true;
++}
++
++static bool
++lower_interlock(nir_shader *shader)
++{
++   return nir_shader_intrinsics_pass(shader, lower_interlock_instr,
++                                     nir_metadata_control_flow, NULL);
++}
++
++/* Hardware has no 16-bit path for stage IO other than smooth fragment inputs
++ * and float color outputs: the attribute fetch, the flat.b varying fetch and
++ * tess/geometry shared storage are all 32-bit. Other 16-bit IO is stored as
++ * 32 bits, which uses the same locations and components (a 16-bit component
++ * consumes one 32-bit component), and converted at the access.
++ */
++static bool
++lower_16bit_io_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_interpolated_input:
++      return false; /* bary.f can write a half register */
++   case nir_intrinsic_load_input:
++   case nir_intrinsic_load_per_vertex_input:
++   case nir_intrinsic_load_output:
++   case nir_intrinsic_load_per_vertex_output: {
++      if (intr->def.bit_size != 16)
++         return false;
++
++      nir_alu_type type16 = nir_intrinsic_dest_type(intr);
++      nir_alu_type base = nir_alu_type_get_base_type(type16);
++      b->cursor = nir_after_instr(&intr->instr);
++      intr->def.bit_size = 32;
++      nir_intrinsic_set_dest_type(intr, (nir_alu_type)(base | 32));
++      nir_def *value = nir_type_convert(b, &intr->def, (nir_alu_type)(base | 32),
++                                        (nir_alu_type)(base | 16),
++                                        nir_rounding_mode_undef);
++      nir_def_rewrite_uses_after(&intr->def, value);
++      return true;
++   }
++   case nir_intrinsic_store_output:
++   case nir_intrinsic_store_per_view_output:
++   case nir_intrinsic_store_per_vertex_output: {
++      if (nir_src_bit_size(intr->src[0]) != 16)
++         return false;
++
++      nir_alu_type type16 = nir_intrinsic_src_type(intr);
++      nir_alu_type base = nir_alu_type_get_base_type(type16);
++      /* The render target takes a half-precision color register. */
++      if (b->shader->info.stage == MESA_SHADER_FRAGMENT &&
++          base == nir_type_float)
++         return false;
++
++      b->cursor = nir_before_instr(&intr->instr);
++      nir_def *value = nir_type_convert(b, intr->src[0].ssa,
++                                        (nir_alu_type)(base | 16),
++                                        (nir_alu_type)(base | 32),
++                                        nir_rounding_mode_undef);
++      nir_src_rewrite(&intr->src[0], value);
++      nir_intrinsic_set_src_type(intr, (nir_alu_type)(base | 32));
++      return true;
++   }
++   default:
++      return false;
++   }
++}
++
++static bool
++lower_16bit_io(nir_shader *shader)
++{
++   return nir_shader_intrinsics_pass(shader, lower_16bit_io_instr,
++                                     nir_metadata_control_flow, NULL);
++}
++
+ static bool
+ lower_alpha_to_coverage(nir_shader *shader)
+ {
+@@ -3651,6 +3747,8 @@ tu_lower_nir(struct tu_device *dev,
+ 
+    ir3_nir_lower_io(nir);
+ 
++   NIR_PASS(_, nir, lower_16bit_io);
++
+    if (key->emulate_alpha_to_coverage)
+       lower_alpha_to_coverage(nir);
+ }

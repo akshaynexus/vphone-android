@@ -1,0 +1,2304 @@
+diff --git a/crates/reims-ctl/src/gpu.rs b/crates/reims-ctl/src/gpu.rs
+index 4163d61b0a0597a2ee711264b3b4884d08221565..908d7e3cc2d38b409a6994b23c0300bf4e891bc8 100644
+--- a/crates/reims-ctl/src/gpu.rs
++++ b/crates/reims-ctl/src/gpu.rs
+@@ -94,7 +94,7 @@ pub fn icd_files() -> Vec<PathBuf> {
+ 
+ /// The host's GPUs, each with the driver manifest that reaches it.
+ pub fn list() -> Vec<GpuInfo> {
+-    if !cfg!(target_os = "linux") {
++    if !cfg!(any(target_os = "linux", target_os = "android")) {
+         return Vec::new();
+     }
+     let Ok(exe) = std::env::current_exe() else {
+@@ -193,7 +193,7 @@ fn probe(exe: &std::path::Path, file: &std::path::Path) -> Vec<GpuInfo> {
+ }
+ 
+ /// `reims-ctl __vulkan-probe`: one JSON line per physical device the loader finds.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub fn probe_main() -> i32 {
+     use ash::vk;
+     // SAFETY: loads the system's Vulkan loader; the calls below follow the API's rules.
+@@ -236,7 +236,7 @@ pub fn probe_main() -> i32 {
+     0
+ }
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ pub fn probe_main() -> i32 {
+     1
+ }
+diff --git a/crates/reims-ctl/src/host.rs b/crates/reims-ctl/src/host.rs
+index cb4629622e812410dfce07c34bafe57547c294cd..ea5e95bb71e1433d37ce632dc52306e2c6103e0b 100644
+--- a/crates/reims-ctl/src/host.rs
++++ b/crates/reims-ctl/src/host.rs
+@@ -38,7 +38,7 @@ impl Host {
+     pub fn current() -> Host {
+         let os = if cfg!(target_os = "macos") {
+             Os::Mac
+-        } else if cfg!(target_os = "linux") {
++        } else if cfg!(any(target_os = "linux", target_os = "android")) {
+             Os::Linux
+         } else {
+             Os::Other
+diff --git a/crates/reims-ctl/src/reims_util.rs b/crates/reims-ctl/src/reims_util.rs
+index b52be627fd938fec495fd34c14d0c9ef6e4967ed..6a3d23f1a929e005a08df9d3a7e34ef2b1562a63 100644
+--- a/crates/reims-ctl/src/reims_util.rs
++++ b/crates/reims-ctl/src/reims_util.rs
+@@ -410,7 +410,7 @@ fn size(bytes: u64) -> String {
+ /// it, so with reims-ctl: a download stops where it is when the interface quits, and the next
+ /// one continues it.
+ fn end_with_parent(cmd: &mut Command) {
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     {
+         use std::os::unix::process::CommandExt;
+         let parent = std::process::id() as libc::pid_t;
+@@ -428,7 +428,7 @@ fn end_with_parent(cmd: &mut Command) {
+             });
+         }
+     }
+-    #[cfg(not(target_os = "linux"))]
++    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+     let _ = cmd;
+ }
+ 
+diff --git a/crates/reims-ctl/src/runtime.rs b/crates/reims-ctl/src/runtime.rs
+index 25f0ed47639871ee5490c452f8a3fe041311287d..e9a8519684c93feb394b85dd64c5ff2fba8e04dc 100644
+--- a/crates/reims-ctl/src/runtime.rs
++++ b/crates/reims-ctl/src/runtime.rs
+@@ -45,7 +45,7 @@ fn alive(pid: i32) -> bool {
+     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn cmdline(pid: i32) -> Option<Vec<u8>> {
+     let b = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+     // A zombie's command line is empty.
+@@ -89,7 +89,7 @@ fn cmdline(pid: i32) -> Option<Vec<u8>> {
+     Some(buf)
+ }
+ 
+-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++#[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
+ fn cmdline(_pid: i32) -> Option<Vec<u8>> {
+     None
+ }
+diff --git a/crates/reims-vgpu-c/include/reims_vgpu_android.h b/crates/reims-vgpu-c/include/reims_vgpu_android.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..56b71174123cbcdf19981e3e431bcc2a361745ba
+--- /dev/null
++++ b/crates/reims-vgpu-c/include/reims_vgpu_android.h
+@@ -0,0 +1,34 @@
++/*
++ * reims_vgpu_android.h: the Android-only part of reims-vgpu's C API (crates/reims-vgpu-c/src/android.rs).
++ *
++ * The dist tree's reims_vgpu.h includes this file under __ANDROID__, so a host includes that one.
++ */
++#ifndef REIMS_VGPU_ANDROID_H
++#define REIMS_VGPU_ANDROID_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Registers the vkGetInstanceProcAddr every Vulkan instance of the process goes through: the
++// app's hooked driver (libadrenotools). Call before qemu_android_main. It stays loaded for the
++// life of the process.
++void rvg_android_set_vulkan_gipa(void *pfn_vk_get_instance_proc_addr);
++
++// Gives the library the app's Surface, an ANativeWindow*, or NULL when it goes away. The library
++// takes its own reference. Call from surfaceCreated, surfaceChanged and surfaceDestroyed; it
++// waits, for at most two seconds, for the render thread to let an old window go.
++void rvg_android_set_window(void *a_native_window);
++
++// A touch or a mouse event at (x, y) in the guest's display pixels, with the
++// RVG_WINDOW_BUTTON_* bits of the buttons held; it reaches the host through the window's pointer
++// callback, on the library's own thread.
++void rvg_android_pointer(uint16_t x, uint16_t y, uint32_t buttons);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* REIMS_VGPU_ANDROID_H */
+diff --git a/crates/reims-vgpu-c/src/android.rs b/crates/reims-vgpu-c/src/android.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4ae92d68afe7ea383d373f3652c6150d0c67a5e
+--- /dev/null
++++ b/crates/reims-vgpu-c/src/android.rs
+@@ -0,0 +1,42 @@
++//! The Android-only C API, `include/reims_vgpu_android.h`: what the app gives the library that a
++//! desktop host's window system gives it itself. Each call runs on the caller's thread.
++
++use std::ffi::c_void;
++
++use crate::ffi;
++
++/// Registers the `vkGetInstanceProcAddr` every Vulkan instance of the process goes through.
++///
++/// # Safety
++///
++/// `pfn_vk_get_instance_proc_addr` is NULL or a valid `vkGetInstanceProcAddr` that stays loaded
++/// for the life of the process, and this runs before `qemu_android_main`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_android_set_vulkan_gipa(pfn_vk_get_instance_proc_addr: *mut c_void) {
++    ffi::export(|| {
++        // SAFETY: the caller's.
++        unsafe { reims_vgpu::android::set_vulkan_gipa(pfn_vk_get_instance_proc_addr) }
++    })
++}
++
++/// Gives the library the app's Surface: an `ANativeWindow*`, or NULL when it goes away.
++///
++/// # Safety
++///
++/// `a_native_window` is NULL or a live `ANativeWindow`; the library takes its own reference.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_android_set_window(a_native_window: *mut c_void) {
++    ffi::export(|| {
++        // SAFETY: the caller's.
++        unsafe { reims_vgpu::android::set_window(a_native_window) }
++    })
++}
++
++/// A touch or a mouse event, at (`x`, `y`) in the guest's display pixels, with the
++/// `RVG_WINDOW_BUTTON_*` bits of the buttons held.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_android_pointer(x: u16, y: u16, buttons: u32) {
++    ffi::export(|| {
++        reims_vgpu::android::pointer(x, y, buttons);
++    })
++}
+diff --git a/crates/reims-vgpu-c/src/ffi/catch.rs b/crates/reims-vgpu-c/src/ffi/catch.rs
+index 599c7a0a49260e829159ab21c5ab50fe9904d980..6d55500b9621f33e495c0a2b8fd8582c5acf5c57 100644
+--- a/crates/reims-vgpu-c/src/ffi/catch.rs
++++ b/crates/reims-vgpu-c/src/ffi/catch.rs
+@@ -1,12 +1,12 @@
+ //! The catch around a call of a host function ([`super::host_call`]), in one file per OS with the
+ //! same function: `catch(f)` runs `f` and answers its value, or `Err(())` for what the host threw.
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(super) use linux::catch;
+ #[cfg(target_os = "macos")]
+ pub(super) use macos::catch;
+diff --git a/crates/reims-vgpu-c/src/ffi/tests.rs b/crates/reims-vgpu-c/src/ffi/tests.rs
+index 54693cc3d9c2bc0106f65941d43cebb8d84bc198..57ad48dd3237fce86239cceb67edb4213e96ec1e 100644
+--- a/crates/reims-vgpu-c/src/ffi/tests.rs
++++ b/crates/reims-vgpu-c/src/ffi/tests.rs
+@@ -8,7 +8,7 @@ use reims_vgpu_core::rt::is_our_thread;
+ 
+ use super::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
+diff --git a/crates/reims-vgpu-c/src/lib.rs b/crates/reims-vgpu-c/src/lib.rs
+index 4bf0da5acb4fd22d068929f4c04c7fe51d1bf94a..10396c6294e95eb65efd6d6e358658cff39aeed1 100644
+--- a/crates/reims-vgpu-c/src/lib.rs
++++ b/crates/reims-vgpu-c/src/lib.rs
+@@ -38,6 +38,8 @@ pub mod window;
+ // The scaler device after the rest, so that the functions before it keep their places.
+ pub mod scaler;
+ 
++#[cfg(target_os = "android")]
++mod android;
+ mod ffi;
+ mod handle;
+ mod sized;
+@@ -55,13 +57,13 @@ pub use status::RvgStatus;
+ /// [`device::rvg_bytes_free`]'s, goes back through that function, and the bytes the library gives
+ /// Metal to free are `malloc`'s own.
+ #[cfg(any(
+-    all(target_os = "linux", target_arch = "x86_64"),
++    all(any(target_os = "linux", target_os = "android"), target_arch = "x86_64"),
+     all(target_os = "macos", target_arch = "aarch64")
+ ))]
+ #[global_allocator]
+ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+ 
+-#[cfg(all(target_os = "linux", not(feature = "vulkan")))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "vulkan")))]
+ compile_error!("on Linux, reims-vgpu-c builds only with the `vulkan` feature (VulkanPlatform)");
+ 
+ /// The platform every handle is made on.
+diff --git a/crates/reims-vgpu-c/tests/exports.rs b/crates/reims-vgpu-c/tests/exports.rs
+index 754a7780c6d5b02814ea118d3046a75582b36744..aac8d2e605ab1b132d14bc6c86ea2a9692b8edf6 100644
+--- a/crates/reims-vgpu-c/tests/exports.rs
++++ b/crates/reims-vgpu-c/tests/exports.rs
+@@ -201,8 +201,13 @@ fn every_export_runs_its_body_inside_ffi_export() {
+         errors.extend(found.errors);
+     }
+     assert!(errors.is_empty(), "{}", errors.join("\n"));
+-    let header =
++    let mut header =
+         std::fs::read_to_string(crate_dir().join("include/reims_vgpu.h")).expect("the header");
++    // The Android-only functions have a header of their own, which only Android includes.
++    header.push_str(
++        &std::fs::read_to_string(crate_dir().join("include/reims_vgpu_android.h"))
++            .expect("the Android header"),
++    );
+     assert_eq!(exports, header_functions(&header));
+ }
+ 
+diff --git a/crates/reims-vgpu-core/src/testkit/death/sys.rs b/crates/reims-vgpu-core/src/testkit/death/sys.rs
+index acd0b3a5633468e980692089ea8ee46fef1c15fa..a2d675919f0087003a3388bb46686228a5bf217b 100644
+--- a/crates/reims-vgpu-core/src/testkit/death/sys.rs
++++ b/crates/reims-vgpu-core/src/testkit/death/sys.rs
+@@ -1,11 +1,11 @@
+ //! The C library calls and constants the harness uses, in one file per OS with the same names.
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub use linux::*;
+ #[cfg(target_os = "macos")]
+ pub use macos::*;
+diff --git a/crates/reims-vgpu-vulkan/Cargo.toml b/crates/reims-vgpu-vulkan/Cargo.toml
+index c31e3c96509799092f535ff7e17dc24610e011c2..65cba97deefaa13d191cf27fd6bf44ef2414978e 100644
+--- a/crates/reims-vgpu-vulkan/Cargo.toml
++++ b/crates/reims-vgpu-vulkan/Cargo.toml
+@@ -24,10 +24,12 @@ ash.workspace = true
+ [target.'cfg(target_os = "macos")'.dependencies]
+ reims-vgpu-metal.workspace = true
+ 
+-# On Linux the OS services are this crate's own (`os/linux.rs`): threads, clocks, the views of
+-# guest pages over the memory map's files, and IOSurface's stand-in.
+-[target.'cfg(target_os = "linux")'.dependencies]
++# On Linux and Android the OS services are this crate's own (`os/linux.rs`): threads, clocks, the
++# views of guest pages over the memory map's files, and IOSurface's stand-in.
++[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+ libc.workspace = true
++
++[target.'cfg(target_os = "linux")'.dependencies]
+ # The driver manifests the host's GPUs are read through (`host_gpus.rs`), as the loader reads them.
+ serde_json.workspace = true
+ 
+diff --git a/crates/reims-vgpu-vulkan/src/answer.rs b/crates/reims-vgpu-vulkan/src/answer.rs
+index e57223f401d431d51e0a8fa6b319d7dc6391c3c2..1cd838df25137afdf9ec327d7c196910bbad756f 100644
+--- a/crates/reims-vgpu-vulkan/src/answer.rs
++++ b/crates/reims-vgpu-vulkan/src/answer.rs
+@@ -1593,7 +1593,7 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
+ /// one: neither relayed, counted, kept nor dying. A kind the runtime announces once per device
+ /// is announced at every occurrence where a probe may meet it ([`crate::platform`]'s
+ /// `announced_each`), so that the probe's takes no later occurrence's line.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(crate) fn unheard<T>(call: impl FnOnce() -> T) -> T {
+     /// Puts back the outer state on drop, an unwinding call's included.
+     struct Restore(bool);
+diff --git a/crates/reims-vgpu-vulkan/src/answer/census.rs b/crates/reims-vgpu-vulkan/src/answer/census.rs
+index caa55e58a5c39e22f520d8797bf2d5e253048bb0..36547a5cbf109007f595f0b8fe32ce5a089efbf2 100644
+--- a/crates/reims-vgpu-vulkan/src/answer/census.rs
++++ b/crates/reims-vgpu-vulkan/src/answer/census.rs
+@@ -41,7 +41,7 @@ const PERIOD: Duration = Duration::from_secs(30);
+ pub const OUTSIDE: &str = "(outside every call)";
+ 
+ /// Whether census mode can be on in this build: on Linux alone (module docs).
+-const ON_THIS_OS: bool = cfg!(target_os = "linux");
++const ON_THIS_OS: bool = cfg!(any(target_os = "linux", target_os = "android"));
+ 
+ /// The census's directory, read once per process ([`chosen`]).
+ fn dir() -> Option<&'static Path> {
+@@ -374,7 +374,7 @@ mod tests {
+     /// The variable turns census mode on on Linux alone; unset or empty, it is off everywhere
+     #[test]
+     fn census_mode_is_linux_s_alone() {
+-        let linux = cfg!(target_os = "linux");
++        let linux = cfg!(any(target_os = "linux", target_os = "android"));
+         assert_eq!(
+             chosen(Some("/census".to_owned())),
+             linux.then(|| PathBuf::from("/census"))
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/device.rs b/crates/reims-vgpu-vulkan/src/gpu/device.rs
+index 8fa1022ecfe4066278088c7869d5402594b7c379..b2ce16a742158c3709da0c8749359d6ba1e1afdc 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/device.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/device.rs
+@@ -252,7 +252,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
+     }
+     metal_space::count_sampler_ids(&raw);
+     crate::answer::native::device_made(raw.properties());
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     crate::os::learn_view_imports(&raw);
+     let made = Obj::new(DeviceObject {
+         raw,
+@@ -2144,7 +2144,7 @@ pub(crate) mod tests {
+     /// command buffer completes, and the memory is unmapped once the import was freed. The command
+     /// buffer reads another texture through its ID, so no command of it names the surface's.
+     /// Linux's: on macOS IOSurface's memory is the surface's own
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     #[test]
+     fn a_released_surface_texture_keeps_the_surfaces_memory_while_imported() {
+         use std::sync::atomic::{AtomicU32, Ordering};
+@@ -2367,7 +2367,7 @@ pub(crate) mod tests {
+     /// own twin. Counted by the process's mappings of the guest's pages' file, which every view of
+     /// them mapped from it takes (`/proc/self/maps`), a view through dma-bufs none, a twin always
+     /// a mapping a run. Linux's: on macOS IOSurface maps the surface
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     #[test]
+     fn textures_over_a_surface_map_its_pages_once_more_at_most() {
+         use reims_vgpu_core::host::PhysicalMemoryRange;
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/encode_compute.rs b/crates/reims-vgpu-vulkan/src/gpu/encode_compute.rs
+index dc54e59b47c808be91687b01d733b70cd1ba8621..01334370eeab4db2ca7d712a4163bd9dc67fd85d 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/encode_compute.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/encode_compute.rs
+@@ -614,7 +614,7 @@ mod tests {
+     /// by its slot writes, or the buffer is made resident for writing: on Linux the runtime
+     /// imports a writable twin of the pages, which the write would reach, where Metal's GPU drops
+     /// it ([`crate::gpu::writes::kept_write`]). The pages stay zeros
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     #[test]
+     fn a_dispatch_through_read_only_pages_dies_on_linux() {
+         use reims_vgpu_core::platform::os::vm::HostVm as _;
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
+index f18f304c2cfc23296e6eb1e473c9635143a4a8b6..45bd6dba5b7d69633e18dbd0486fc366a5e60663 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
+@@ -4705,7 +4705,7 @@ pub(crate) mod tests {
+     /// vertex function's slot 2 too, a `device` pointer, the draw dies where it is encoded: on
+     /// Linux the runtime imports a writable twin of the pages, which the write would reach
+     /// ([`crate::gpu::writes::kept_write`]). The pages stay zeros
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     #[test]
+     fn a_draw_through_read_only_pages_at_slots_it_cannot_write_draws_on_linux() {
+         use reims_vgpu_core::platform::os::vm::HostVm as _;
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs b/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs
+index 049e5eefc0ea38210401cb35b6b97a162f180158..9b980a2fb3cc03aad682368a8bd79337e7823a00 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs
+@@ -143,7 +143,7 @@ fn cpu_now() -> [u64; 3] {
+     // `CLOCK_THREAD_CPUTIME_ID`, `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_MONOTONIC`.
+     #[cfg(target_os = "macos")]
+     const CLOCKS: [i32; 3] = [16, 12, 6];
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     const CLOCKS: [i32; 3] = [3, 2, 1];
+     CLOCKS.map(|clock| {
+         let mut at = Timespec { sec: 0, nsec: 0 };
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource.rs b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
+index 2b01a22aa57ed5d99ba4cf7206465eb6417d339a..365987a9d13c68da83b74a5bcb914e7a0f2dcc1c 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
+@@ -2080,7 +2080,7 @@ pub(crate) mod tests {
+     /// A no-copy buffer over `pages` pages of zeros mapped read-only, which the runtime imports
+     /// through a writable twin of them on Linux, and the pages' first byte, which the caller
+     /// frees once the buffer is gone.
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     pub(crate) fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
+         use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
+ 
+@@ -2106,7 +2106,7 @@ pub(crate) mod tests {
+     /// runtime imports a writable twin of the pages, which the fill would reach, where Metal
+     /// drops the write (`os/linux/import.rs`, [`crate::gpu::writes::kept_write`]). The rest of
+     /// the command buffer runs, and the pages stay zeros
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     #[test]
+     fn a_fill_into_read_only_pages_dies_on_linux() {
+         use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/writes.rs b/crates/reims-vgpu-vulkan/src/gpu/writes.rs
+index f32c86e1db334f945e6923b591c9974f1e9716f9..c6827d8d84e5dba013adcda4950cdd069d31c668 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/writes.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/writes.rs
+@@ -249,11 +249,11 @@ pub(crate) fn set_kept(flag: &AtomicBool, kept: bool) {
+ 
+ /// One surface counted in [`KEPT_NOW`] while this lives: one whose GPU writes never reach its
+ /// memory ([`surface_kept`]), which every object made on it holds.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ #[derive(Debug)]
+ pub(crate) struct Keeping(());
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ impl Keeping {
+     /// A count of one, from now on.
+     pub(crate) fn new() -> Keeping {
+@@ -262,7 +262,7 @@ impl Keeping {
+     }
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ impl Drop for Keeping {
+     fn drop(&mut self) {
+         KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
+diff --git a/crates/reims-vgpu-vulkan/src/lib.rs b/crates/reims-vgpu-vulkan/src/lib.rs
+index 21ef548cd30bd51df032c28682c53cb39995bd49..75f63f66f53fe2b53788ec8d7e051ce26ca002f1 100644
+--- a/crates/reims-vgpu-vulkan/src/lib.rs
++++ b/crates/reims-vgpu-vulkan/src/lib.rs
+@@ -34,3 +34,9 @@ pub mod remap;
+ pub mod swapchain;
+ 
+ pub use platform::{Obj, VulkanPlatform};
++
++/// ash's Vulkan types, which [`set_android_vulkan_gipa`] takes.
++#[cfg(target_os = "android")]
++pub use ash::vk as ash_vk;
++#[cfg(target_os = "android")]
++pub use metal2vulkan_runtime::set_android_vulkan_gipa;
+diff --git a/crates/reims-vgpu-vulkan/src/os.rs b/crates/reims-vgpu-vulkan/src/os.rs
+index a0921aefdb7330e829ae3a82f3dd813a79a5fe60..3371e4a007f0328fb82e46ce3be199f623a65116 100644
+--- a/crates/reims-vgpu-vulkan/src/os.rs
++++ b/crates/reims-vgpu-vulkan/src/os.rs
+@@ -13,14 +13,14 @@
+ //! its loader, and fetching an image's drawable ahead where the driver needs it
+ //! (`Drawables`: MoltenVK's, on macOS).
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
+ mod surface;
+ mod wsi;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ use linux as host_os;
+ #[cfg(target_os = "macos")]
+ use macos as host_os;
+@@ -30,22 +30,22 @@ use std::sync::Arc;
+ 
+ /// The dirty source's side on Linux: the device's log, the harvester's interface, and the
+ /// per-import answers the runtime asks (`os/linux/dirty.rs`).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub use host_os::dirty;
+ /// Learns whether a device imports views of guest pages mapped through dma-bufs, on Linux
+ /// (`os/linux/import.rs`).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(crate) use host_os::learn_view_imports;
+ /// The loader the runtime opens, for `crate::host_gpus`'s own instances.
+ #[cfg(target_os = "linux")]
+ pub(crate) use host_os::open_loader;
+ /// Whether a view of several runs of pages made now is mapped through dma-bufs, on Linux
+ /// (`os/linux/import.rs`).
+-#[cfg(all(test, target_os = "linux"))]
++#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+ pub(crate) use host_os::views_through_dma_bufs;
+ /// A surface's memory lent to a device outside the runtime, on Linux (`os/linux/device_lend.rs`),
+ /// and what a host attaches to a surface for as long as it lives.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub use host_os::{DeviceLend, LendRefusal, LentDmaBuf, attachment, lend_to_devices};
+ pub(crate) use host_os::{
+     Drawables, ImportView, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, dma_buf_refusal,
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux.rs b/crates/reims-vgpu-vulkan/src/os/linux.rs
+index 6686fef4c9c199c20b418a5d1fa14c48f6a675c5..24fec190d1729763e2148cdd823bfe8a1cd5e04e 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux.rs
+@@ -47,17 +47,28 @@ pub(crate) use vm::tests::{PAGE, mapped, writable};
+ /// The instance's surface extensions a display's window may present over, besides
+ /// `VK_KHR_surface`, each asked for where the loader lists it (`crate::os`'s `wsi`): Wayland's,
+ /// XCB's and Xlib's, so a window opens over whichever the window library picks.
++#[cfg(target_os = "linux")]
+ pub(crate) const WINDOW_SURFACE_EXTENSIONS: [&CStr; 3] = [
+     ash::khr::wayland_surface::NAME,
+     ash::khr::xcb_surface::NAME,
+     ash::khr::xlib_surface::NAME,
+ ];
+ 
++/// The instance's surface extensions on Android: the app's `ANativeWindow`.
++#[cfg(target_os = "android")]
++pub(crate) const WINDOW_SURFACE_EXTENSIONS: [&CStr; 1] = [ash::khr::android_surface::NAME];
++
+ /// The device extensions a window's swapchain needs besides `VK_KHR_swapchain`: none.
+ pub(crate) const WINDOW_DEVICE_EXTENSIONS: [&CStr; 0] = [];
+ 
+-/// The Vulkan loader, opened by its usual name, as the runtime opens it.
++/// The Vulkan loader, opened as the runtime opens it: on Android the `vkGetInstanceProcAddr` the
++/// app registered (`rvg_android_set_vulkan_gipa`), so the driver the app hooked is the one
++/// everything here talks to; elsewhere by its usual name.
+ pub(crate) fn open_loader() -> Result<ash::Entry, ash::LoadingError> {
++    #[cfg(target_os = "android")]
++    if let Some(entry) = rt::android_entry() {
++        return Ok(entry);
++    }
+     // SAFETY: opening the loader runs its initialization, and it is kept open while the entry
+     // lives.
+     unsafe { ash::Entry::load() }
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/budget.rs b/crates/reims-vgpu-vulkan/src/os/linux/budget.rs
+index cf52fd2bb23616f9a144ada14d3f90877dbd6db7..978fb0aef47d4ac3bb4991be1162045948b80f81 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/budget.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/budget.rs
+@@ -100,13 +100,20 @@ pub(super) fn set_test_limit(limit: Option<u64>) {
+     TEST_LIMIT.with(|l| l.set(limit));
+ }
+ 
+-/// `vm.max_map_count` read now; `u64::MAX` where it does not read, leaving the kernel's own
+-/// refusal.
++/// The limit assumed where `vm.max_map_count` does not read: `u64::MAX`, leaving the kernel's
++/// own refusal; on Android, where SELinux denies an app the file and nothing can raise the limit,
++/// the kernel's default, so views stop short of it rather than be refused at the kernel's limit.
++#[cfg(not(target_os = "android"))]
++const UNREAD_LIMIT: u64 = u64::MAX;
++#[cfg(target_os = "android")]
++const UNREAD_LIMIT: u64 = 65_530;
++
++/// `vm.max_map_count` read now; [`UNREAD_LIMIT`] where it does not read.
+ fn read_limit() -> u64 {
+     std::fs::read_to_string("/proc/sys/vm/max_map_count")
+         .ok()
+         .and_then(|l| l.trim().parse().ok())
+-        .unwrap_or(u64::MAX)
++        .unwrap_or(UNREAD_LIMIT)
+ }
+ 
+ /// The limit as last read, reading it the first time; a test's, where the thread set one.
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/hints.rs b/crates/reims-vgpu-vulkan/src/os/linux/hints.rs
+index 9a0811104b5bc5dc865a98d391d67d4b1cf81c25..17dd9e9f4e0f9ff6420d1758b1f3259ab737421d 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/hints.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/hints.rs
+@@ -52,6 +52,8 @@
+ //! without `CONFIG_UCLAMP_TASK` refuses the call, and the thread runs as it would have. The first
+ //! hint's outcome is logged once; a dropped floor is not logged.
+ 
++#![cfg_attr(target_os = "android", allow(dead_code))]
++
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ /// `SCHED_FLAG_KEEP_POLICY`: the thread keeps its policy.
+@@ -119,7 +121,15 @@ fn util_floor_request(floor: u32) -> SchedAttr {
+     }
+ }
+ 
++/// Sets the calling thread's utilization floor to `floor`: not on Android, whose seccomp filter
++/// kills an app for a system call it does not allow, and whose scheduler hints are the OS's.
++#[cfg(target_os = "android")]
++fn set_util_floor(_floor: u32) -> std::io::Result<()> {
++    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
++}
++
+ /// Sets the calling thread's utilization floor to `floor` ([`util_floor_request`]).
++#[cfg(not(target_os = "android"))]
+ fn set_util_floor(floor: u32) -> std::io::Result<()> {
+     let request = util_floor_request(floor);
+     // SAFETY: the calling thread's attributes, from a live `sched_attr` of the size it names.
+diff --git a/crates/reims-vgpu-vulkan/src/os/surface.rs b/crates/reims-vgpu-vulkan/src/os/surface.rs
+index 55921c3f35ad4826e945ee8c9e6b5c0c9fbfdbf4..c83407395ec27de4cd7603509f6e0efcdd275f43 100644
+--- a/crates/reims-vgpu-vulkan/src/os/surface.rs
++++ b/crates/reims-vgpu-vulkan/src/os/surface.rs
+@@ -798,7 +798,7 @@ pub(crate) mod tests {
+         })
+         .unwrap();
+         assert_eq!(before, 7, "the bytes lent are the pages'");
+-        let in_view = cfg!(target_os = "linux");
++        let in_view = cfg!(any(target_os = "linux", target_os = "android"));
+         assert_eq!(
+             (at == s.base_address().as_ptr::<u8>().addr(), landed == 1),
+             (in_view, in_view),
+diff --git a/crates/reims-vgpu-vulkan/src/remap.rs b/crates/reims-vgpu-vulkan/src/remap.rs
+index 22da52db0a29c24d01992b0ca2b0f7ac54b39771..c51fbdebb326f20d81699eb3ec0c8ed10f778512 100644
+--- a/crates/reims-vgpu-vulkan/src/remap.rs
++++ b/crates/reims-vgpu-vulkan/src/remap.rs
+@@ -660,7 +660,7 @@ mod tests {
+         }
+         let anonymous = vm.allocate_anywhere(page).unwrap();
+         let refused = vm.remap_shared_overwrite(view, anonymous, page);
+-        assert_eq!(refused.is_err(), cfg!(target_os = "linux"));
++        assert_eq!(refused.is_err(), cfg!(any(target_os = "linux", target_os = "android")));
+         for (range, length) in [(view, 2 * page), (at, 2 * page), (anonymous, page)] {
+             assert!(vm.deallocate(range, length).is_success());
+         }
+diff --git a/crates/reims-vgpu-vulkan/src/swapchain.rs b/crates/reims-vgpu-vulkan/src/swapchain.rs
+index 8067f1a86e957f6bc48b4441a03d0d7ada49d4cd..1ea722ec376d15496be3e41770e25c87ea205b78 100644
+--- a/crates/reims-vgpu-vulkan/src/swapchain.rs
++++ b/crates/reims-vgpu-vulkan/src/swapchain.rs
+@@ -16,8 +16,8 @@
+ //!
+ //! **Making it.** Over a `VkSurfaceKHR` of the runtime's instance, which the swapchain owns from
+ //! then on and destroys after its last image. The presenting queue's family must present to the
+-//! surface, which must offer `B8G8R8A8_UNORM` in `SRGB_NONLINEAR`: the format the display draws
+-//! into, which the compositor reads as sRGB. Otherwise there is no swapchain, and the window
++//! surface, which must offer `B8G8R8A8_UNORM` (Android's loader: `R8G8B8A8_UNORM`, [`FORMAT`]) in
++//! `SRGB_NONLINEAR`: the format the display draws into, which the compositor reads as sRGB. Otherwise there is no swapchain, and the window
+ //! stays empty; the reason is logged.
+ //!
+ //! **Present mode.** Never one that tears, and never one that makes the guest wait: MAILBOX
+@@ -154,8 +154,22 @@ const MAILBOX_IMAGES: u32 = 4;
+ /// With FIFO.
+ const FIFO_IMAGES: u32 = 3;
+ 
+-/// The format the display draws into, and its colour space.
++/// The format the display draws into, and its colour space. Android's loader offers surfaces in
++/// RGBA byte order only; the display's pipelines take whatever format its target has.
++#[cfg(not(target_os = "android"))]
+ const FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
++#[cfg(target_os = "android")]
++const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
++/// [`FORMAT`] in Metal's names.
++#[cfg(not(target_os = "android"))]
++const PIXEL_FORMAT: PixelFormat = PixelFormat::BGRA8Unorm;
++#[cfg(target_os = "android")]
++const PIXEL_FORMAT: PixelFormat = PixelFormat::RGBA8Unorm;
++/// Whether a suboptimal swapchain is made again. Android's loader answers `SUBOPTIMAL` for every
++/// present while the device's rotation differs from the swapchain's, which [`Swapchain::make`]
++/// leaves to the compositor (identity, always): making one again would give the same one for
++/// every frame.
++const SUBOPTIMAL_IS_STALE: bool = !cfg!(target_os = "android");
+ /// The colour space the compositor reads it in.
+ const COLOR_SPACE: vk::ColorSpaceKHR = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+ /// The usages a swapchain asks its images for, of those the surface supports.
+@@ -662,9 +676,10 @@ impl Swapchain {
+             .iter()
+             .any(|f| f.format == FORMAT && f.color_space == COLOR_SPACE)
+         {
+-            return Err(destroy(Refused(
+-                "the window's surface offers no B8G8R8A8_UNORM in SRGB_NONLINEAR".to_owned(),
+-            )));
++            return Err(destroy(Refused(format!(
++                "the window's surface offers no format {} in SRGB_NONLINEAR",
++                FORMAT.as_raw()
++            ))));
+         }
+         // SAFETY: as above.
+         let modes =
+@@ -812,7 +827,7 @@ impl Swapchain {
+         );
+         match taken {
+             Ok((index, suboptimal)) => {
+-                self.stale |= suboptimal;
++                self.stale |= suboptimal && SUBOPTIMAL_IS_STALE;
+                 self.wait_for(index)
+             }
+             Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Acquired::Retry,
+@@ -966,7 +981,7 @@ impl Swapchain {
+             fences.presented(image.presented, fence, presented);
+         }
+         match presented {
+-            Ok(suboptimal) => self.stale |= suboptimal,
++            Ok(suboptimal) => self.stale |= suboptimal && SUBOPTIMAL_IS_STALE,
+             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
+             Err(e) => {
+                 log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkQueuePresentKHR: {e}");
+@@ -1197,6 +1212,17 @@ impl Swapchain {
+             vk::CompositeAlphaFlagsKHR::INHERIT
+         };
+         let sharing = sharing_among(&self.families);
++        // On Android the compositor turns an identity image for the device's rotation, as
++        // nothing here draws into a rotated one; elsewhere the surface's own transform stands.
++        let transform = if cfg!(target_os = "android")
++            && caps
++                .supported_transforms
++                .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
++        {
++            vk::SurfaceTransformFlagsKHR::IDENTITY
++        } else {
++            caps.current_transform
++        };
+         let mut info = vk::SwapchainCreateInfoKHR::default()
+             .surface(self.surface)
+             .min_image_count(count)
+@@ -1206,7 +1232,7 @@ impl Swapchain {
+             .image_array_layers(1)
+             .image_usage(usage)
+             .image_sharing_mode(sharing)
+-            .pre_transform(caps.current_transform)
++            .pre_transform(transform)
+             .composite_alpha(alpha)
+             .present_mode(self.mode)
+             .clipped(true)
+@@ -1340,14 +1366,14 @@ fn image_info(
+     }
+ }
+ 
+-/// The runtime's descriptor of a swapchain's image of `extent`: a `Private` `BGRA8Unorm` render
++/// The runtime's descriptor of a swapchain's image of `extent`: a `Private` [`PIXEL_FORMAT`] render
+ /// target, placed outside the program's resource IDs (`IdPlacement::Outside`, a runtime
+ /// extension), as the device's own textures are. It takes no texture resource ID, so the
+ /// `gpuResourceID` and `uniqueIdentifier` of the guest's textures are the same whether or not a
+ /// window is open.
+ fn image_descriptor(extent: vk::Extent2D) -> rt::TextureDescriptor {
+     let mut descriptor = rt::TextureDescriptor::texture_2d(
+-        PixelFormat::BGRA8Unorm,
++        PIXEL_FORMAT,
+         u64::from(extent.width),
+         u64::from(extent.height),
+         false,
+diff --git a/crates/reims-vgpu-window/Cargo.toml b/crates/reims-vgpu-window/Cargo.toml
+index d5ea7726a1fedd64d0138ae1e6616e8d9b8a1928..2ab723a4174af9ef5476cc2ab7ddd7963e79f9a6 100644
+--- a/crates/reims-vgpu-window/Cargo.toml
++++ b/crates/reims-vgpu-window/Cargo.toml
+@@ -13,6 +13,12 @@ log.workspace = true
+ # ash's Vulkan types for a window's surface (`present`): SDL's on Linux, the layer's on macOS.
+ ash.workspace = true
+ 
++# The window on Android (`native/android.rs`): the app's ANativeWindow, presented through the
++# Vulkan crate's swapchain, with no SDL.
++[target.'cfg(target_os = "android")'.dependencies]
++reims-vgpu-vulkan.workspace = true
++libc.workspace = true
++
+ # The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface, and the
+ # Vulkan crate's threads.
+ [target.'cfg(target_os = "linux")'.dependencies]
+diff --git a/crates/reims-vgpu-window/features.md b/crates/reims-vgpu-window/features.md
+index 6d787e4f981ae398395f7e14ed4001ea494cf62c..25ac919a08fdc7d6c1d3903f46af35d5e5e9176c 100644
+--- a/crates/reims-vgpu-window/features.md
++++ b/crates/reims-vgpu-window/features.md
+@@ -347,9 +347,9 @@ runtime's own device. The switches above apply, and `resolution=` too.
+   `manual`
+ - Nothing is drawn while the window is hidden or minimized, nor before it
+   and its layout exist; it redraws when it shows.
+-  `test: native::linux::render::a_hidden_window_is_drawn_when_it_shows`,
+-  `test: native::linux::render::nothing_is_drawn_before_the_window_and_layout`,
+-  `test: native::linux::render::what_asks_for_a_draw`
++  `test: native::vulkan_render::a_hidden_window_is_drawn_when_it_shows`,
++  `test: native::vulkan_render::nothing_is_drawn_before_the_window_and_layout`,
++  `test: native::vulkan_render::what_asks_for_a_draw`
+ - Nothing is presented while the compositor suspends the window (Wayland's
+   suspended state, as KWin and Mutter set it for a covered window or one on
+   another desktop): from SDL's occluded event until it is exposed again, the
+@@ -363,7 +363,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
+   when it shows, and holds none back.
+   `test: sdl::shell::a_covered_window_stops_drawing_until_exposed`,
+   `test: sdl::shell::the_last_show_or_hide_of_a_batch_decides`,
+-  `test: native::linux::render::a_hidden_window_takes_no_retry`, `manual`
++  `test: native::vulkan_render::a_hidden_window_takes_no_retry`, `manual`
+ - Pointer: absolute, held at the image's nearest edge; five buttons; a
+   drag ends in the guest; the click that focuses the window is not sent;
+   nothing is sent before the guest has a mode.
+@@ -443,7 +443,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
+   `test: decor::the_texture_coordinates_turn_the_image`,
+   `test: decor::the_pointer_over_a_turned_image_reaches_the_pixel_under_it`,
+   `test: native::linux::input::over_a_turned_image_the_pointer_reaches_the_pixel_under_it`,
+-  `test: native::linux::render::a_changed_decoration_is_drawn`, `manual`
++  `test: native::vulkan_render::a_changed_decoration_is_drawn`, `manual`
+ - The button bar: a strip right of the image, #1c1c1e, its buttons
+   `button-px` points a side, 8 points apart and from the bar's sides,
+   stacked and centred down it, at the screen's scale as the image's points
+diff --git a/crates/reims-vgpu-window/src/lib.rs b/crates/reims-vgpu-window/src/lib.rs
+index a1403eb61a8f24e61b92f56f40a0a73cf2a118f7..27923d9d5d5eac9aacd80c6d928084d49561eb02 100644
+--- a/crates/reims-vgpu-window/src/lib.rs
++++ b/crates/reims-vgpu-window/src/lib.rs
+@@ -43,6 +43,10 @@
+ //!   ones (`sdl`). SDL's window on macOS shares `sdl`'s shell and cursor, and AppKit's
+ //!   application, render thread, input and hot keys, with its own side in `native/macos/sdl.rs`.
+ 
++// Android draws no bar or decoration, takes no scroll or key input and lists one screen: what only
++// the desktop windows use stays compiled, for the crate's shared code, and is not used there.
++#![cfg_attr(target_os = "android", allow(dead_code))]
++
+ pub mod capture;
+ pub mod config;
+ pub mod control;
+@@ -60,9 +64,12 @@ pub mod scroll;
+ 
+ // The SDL3 window: Linux's (`native/linux.rs`), and macOS's with the `macos-sdl` feature, behind
+ // `REIMS_VGPU_WINDOW_IMPL`.
+-#[cfg(any(target_os = "linux", feature = "macos-sdl"))]
++#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-sdl")))]
+ mod sdl;
+ 
++#[cfg(target_os = "android")]
++pub use native::{android_pointer, android_set_window};
++
+ pub use config::{
+     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
+     MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
+diff --git a/crates/reims-vgpu-window/src/native.rs b/crates/reims-vgpu-window/src/native.rs
+index 143839466fd881fc98f20ff35425b8f3c4380110..ae02a1fe5b7a81f3ff619f14649d60dd8c55cb88 100644
+--- a/crates/reims-vgpu-window/src/native.rs
++++ b/crates/reims-vgpu-window/src/native.rs
+@@ -6,15 +6,28 @@
+ //!   built with the `macos-sdl` feature and run with `REIMS_VGPU_WINDOW_IMPL=sdl`, SDL3 in
+ //!   AppKit's application there, with AppKit's window's extensions over SDL's `NSWindow`
+ //!   (`native/macos/sdl.rs`).
++//! - **Android** (`native/android.rs`): the app's `ANativeWindow`, no SDL, drawn by Linux's
++//!   render thread (`native/vulkan_render.rs`).
+ //! - **Linux** (`native/linux.rs`): SDL3, on Wayland or X11, on the library's UI thread
+ //!   (`reims-vgpu.ui`) but for the render thread, which draws into the window's Vulkan swapchain;
+ //!   the window's shell and cursor are SDL's shared ones (`sdl`), with Linux's side in
+ //!   `native/linux/sdl.rs`.
+ 
++#[cfg(target_os = "android")]
++mod android;
+ #[cfg(target_os = "linux")]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
++#[cfg(any(target_os = "linux", target_os = "android"))]
++mod vulkan_render;
++
++#[cfg(target_os = "android")]
++pub use android::{FrameSink, pointer as android_pointer, set_window as android_set_window};
++#[cfg(target_os = "android")]
++pub(crate) use android::{
++    Surface, close, cursor_changed, guest_mode_changed, host_screens, now, open,
++};
+ 
+ #[cfg(target_os = "linux")]
+ pub use linux::FrameSink;
+diff --git a/crates/reims-vgpu-window/src/native/android.rs b/crates/reims-vgpu-window/src/native/android.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e72b74b01afe4fa4499267e9a5924c6889a9518
+--- /dev/null
++++ b/crates/reims-vgpu-window/src/native/android.rs
+@@ -0,0 +1,364 @@
++//! The window on Android: the app's `ANativeWindow`, drawn through Vulkan by the render thread
++//! Linux's window uses (`crate::native::vulkan_render`). There is no window system to open here:
++//! the app owns the only Surface and hands it over with [`set_window`], from its
++//! `surfaceCreated` / `surfaceChanged` / `surfaceDestroyed`, before or after the display exists.
++//! It draws the display of the first window open, the guest's primary display; a later window
++//! waits and takes over when that one ends.
++//!
++//! **A Surface that comes and goes.** Android destroys the Surface whenever the app is not shown,
++//! and makes a new one when it is shown again. The library holds its own reference to the window
++//! it was given. [`set_window`] with another window (or NULL) has the render thread let its
++//! swapchain and Vulkan surface go, and waits a bounded time for that before it returns, as
++//! `surfaceDestroyed` must not return with a producer still connected to the old window
++//! ([`RELEASE_WAIT`]); the guest runs on regardless, and the next window draws whatever frame is
++//! current. The same window again (a `surfaceChanged`) lays out again for its new size.
++//!
++//! **The image.** The whole Surface is the drawable, one pixel per window pixel, and the image
++//! is the guest's mode fitted inside it, centred ([`crate::geometry::layout`]).
++//!
++//! **Touch.** The app sends touches in the guest's pixels with [`pointer`], which go to the host
++//! through the window's pointer callback on the library's thread `reims-vgpu.ui`, one at a time
++//! in the order they came, as Linux's window sends its events, never inside the call of the app's
++//! that made them.
++
++use std::ffi::{CStr, c_void};
++use std::ptr::NonNull;
++use std::sync::mpsc::{self, Sender};
++use std::sync::{Arc, OnceLock};
++use std::time::Duration;
++
++use ash::vk;
++use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
++use reims_vgpu_core::rt::spawn_named;
++use reims_vgpu_core::sync::Mutex;
++use reims_vgpu_vulkan::os::{OsClock, OsThreads};
++
++use super::vulkan_render as render_thread;
++pub use render_thread::FrameSink;
++pub(crate) use render_thread::Surface;
++
++use crate::geometry::{self, Insets};
++use crate::handle::Window;
++use crate::policy::DEFAULT_REFRESH_HZ;
++use crate::present::VulkanTarget;
++use crate::screens::HostScreen;
++
++/// How long [`set_window`] waits for the render thread to let the old window go. The render
++/// thread can be inside a draw, which waits at most about 33 ms for an image, and a queue idle at
++/// a swapchain's end; past this the app goes on and the window is let go when the thread is done.
++const RELEASE_WAIT: Duration = Duration::from_secs(2);
++
++/// The input thread's stack.
++const INPUT_STACK: usize = 256 * 1024;
++
++#[link(name = "android")]
++unsafe extern "C" {
++    fn ANativeWindow_acquire(window: *mut c_void);
++    fn ANativeWindow_release(window: *mut c_void);
++    fn ANativeWindow_getWidth(window: *mut c_void) -> i32;
++    fn ANativeWindow_getHeight(window: *mut c_void) -> i32;
++}
++
++/// A reference of the library's own to an `ANativeWindow`.
++#[derive(Debug)]
++struct NativeWindow(NonNull<c_void>);
++
++// SAFETY: `ANativeWindow`'s reference count and the queries made here are safe on any thread.
++unsafe impl Send for NativeWindow {}
++// SAFETY: as above.
++unsafe impl Sync for NativeWindow {}
++
++impl NativeWindow {
++    /// A new reference to `window`.
++    ///
++    /// # Safety
++    ///
++    /// `window` is a live `ANativeWindow`.
++    unsafe fn acquire(window: NonNull<c_void>) -> Arc<NativeWindow> {
++        // SAFETY: the caller's.
++        unsafe { ANativeWindow_acquire(window.as_ptr()) };
++        Arc::new(NativeWindow(window))
++    }
++
++    /// Its size in pixels; `None` where it has no pixels yet.
++    fn pixels(&self) -> Option<(u32, u32)> {
++        // SAFETY: the window is live while this reference is.
++        let (width, height) = unsafe {
++            (
++                ANativeWindow_getWidth(self.0.as_ptr()),
++                ANativeWindow_getHeight(self.0.as_ptr()),
++            )
++        };
++        let width = u32::try_from(width).ok().filter(|w| *w > 0)?;
++        let height = u32::try_from(height).ok().filter(|h| *h > 0)?;
++        Some((width, height))
++    }
++}
++
++impl Drop for NativeWindow {
++    fn drop(&mut self) {
++        // SAFETY: the reference [`NativeWindow::acquire`] took.
++        unsafe { ANativeWindow_release(self.0.as_ptr()) };
++    }
++}
++
++/// The app's window, as the render thread holds it.
++#[derive(Clone, Debug)]
++pub(crate) struct Target(Option<Arc<NativeWindow>>);
++
++impl Target {
++    /// A target over `window`.
++    fn of(window: &Arc<NativeWindow>) -> Target {
++        Target(Some(Arc::clone(window)))
++    }
++
++    /// A target that names no window.
++    #[cfg(test)]
++    pub(in crate::native) fn empty() -> Target {
++        Target(None)
++    }
++}
++
++impl VulkanTarget for Target {
++    /// `vkCreateAndroidSurfaceKHR` of the window, looked up on `instance` through the loader the
++    /// runtime opened, the hooked one the app registered.
++    fn create_surface(
++        &self,
++        get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
++        instance: vk::Instance,
++    ) -> Option<vk::SurfaceKHR> {
++        let window = self.0.as_ref()?;
++        const NAME: &CStr = c"vkCreateAndroidSurfaceKHR";
++        // SAFETY: the instance is live; the name is NUL-terminated.
++        let found = unsafe { get_instance_proc_addr(instance, NAME.as_ptr()) };
++        let Some(found) = found else {
++            log::warn!(
++                target: "reims_vgpu_window",
++                "the instance has no vkCreateAndroidSurfaceKHR: the window stays empty"
++            );
++            return None;
++        };
++        // SAFETY: the loader answered this command for this name, with this signature.
++        let create: vk::PFN_vkCreateAndroidSurfaceKHR = unsafe { std::mem::transmute(found) };
++        let info = vk::AndroidSurfaceCreateInfoKHR::default().window(window.0.as_ptr().cast());
++        let mut surface = vk::SurfaceKHR::null();
++        // SAFETY: a valid create info over a live window, on a live instance.
++        let result = unsafe { create(instance, &info, std::ptr::null(), &mut surface) };
++        if result == vk::Result::SUCCESS {
++            Some(surface)
++        } else {
++            log::warn!(
++                target: "reims_vgpu_window",
++                "vkCreateAndroidSurfaceKHR: {result}: the window stays empty for now"
++            );
++            None
++        }
++    }
++}
++
++/// The app's window and the windows open, the first of which it shows.
++struct Shared {
++    native: Option<Arc<NativeWindow>>,
++    windows: Vec<Arc<Window>>,
++}
++
++static SHARED: Mutex<Shared> = Mutex::new(Shared {
++    native: None,
++    windows: Vec::new(),
++});
++
++/// Lays out `window` over `native`'s pixels, for the mode the guest set.
++fn lay_out(window: &Window, native: &NativeWindow) {
++    let Some((width, height)) = native.pixels() else {
++        return;
++    };
++    let layout = geometry::layout(
++        (f64::from(width), f64::from(height)),
++        1.0,
++        Insets::default(),
++        window.mode(),
++    );
++    window.surface().set_layout(layout);
++}
++
++/// Gives `window` the app's window to draw into, where it has it.
++fn show(window: &Window, native: Option<&Arc<NativeWindow>>) {
++    if let Some(native) = native {
++        window.surface().set_target(Target::of(native));
++        lay_out(window, native);
++    }
++}
++
++/// The app's Surface (`ANativeWindow*`; NULL when it goes away). See the module doc.
++///
++/// # Safety
++///
++/// `window` is NULL or a live `ANativeWindow`.
++pub unsafe fn set_window(window: *mut c_void) {
++    let new = NonNull::new(window).map(|window| {
++        // SAFETY: the caller's.
++        unsafe { NativeWindow::acquire(window) }
++    });
++    let mut shared = SHARED.lock();
++    let same = match (&shared.native, &new) {
++        (Some(old), Some(new)) => old.0 == new.0,
++        (None, None) => true,
++        _ => false,
++    };
++    let primary = shared.windows.first().map(Arc::clone);
++    if same {
++        // The window's size may have changed (`surfaceChanged`).
++        if let (Some(window), Some(native)) = (primary, new) {
++            drop(shared);
++            lay_out(&window, &native);
++        }
++        return;
++    }
++    shared.native = new.as_ref().map(Arc::clone);
++    drop(shared);
++    log::info!(
++        target: "reims_vgpu_window",
++        "the app's window {}",
++        if new.is_some() { "changed" } else { "went away" }
++    );
++    let Some(window) = primary else {
++        return;
++    };
++    match &new {
++        Some(native) => show(&window, Some(native)),
++        None => window.surface().clear_target(),
++    }
++    if !window.surface().wait_released(RELEASE_WAIT) {
++        log::warn!(
++            target: "reims_vgpu_window",
++            "the render thread still holds the app's old window after {RELEASE_WAIT:?}"
++        );
++    }
++}
++
++/// A touch or a mouse event, in the guest's pixels, with the `RVG_WINDOW_BUTTON_*` bits held. It
++/// goes to the host from the input thread (the module doc); before a window opens or the guest
++/// has set a mode there is nothing to send it to, and it is dropped.
++pub fn pointer(x: u16, y: u16, buttons: u32) {
++    let sent = input_thread().lock().send((x, y, buttons));
++    debug_assert!(
++        sent.is_ok(),
++        "the input thread outlives the process's windows"
++    );
++}
++
++/// The sender to the input thread, started the first time it is asked for.
++fn input_thread() -> &'static Mutex<Sender<(u16, u16, u32)>> {
++    static SENDER: OnceLock<Mutex<Sender<(u16, u16, u32)>>> = OnceLock::new();
++    SENDER.get_or_init(|| {
++        let (sender, events) = mpsc::channel::<(u16, u16, u32)>();
++        spawn_named(
++            &OsThreads::without_hints(),
++            "reims-vgpu.ui",
++            INPUT_STACK,
++            Box::new(()),
++            move || {
++                for (x, y, buttons) in events {
++                    send_pointer(x, y, buttons);
++                }
++            },
++        );
++        Mutex::new(sender)
++    })
++}
++
++/// Sends the host a pointer event over the shown window, held inside the guest's mode as every
++/// window's pointer is.
++fn send_pointer(x: u16, y: u16, buttons: u32) {
++    let Some(window) = SHARED.lock().windows.first().map(Arc::clone) else {
++        return;
++    };
++    let Some((width, height)) = window.mode().filter(|&(w, h)| w > 0 && h > 0) else {
++        return;
++    };
++    window.pointer_sent();
++    let Some(callbacks) = window.callbacks() else {
++        return;
++    };
++    if let Some(pointer) = &callbacks.pointer {
++        pointer(x.min(width - 1), y.min(height - 1), width, height, buttons);
++    }
++}
++
++/// Starts `window`'s render thread and shows it where it is the first window open.
++pub(crate) fn open(window: &Arc<Window>) {
++    render_thread::start(Arc::clone(window));
++    window.opening();
++    window.surface().set_visible(true);
++    let mut shared = SHARED.lock();
++    shared.windows.push(Arc::clone(window));
++    if shared.windows.len() == 1 {
++        let native = shared.native.as_ref().map(Arc::clone);
++        drop(shared);
++        show(window, native.as_ref());
++    }
++}
++
++/// The window `id` of the open windows, and the app's window.
++fn window_of(id: u64) -> (Option<Arc<Window>>, Option<Arc<NativeWindow>>) {
++    let shared = SHARED.lock();
++    (
++        shared.windows.iter().find(|w| w.id() == id).map(Arc::clone),
++        shared.native.as_ref().map(Arc::clone),
++    )
++}
++
++/// The guest of window `id` set a mode: the image is laid out again.
++pub(crate) fn guest_mode_changed(id: u64) {
++    if let (Some(window), Some(native)) = window_of(id) {
++        lay_out(&window, &native);
++    }
++}
++
++/// The guest of window `id` changed its cursor or showed or hid it: drawn with the next frame.
++pub(crate) fn cursor_changed(id: u64) {
++    if let (Some(window), _) = window_of(id) {
++        window.take_cursor_refresh();
++        window.surface().request_draw();
++    }
++}
++
++/// Window `id` ended: it is forgotten, and the next window open, if any, is shown.
++pub(crate) fn close(id: u64) {
++    let (next, native) = {
++        let mut shared = SHARED.lock();
++        let was_primary = shared.windows.first().is_some_and(|w| w.id() == id);
++        shared.windows.retain(|w| w.id() != id);
++        let next = was_primary
++            .then(|| shared.windows.first().map(Arc::clone))
++            .flatten();
++        (next, shared.native.as_ref().map(Arc::clone))
++    };
++    if let Some(next) = next {
++        show(&next, native.as_ref());
++    }
++}
++
++/// Nothing is kept of a window whose render thread has ended.
++pub(in crate::native) fn render_ended(_id: u64) {}
++
++/// Now, on the monotonic clock the library's platform reads.
++pub(crate) fn now() -> MonoTime {
++    OsClock::new().now_mono()
++}
++
++/// The host's screens: the app's window, where it has pixels. Android gives a Surface no refresh
++/// rate through the NDK, so a display matching it offers the default.
++pub(crate) fn host_screens() -> Vec<HostScreen> {
++    let native = SHARED.lock().native.as_ref().map(Arc::clone);
++    native
++        .and_then(|native| native.pixels())
++        .map(|pixels| HostScreen {
++            id: 0,
++            pixels,
++            scale: 1.0,
++            refresh_hz: DEFAULT_REFRESH_HZ,
++        })
++        .into_iter()
++        .collect()
++}
+diff --git a/crates/reims-vgpu-window/src/native/linux.rs b/crates/reims-vgpu-window/src/native/linux.rs
+index 65666b7cc76fc2340969b32c839b95961fa6a1d6..e0e96e8ef502d4bf248c8fa9ea2f9020185191cf 100644
+--- a/crates/reims-vgpu-window/src/native/linux.rs
++++ b/crates/reims-vgpu-window/src/native/linux.rs
+@@ -11,7 +11,7 @@
+ mod control;
+ mod input;
+ mod keymap;
+-mod render;
++pub(super) mod render;
+ pub(crate) mod sdl;
+ mod ui;
+ 
+@@ -20,8 +20,9 @@ use std::sync::Arc;
+ use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
+ use reims_vgpu_vulkan::os::OsClock;
+ 
+-pub use render::FrameSink;
+-pub(crate) use render::Surface;
++use super::vulkan_render as render_thread;
++pub use render_thread::FrameSink;
++pub(crate) use render_thread::Surface;
+ 
+ use crate::handle::Window;
+ use crate::screens::HostScreen;
+@@ -32,7 +33,7 @@ use crate::sdl::shell;
+ /// has not started.
+ pub(crate) fn open(window: &Arc<Window>) {
+     control::start();
+-    render::start(Arc::clone(window));
++    render_thread::start(Arc::clone(window));
+     let window = Arc::downgrade(window);
+     ui::post(move || {
+         if let Some(window) = window.upgrade() {
+diff --git a/crates/reims-vgpu-window/src/native/linux/render.rs b/crates/reims-vgpu-window/src/native/linux/render.rs
+index 0bf2ab63e346d1395b7cc0fac3e444d83d3a080c..e0f411646a3e5edb0e219276dba4dc79ab7ad468 100644
+--- a/crates/reims-vgpu-window/src/native/linux/render.rs
++++ b/crates/reims-vgpu-window/src/native/linux/render.rs
+@@ -1,65 +1,14 @@
+-//! A window's render thread, which draws the display's current frame into the window's swapchain
+-//! when there is something new to show, the [`Surface`] it shares with the window and the UI
+-//! thread, and what the display's sink gives it ([`FrameSink`]).
+-//!
+-//! One thread per window (`reims-vgpu.window`), started when the window attaches. It waits until
+-//! there is something to draw: a new guest frame, a new layout (the window resized, or moved to a
+-//! screen of another scale, or the guest set a mode), the window showing again, or a change of
+-//! the guest's cursor where the window draws it ([`Window::drawn_cursor`], which each draw hands
+-//! the presenter), or a change of what the window draws around the image at its control's say
+-//! (the image's rotation, the button bar and which button is lit: [`Surface::set_decoration`],
+-//! which each draw hands the presenter too, so the bar repaints with no frame of the guest's).
+-//! It draws only
+-//! while the window is shown, once SDL's window and the layout exist, through a presenter the sink
+-//! makes over the window ([`FrameSink::presenter`]), which makes the window's Vulkan surface
+-//! ([`VulkanTarget`]), as `crate::present` says: made at the first draw, tried again after
+-//! [`RETRY`] where no image came in time, made again where one ends.
+-//!
+-//! Requests that come while it draws fold into one: it draws the latest frame once more. It
+-//! copies the sink out of the window's lock before asking it, and holds no lock of the window's
+-//! while it draws.
+-//!
+-//! It ends at the window's end ([`Surface::close`]): it drops its presenter, which destroys the
+-//! swapchain and the Vulkan surface, and only then posts to the UI thread that SDL's window may go
+-//! ([`crate::sdl::shell::released`]), so the surface always goes before the window under it.
+-//! Nothing joins it, and the window's end waits for nothing.
+-
+-use std::sync::Arc;
++//! The Linux render thread's window: SDL's, which only its Vulkan surface is made of. The thread
++//! itself is shared with Android (`crate::native::vulkan_render`).
+ 
+ use ash::vk;
+-use reims_vgpu_core::rt::spawn_named;
+-use reims_vgpu_core::sync::{Condvar, Mutex};
+-use reims_vgpu_vulkan::os::OsThreads;
+ use sdl3_sys::everything::{SDL_Vulkan_CreateSurface, SDL_Window};
+ 
+-use crate::decor::Decoration;
+-use crate::geometry::Layout;
+-use crate::handle::Window;
+-use crate::present::{Presenter, Presenting, RETRY, VulkanTarget};
+-
+-/// The render thread's stack.
+-const STACK: usize = 512 * 1024;
+-
+-/// What draws a display's current frame into a window: `reims-vgpu`'s, over the display, which it
+-/// holds weakly.
+-pub trait FrameSink: Send + Sync {
+-    /// A presenter over `target`'s window: one that makes the window's surface on the sink's
+-    /// Vulkan instance and a swapchain over it. `None` where there is none (the display has
+-    /// ended, or this host has no swapchain): the window then stays empty.
+-    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
+-
+-    /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
+-    /// once the display has ended, without a guest display, while it is paused, and for a sink
+-    /// that cannot tell. Asked on the thread of the display's callbacks
+-    /// ([`Window::cursor_moved`](crate::Window::cursor_moved)).
+-    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+-        None
+-    }
+-}
++use crate::present::VulkanTarget;
+ 
+ /// SDL's window, as its render thread holds it: only to make the window's Vulkan surface of it.
+ #[derive(Clone, Copy, Debug)]
+-pub(crate) struct Target(pub(super) *mut SDL_Window);
++pub(crate) struct Target(pub(in crate::native) *mut SDL_Window);
+ 
+ // SAFETY: SDL's thread makes and destroys the window, and destroys it only once the render thread
+ // has let its surface go ([`crate::sdl::shell::released`]); the render thread, the only other one
+@@ -93,322 +42,15 @@ impl VulkanTarget for Target {
+     }
+ }
+ 
+-/// What the render thread draws with, shared with the window and the UI thread.
+-#[derive(Debug, Default)]
+-pub(crate) struct Surface {
+-    state: Mutex<SurfaceState>,
+-    wake: Condvar,
+-}
+-
+-/// The surface's state.
+-#[derive(Debug, Default)]
+-struct SurfaceState {
+-    /// SDL's window, once it has opened on the UI thread.
+-    target: Option<Target>,
+-    /// Where the drawable and the image are, once the window has laid out.
+-    layout: Option<Layout>,
+-    /// What is drawn around the image: none for a plain window ([`Decoration::is_plain`]).
+-    decoration: Option<Arc<Decoration>>,
+-    /// Whether the window is shown.
+-    visible: bool,
+-    /// Something new to show: a frame, a layout, the window showing again.
+-    dirty: bool,
+-    /// The window has ended: the render thread ends.
+-    closed: bool,
+-}
+-
+-/// A draw the render thread takes: SDL's window and the layout.
+-struct Work {
+-    target: Target,
+-    layout: Layout,
+-    decoration: Option<Arc<Decoration>>,
+-}
+-
+-impl SurfaceState {
+-    /// The draw to make now, if any: something new, the window shown, its window and layout
+-    /// there.
+-    fn take(&mut self) -> Option<Work> {
+-        if !(self.dirty && self.visible) {
+-            return None;
+-        }
+-        let (Some(target), Some(layout)) = (self.target, self.layout) else {
+-            return None;
+-        };
+-        self.dirty = false;
+-        Some(Work {
+-            target,
+-            layout,
+-            decoration: self.decoration.clone(),
+-        })
+-    }
+-
+-    /// The draw to make again after one that had no image in time: the newest, else the same,
+-    /// while the window is shown. None while it is hidden: the draw waits for it to show, which
+-    /// asks for one ([`Surface::set_visible`]).
+-    fn retake(&mut self, work: Work) -> Option<Work> {
+-        if !self.visible {
+-            return None;
+-        }
+-        Some(self.take().unwrap_or(work))
+-    }
+-}
+-
+-impl Surface {
+-    /// An empty surface: no window, no layout, not shown.
+-    pub(crate) fn new() -> Surface {
+-        Surface::default()
+-    }
+-
+-    /// Changes the state with `f` and wakes the render thread.
+-    fn update(&self, f: impl FnOnce(&mut SurfaceState)) {
+-        f(&mut self.state.lock());
+-        self.wake.notify_all();
+-    }
+-
+-    /// SDL's window, from the UI thread as the window opens.
+-    pub(crate) fn set_target(&self, target: Target) {
+-        self.update(|s| {
+-            s.target = Some(target);
+-            s.dirty = true;
+-        });
+-    }
+-
+-    /// The window's layout: a changed one is drawn.
+-    pub(crate) fn set_layout(&self, layout: Layout) {
+-        self.update(|s| {
+-            if s.layout != Some(layout) {
+-                s.layout = Some(layout);
+-                s.dirty = true;
+-            }
+-        });
+-    }
+-
+-    /// What the window draws around the image (`crate::decor`), laid out with the layout the
+-    /// window last set: a changed one is drawn. A plain one is none, so a window whose control
+-    /// asks for nothing draws as one with no control.
+-    pub(crate) fn set_decoration(&self, decoration: Decoration) {
+-        let decoration = (!decoration.is_plain()).then(|| Arc::new(decoration));
+-        self.update(|s| {
+-            if s.decoration != decoration {
+-                s.decoration = decoration;
+-                s.dirty = true;
+-            }
+-        });
+-    }
+-
+-    /// Whether the window is shown: nothing is drawn while it is not, and it is drawn again when
+-    /// it shows.
+-    pub(crate) fn set_visible(&self, visible: bool) {
+-        self.update(|s| {
+-            if visible && !s.visible {
+-                s.dirty = true;
+-            }
+-            s.visible = visible;
+-        });
+-    }
+-
+-    /// The guest presented a frame: it is drawn.
+-    pub(crate) fn request_draw(&self) {
+-        self.update(|s| s.dirty = true);
+-    }
+-
+-    /// The window's end: the render thread ends.
+-    pub(crate) fn close(&self) {
+-        self.update(|s| s.closed = true);
+-    }
+-
+-    /// Waits for the next draw; `None` at the window's end. `retry` asks for the last draw
+-    /// again after [`RETRY`], where nothing newer comes first.
+-    fn next(&self, retry: Option<Work>) -> Option<Work> {
+-        let mut state = self.state.lock();
+-        if let Some(work) = retry
+-            && !state.closed
+-        {
+-            self.wake.wait_for(&mut state, RETRY);
+-            if state.closed {
+-                return None;
+-            }
+-            if let Some(work) = state.retake(work) {
+-                return Some(work);
+-            }
+-        }
+-        loop {
+-            if state.closed {
+-                return None;
+-            }
+-            if let Some(work) = state.take() {
+-                return Some(work);
+-            }
+-            self.wake.wait(&mut state);
+-        }
+-    }
+-}
+-
+-/// Starts `window`'s render thread.
+-pub(crate) fn start(window: Arc<Window>) {
+-    spawn_named(
+-        &OsThreads::without_hints(),
+-        "reims-vgpu.window",
+-        STACK,
+-        Box::new(()),
+-        move || run(&window),
+-    );
+-}
+-
+-/// The render thread's body: draws until the window's end, then lets its presenter go and posts
+-/// the window's release to the UI thread.
+-fn run(window: &Window) {
+-    let surface = window.surface();
+-    let mut presenting = Presenting::default();
+-    let mut retry = None;
+-    while let Some(work) = surface.next(retry.take()) {
+-        if presenting.needs_presenter() {
+-            // The sink is copied out of the window's lock: none is held while it answers.
+-            let Some(sink) = window.sink() else {
+-                continue;
+-            };
+-            presenting.make(|| sink.presenter(&work.target));
+-        }
+-        let cursor = window.drawn_cursor();
+-        if presenting.draw_decorated(
+-            work.layout.drawable,
+-            work.layout.pixels,
+-            cursor.as_ref(),
+-            work.decoration.as_deref(),
+-        ) {
+-            retry = Some(work);
+-        }
+-    }
+-    drop(presenting);
+-    let id = window.id();
++/// The render thread has let its surface go: SDL's window may go ([`crate::sdl::shell::released`]).
++pub(in crate::native) fn render_ended(id: u64) {
+     super::ui::post(move || crate::sdl::shell::released(id));
+ }
+ 
+ #[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use crate::geometry::{self, Insets};
+-
+-    /// A layout for a 100×50 point window at scale 2.
+-    fn a_layout() -> Layout {
+-        geometry::layout((100.0, 50.0), 2.0, Insets::default(), Some((1920, 1080)))
+-    }
+-
+-    /// A target that names no window, for the state's logic.
+-    fn a_target() -> Target {
++impl Target {
++    /// A target that names no window.
++    pub(in crate::native) fn empty() -> Target {
+         Target(std::ptr::null_mut())
+     }
+-
+-    /// Nothing is drawn while the window is hidden, and the window is drawn again as it shows
+-    #[test]
+-    fn a_hidden_window_is_drawn_when_it_shows() {
+-        let mut s = SurfaceState {
+-            target: Some(a_target()),
+-            layout: Some(a_layout()),
+-            dirty: true,
+-            ..SurfaceState::default()
+-        };
+-        assert!(s.take().is_none());
+-        s.visible = true;
+-        assert!(s.take().is_some());
+-        assert!(s.take().is_none(), "one draw per request");
+-    }
+-
+-    /// Nothing is drawn before SDL's window and the layout
+-    #[test]
+-    fn nothing_is_drawn_before_the_window_and_layout() {
+-        let mut s = SurfaceState {
+-            visible: true,
+-            dirty: true,
+-            ..SurfaceState::default()
+-        };
+-        assert!(s.take().is_none());
+-        s.layout = Some(a_layout());
+-        assert!(s.take().is_none());
+-        s.target = Some(a_target());
+-        assert_eq!(s.take().map(|w| w.layout), Some(a_layout()));
+-    }
+-
+-    /// Showing again, a new layout and a new frame each ask for a draw; an unchanged layout does
+-    /// not; a draw with no image comes again
+-    #[test]
+-    fn what_asks_for_a_draw() {
+-        let surface = Surface::new();
+-        surface.set_target(a_target());
+-        surface.set_layout(a_layout());
+-        surface.set_visible(true);
+-        assert!(surface.state.lock().take().is_some());
+-        surface.set_layout(a_layout());
+-        assert!(surface.state.lock().take().is_none());
+-        surface.request_draw();
+-        let work = surface.next(None).unwrap();
+-        let again = surface.next(Some(work)).unwrap();
+-        assert_eq!(
+-            again.layout,
+-            a_layout(),
+-            "the draw with no image comes again"
+-        );
+-        surface.set_visible(false);
+-        surface.set_visible(true);
+-        assert!(surface.state.lock().take().is_some());
+-        surface.close();
+-        assert!(surface.next(None).is_none());
+-    }
+-
+-    /// A changed decoration asks for a draw, with no frame of the guest's, and is handed to it;
+-    /// an unchanged one does not, and a plain one is none
+-    #[test]
+-    fn a_changed_decoration_is_drawn() {
+-        use crate::decor::Rotation;
+-
+-        let surface = Surface::new();
+-        surface.set_target(a_target());
+-        surface.set_layout(a_layout());
+-        surface.set_visible(true);
+-        assert!(surface.state.lock().take().unwrap().decoration.is_none());
+-        surface.set_decoration(Decoration::default());
+-        assert!(surface.state.lock().take().is_none(), "plain: as before");
+-        let turned = Decoration {
+-            rotation: Rotation::Quarter,
+-            bar: None,
+-        };
+-        surface.set_decoration(turned.clone());
+-        let work = surface.state.lock().take().unwrap();
+-        assert_eq!(work.decoration.as_deref(), Some(&turned));
+-        surface.set_decoration(turned);
+-        assert!(surface.state.lock().take().is_none());
+-        surface.set_decoration(Decoration::default());
+-        assert!(surface.state.lock().take().unwrap().decoration.is_none());
+-    }
+-
+-    /// A draw that had no image in time is not made again while the window is hidden: it is
+-    /// made once the window shows
+-    #[test]
+-    fn a_hidden_window_takes_no_retry() {
+-        let mut s = SurfaceState {
+-            target: Some(a_target()),
+-            layout: Some(a_layout()),
+-            visible: true,
+-            dirty: true,
+-            ..SurfaceState::default()
+-        };
+-        let work = s.take().unwrap();
+-        assert!(s.retake(work).is_some(), "shown, the draw comes again");
+-        let work = Work {
+-            target: a_target(),
+-            layout: a_layout(),
+-            decoration: None,
+-        };
+-        s.visible = false;
+-        assert!(s.retake(work).is_none(), "hidden, it does not");
+-        let surface = Surface::new();
+-        surface.set_target(a_target());
+-        surface.set_layout(a_layout());
+-        surface.set_visible(false);
+-        surface.set_visible(true);
+-        assert!(
+-            surface.state.lock().take().is_some(),
+-            "shown again, it is drawn"
+-        );
+-    }
+ }
+diff --git a/crates/reims-vgpu-window/src/native/vulkan_render.rs b/crates/reims-vgpu-window/src/native/vulkan_render.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd9b4c31ef28b477bfc75e0c5855bf488fb10325
+--- /dev/null
++++ b/crates/reims-vgpu-window/src/native/vulkan_render.rs
+@@ -0,0 +1,484 @@
++//! A window's render thread, which draws the display's current frame into the window's swapchain
++//! when there is something new to show, the [`Surface`] it shares with the window and the UI
++//! thread, and what the display's sink gives it ([`FrameSink`]).
++//!
++//! One thread per window (`reims-vgpu.window`), started when the window attaches. It waits until
++//! there is something to draw: a new guest frame, a new layout (the window resized, or moved to a
++//! screen of another scale, or the guest set a mode), the window showing again, or a change of
++//! the guest's cursor where the window draws it ([`Window::drawn_cursor`], which each draw hands
++//! the presenter), or a change of what the window draws around the image at its control's say
++//! (the image's rotation, the button bar and which button is lit: [`Surface::set_decoration`],
++//! which each draw hands the presenter too, so the bar repaints with no frame of the guest's).
++//! It draws only
++//! while the window is shown, once SDL's window and the layout exist, through a presenter the sink
++//! makes over the window ([`FrameSink::presenter`]), which makes the window's Vulkan surface
++//! ([`VulkanTarget`]), as `crate::present` says: made at the first draw, tried again after
++//! [`RETRY`] where no image came in time, made again where one ends.
++//!
++//! Requests that come while it draws fold into one: it draws the latest frame once more. It
++//! copies the sink out of the window's lock before asking it, and holds no lock of the window's
++//! while it draws.
++//!
++//! It ends at the window's end ([`Surface::close`]): it drops its presenter, which destroys the
++//! swapchain and the Vulkan surface, and only then posts to the UI thread that SDL's window may go
++//! ([`crate::sdl::shell::released`]), so the surface always goes before the window under it.
++//! Nothing joins it, and the window's end waits for nothing.
++
++use std::sync::Arc;
++
++#[cfg(target_os = "android")]
++use std::time::{Duration, Instant};
++
++use reims_vgpu_core::rt::spawn_named;
++use reims_vgpu_core::sync::{Condvar, Mutex};
++use reims_vgpu_vulkan::os::OsThreads;
++
++#[cfg(target_os = "android")]
++use super::android::{Target, render_ended};
++#[cfg(target_os = "linux")]
++use super::linux::render::{Target, render_ended};
++use crate::decor::Decoration;
++use crate::geometry::Layout;
++use crate::handle::Window;
++use crate::present::{Presenter, Presenting, RETRY, VulkanTarget};
++
++/// The render thread's stack.
++const STACK: usize = 512 * 1024;
++
++/// What draws a display's current frame into a window: `reims-vgpu`'s, over the display, which it
++/// holds weakly.
++pub trait FrameSink: Send + Sync {
++    /// A presenter over `target`'s window: one that makes the window's surface on the sink's
++    /// Vulkan instance and a swapchain over it. `None` where there is none (the display has
++    /// ended, or this host has no swapchain): the window then stays empty.
++    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
++
++    /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
++    /// once the display has ended, without a guest display, while it is paused, and for a sink
++    /// that cannot tell. Asked on the thread of the display's callbacks
++    /// ([`Window::cursor_moved`](crate::Window::cursor_moved)).
++    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
++        None
++    }
++}
++
++/// What the render thread draws with, shared with the window and the UI thread.
++#[derive(Debug, Default)]
++pub(crate) struct Surface {
++    state: Mutex<SurfaceState>,
++    wake: Condvar,
++}
++
++/// The surface's state.
++#[derive(Debug, Default)]
++struct SurfaceState {
++    /// SDL's window, once it has opened on the UI thread.
++    target: Option<Target>,
++    /// Where the drawable and the image are, once the window has laid out.
++    layout: Option<Layout>,
++    /// What is drawn around the image: none for a plain window ([`Decoration::is_plain`]).
++    decoration: Option<Arc<Decoration>>,
++    /// Whether the window is shown.
++    visible: bool,
++    /// Something new to show: a frame, a layout, the window showing again.
++    dirty: bool,
++    /// The window has ended: the render thread ends.
++    closed: bool,
++    /// How many times the target has changed: a render thread that drew over an earlier one lets
++    /// its presenter go first.
++    generation: u64,
++    /// The newest generation the render thread has let go of everything older than.
++    released: u64,
++}
++
++/// What the render thread does next ([`Surface::next`]).
++enum Step {
++    /// The target changed: its presenter, and with it the window's swapchain and Vulkan surface,
++    /// goes, and then it tells [`Surface::wait_released`] it has.
++    Release(u64),
++    /// A draw.
++    Draw(Work),
++}
++
++/// A draw the render thread takes: the OS's window and the layout.
++struct Work {
++    target: Target,
++    layout: Layout,
++    decoration: Option<Arc<Decoration>>,
++}
++
++impl SurfaceState {
++    /// The draw to make now, if any: something new, the window shown, its window and layout
++    /// there.
++    fn take(&mut self) -> Option<Work> {
++        if !(self.dirty && self.visible) {
++            return None;
++        }
++        let (Some(target), Some(layout)) = (&self.target, self.layout) else {
++            return None;
++        };
++        // A copy of the handle on Linux, a reference on Android.
++        #[allow(clippy::clone_on_copy)]
++        let target = target.clone();
++        self.dirty = false;
++        Some(Work {
++            target,
++            layout,
++            decoration: self.decoration.clone(),
++        })
++    }
++
++    /// The draw to make again after one that had no image in time: the newest, else the same,
++    /// while the window is shown. None while it is hidden: the draw waits for it to show, which
++    /// asks for one ([`Surface::set_visible`]).
++    fn retake(&mut self, work: Work) -> Option<Work> {
++        if !self.visible {
++            return None;
++        }
++        Some(self.take().unwrap_or(work))
++    }
++}
++
++impl Surface {
++    /// An empty surface: no window, no layout, not shown.
++    pub(crate) fn new() -> Surface {
++        Surface::default()
++    }
++
++    /// Changes the state with `f` and wakes the render thread.
++    fn update(&self, f: impl FnOnce(&mut SurfaceState)) {
++        f(&mut self.state.lock());
++        self.wake.notify_all();
++    }
++
++    /// The OS's window, as the window opens, or a new one where the old went (Android's Surface,
++    /// replaced each time the app shows again).
++    pub(crate) fn set_target(&self, target: Target) {
++        self.update(|s| {
++            s.target = Some(target);
++            s.dirty = true;
++            s.generation += 1;
++        });
++    }
++
++    /// The OS's window went away: nothing is drawn until the next [`Surface::set_target`], and
++    /// the render thread lets its presenter go.
++    #[cfg(target_os = "android")]
++    pub(crate) fn clear_target(&self) {
++        self.update(|s| {
++            s.target = None;
++            s.generation += 1;
++        });
++    }
++
++    /// Waits, up to `timeout`, for the render thread to let go of every target but the current
++    /// one: whether it did. Called by what is about to give the old window back to the OS.
++    #[cfg(target_os = "android")]
++    pub(crate) fn wait_released(&self, timeout: Duration) -> bool {
++        let deadline = Instant::now() + timeout;
++        let mut state = self.state.lock();
++        while state.released < state.generation && !state.closed {
++            let left = deadline.saturating_duration_since(Instant::now());
++            if left.is_zero() {
++                return false;
++            }
++            self.wake.wait_for(&mut state, left);
++        }
++        true
++    }
++
++    /// The render thread has let go of every target older than `generation`.
++    fn released(&self, generation: u64) {
++        self.update(|s| s.released = generation);
++    }
++
++    /// The window's layout: a changed one is drawn.
++    pub(crate) fn set_layout(&self, layout: Layout) {
++        self.update(|s| {
++            if s.layout != Some(layout) {
++                s.layout = Some(layout);
++                s.dirty = true;
++            }
++        });
++    }
++
++    /// What the window draws around the image (`crate::decor`), laid out with the layout the
++    /// window last set: a changed one is drawn. A plain one is none, so a window whose control
++    /// asks for nothing draws as one with no control.
++    pub(crate) fn set_decoration(&self, decoration: Decoration) {
++        let decoration = (!decoration.is_plain()).then(|| Arc::new(decoration));
++        self.update(|s| {
++            if s.decoration != decoration {
++                s.decoration = decoration;
++                s.dirty = true;
++            }
++        });
++    }
++
++    /// Whether the window is shown: nothing is drawn while it is not, and it is drawn again when
++    /// it shows.
++    pub(crate) fn set_visible(&self, visible: bool) {
++        self.update(|s| {
++            if visible && !s.visible {
++                s.dirty = true;
++            }
++            s.visible = visible;
++        });
++    }
++
++    /// The guest presented a frame: it is drawn.
++    pub(crate) fn request_draw(&self) {
++        self.update(|s| s.dirty = true);
++    }
++
++    /// The window's end: the render thread ends.
++    pub(crate) fn close(&self) {
++        self.update(|s| s.closed = true);
++    }
++
++    /// Waits for what the render thread does next; `None` at the window's end. `held` is the
++    /// generation of the target its presenter was made over: a newer one comes first, as a
++    /// release. `retry` asks for the last draw again after [`RETRY`], where nothing newer comes
++    /// first.
++    fn next(&self, retry: Option<Work>, held: u64) -> Option<Step> {
++        let mut state = self.state.lock();
++        if let Some(work) = retry
++            && !state.closed
++        {
++            self.wake.wait_for(&mut state, RETRY);
++            if state.closed {
++                return None;
++            }
++            if state.generation != held {
++                return Some(Step::Release(state.generation));
++            }
++            if let Some(work) = state.retake(work) {
++                return Some(Step::Draw(work));
++            }
++        }
++        loop {
++            if state.closed {
++                return None;
++            }
++            if state.generation != held {
++                return Some(Step::Release(state.generation));
++            }
++            if let Some(work) = state.take() {
++                return Some(Step::Draw(work));
++            }
++            self.wake.wait(&mut state);
++        }
++    }
++}
++
++/// Starts `window`'s render thread.
++pub(crate) fn start(window: Arc<Window>) {
++    spawn_named(
++        &OsThreads::without_hints(),
++        "reims-vgpu.window",
++        STACK,
++        Box::new(()),
++        move || run(&window),
++    );
++}
++
++/// The render thread's body: draws until the window's end, then lets its presenter go and posts
++/// the window's release to the UI thread.
++fn run(window: &Window) {
++    let surface = window.surface();
++    let mut presenting = Presenting::default();
++    let mut retry = None;
++    let mut held = 0;
++    while let Some(step) = surface.next(retry.take(), held) {
++        let work = match step {
++            Step::Release(generation) => {
++                // The old window's swapchain and surface go here, before anything may make a new
++                // one over a window the OS gives this process only one connection to.
++                presenting = Presenting::default();
++                held = generation;
++                surface.released(generation);
++                continue;
++            }
++            Step::Draw(work) => work,
++        };
++        if presenting.needs_presenter() {
++            // The sink is copied out of the window's lock: none is held while it answers.
++            let Some(sink) = window.sink() else {
++                continue;
++            };
++            presenting.make(|| sink.presenter(&work.target));
++        }
++        let cursor = window.drawn_cursor();
++        if presenting.draw_decorated(
++            work.layout.drawable,
++            work.layout.pixels,
++            cursor.as_ref(),
++            work.decoration.as_deref(),
++        ) {
++            retry = Some(work);
++        }
++    }
++    drop(presenting);
++    surface.released(u64::MAX);
++    render_ended(window.id());
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::geometry::{self, Insets};
++
++    /// A layout for a 100×50 point window at scale 2.
++    fn a_layout() -> Layout {
++        geometry::layout((100.0, 50.0), 2.0, Insets::default(), Some((1920, 1080)))
++    }
++
++    /// A target that names no window, for the state's logic.
++    fn a_target() -> Target {
++        Target::empty()
++    }
++
++    impl Surface {
++        /// The next draw, past every release.
++        fn next_draw(&self, retry: Option<Work>) -> Option<Work> {
++            let mut held = self.state.lock().generation;
++            let mut retry = retry;
++            loop {
++                match self.next(retry.take(), held)? {
++                    Step::Release(generation) => held = generation,
++                    Step::Draw(work) => return Some(work),
++                }
++            }
++        }
++    }
++
++    /// Nothing is drawn while the window is hidden, and the window is drawn again as it shows
++    #[test]
++    fn a_hidden_window_is_drawn_when_it_shows() {
++        let mut s = SurfaceState {
++            target: Some(a_target()),
++            layout: Some(a_layout()),
++            dirty: true,
++            ..SurfaceState::default()
++        };
++        assert!(s.take().is_none());
++        s.visible = true;
++        assert!(s.take().is_some());
++        assert!(s.take().is_none(), "one draw per request");
++    }
++
++    /// Nothing is drawn before SDL's window and the layout
++    #[test]
++    fn nothing_is_drawn_before_the_window_and_layout() {
++        let mut s = SurfaceState {
++            visible: true,
++            dirty: true,
++            ..SurfaceState::default()
++        };
++        assert!(s.take().is_none());
++        s.layout = Some(a_layout());
++        assert!(s.take().is_none());
++        s.target = Some(a_target());
++        assert_eq!(s.take().map(|w| w.layout), Some(a_layout()));
++    }
++
++    /// Showing again, a new layout and a new frame each ask for a draw; an unchanged layout does
++    /// not; a draw with no image comes again
++    #[test]
++    fn what_asks_for_a_draw() {
++        let surface = Surface::new();
++        surface.set_target(a_target());
++        surface.set_layout(a_layout());
++        surface.set_visible(true);
++        assert!(surface.state.lock().take().is_some());
++        surface.set_layout(a_layout());
++        assert!(surface.state.lock().take().is_none());
++        surface.request_draw();
++        let work = surface.next_draw(None).unwrap();
++        let again = surface.next_draw(Some(work)).unwrap();
++        assert_eq!(
++            again.layout,
++            a_layout(),
++            "the draw with no image comes again"
++        );
++        surface.set_visible(false);
++        surface.set_visible(true);
++        assert!(surface.state.lock().take().is_some());
++        surface.close();
++        assert!(surface.next_draw(None).is_none());
++    }
++
++    /// A new target comes first as a release, whatever is drawn, and then the draws are over it
++    #[test]
++    fn a_new_target_releases_before_it_draws() {
++        let surface = Surface::new();
++        surface.set_target(a_target());
++        surface.set_layout(a_layout());
++        surface.set_visible(true);
++        let held = surface.state.lock().generation;
++        assert!(matches!(surface.next(None, 0), Some(Step::Release(g)) if g == held));
++        surface.released(held);
++        assert!(matches!(surface.next(None, held), Some(Step::Draw(_))));
++        surface.set_target(a_target());
++        let newer = surface.state.lock().generation;
++        assert!(newer > held);
++        assert!(matches!(surface.next(None, held), Some(Step::Release(g)) if g == newer));
++    }
++
++    /// A changed decoration asks for a draw, with no frame of the guest's, and is handed to it;
++    /// an unchanged one does not, and a plain one is none
++    #[test]
++    fn a_changed_decoration_is_drawn() {
++        use crate::decor::Rotation;
++
++        let surface = Surface::new();
++        surface.set_target(a_target());
++        surface.set_layout(a_layout());
++        surface.set_visible(true);
++        assert!(surface.state.lock().take().unwrap().decoration.is_none());
++        surface.set_decoration(Decoration::default());
++        assert!(surface.state.lock().take().is_none(), "plain: as before");
++        let turned = Decoration {
++            rotation: Rotation::Quarter,
++            bar: None,
++        };
++        surface.set_decoration(turned.clone());
++        let work = surface.state.lock().take().unwrap();
++        assert_eq!(work.decoration.as_deref(), Some(&turned));
++        surface.set_decoration(turned);
++        assert!(surface.state.lock().take().is_none());
++        surface.set_decoration(Decoration::default());
++        assert!(surface.state.lock().take().unwrap().decoration.is_none());
++    }
++
++    /// A draw that had no image in time is not made again while the window is hidden: it is
++    /// made once the window shows
++    #[test]
++    fn a_hidden_window_takes_no_retry() {
++        let mut s = SurfaceState {
++            target: Some(a_target()),
++            layout: Some(a_layout()),
++            visible: true,
++            dirty: true,
++            ..SurfaceState::default()
++        };
++        let work = s.take().unwrap();
++        assert!(s.retake(work).is_some(), "shown, the draw comes again");
++        let work = Work {
++            target: a_target(),
++            layout: a_layout(),
++            decoration: None,
++        };
++        s.visible = false;
++        assert!(s.retake(work).is_none(), "hidden, it does not");
++        let surface = Surface::new();
++        surface.set_target(a_target());
++        surface.set_layout(a_layout());
++        surface.set_visible(false);
++        surface.set_visible(true);
++        assert!(
++            surface.state.lock().take().is_some(),
++            "shown again, it is drawn"
++        );
++    }
++}
+diff --git a/crates/reims-vgpu-window/src/present.rs b/crates/reims-vgpu-window/src/present.rs
+index c037e6e147964be9694d76740a686ea7ad29841e..3ffd6b27a027c4111d0da453d9dff36131c7af83 100644
+--- a/crates/reims-vgpu-window/src/present.rs
++++ b/crates/reims-vgpu-window/src/present.rs
+@@ -117,8 +117,8 @@ impl Presenting {
+     /// `region`, with `cursor` over it: whether to draw again after [`RETRY`] (no image came in
+     /// time). Nothing without a presenter.
+     #[cfg_attr(
+-        all(target_os = "linux", not(test)),
+-        expect(dead_code, reason = "Linux's render thread draws with its decoration")
++        all(any(target_os = "linux", target_os = "android"), not(test)),
++        expect(dead_code, reason = "this OS's render thread draws with its decoration")
+     )]
+     pub(crate) fn draw(
+         &mut self,
+diff --git a/crates/reims-vgpu/src/lib.rs b/crates/reims-vgpu/src/lib.rs
+index a88d015fdc023bf6103928cdfe342699a214ff8b..8f655466df6bb6955406b76270f486a55e59eeec 100644
+--- a/crates/reims-vgpu/src/lib.rs
++++ b/crates/reims-vgpu/src/lib.rs
+@@ -29,7 +29,7 @@
+ // limit of 128 (E0275), as the C crate's does.
+ #![recursion_limit = "256"]
+ 
+-#[cfg(all(target_os = "linux", not(feature = "vulkan")))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "vulkan")))]
+ compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
+ 
+ mod device;
+@@ -81,7 +81,7 @@ pub use video::{
+ #[cfg(target_os = "macos")]
+ pub type DefaultPlatform = MetalPlatform;
+ /// The platform every handle is made on by default: `VulkanPlatform` on Linux.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub type DefaultPlatform = VulkanPlatform;
+ pub use reims_vgpu_window::{
+     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
+@@ -97,3 +97,27 @@ pub const DEVICE_MMIO_SIZE: u64 = reims_vgpu_core::device::config::DEFAULT_MMIO_
+ pub const PCI_VENDOR_ID: u16 = 0x106b;
+ /// The PCI device ID of the device.
+ pub const PCI_DEVICE_ID: u16 = 0xeeee;
++
++/// What the app does on Android: its driver's `vkGetInstanceProcAddr`, its Surface, its touches.
++#[cfg(target_os = "android")]
++pub mod android {
++    pub use reims_vgpu_window::{android_pointer as pointer, android_set_window as set_window};
++
++    /// Registers the `vkGetInstanceProcAddr` every Vulkan instance of the process goes through
++    /// (`metal2vulkan_runtime::set_android_vulkan_gipa`), before the first device is made.
++    ///
++    /// # Safety
++    ///
++    /// `gipa` is a valid `vkGetInstanceProcAddr` that stays loaded for the life of the process.
++    pub unsafe fn set_vulkan_gipa(gipa: *mut std::ffi::c_void) {
++        // SAFETY: the caller's: a pointer of that type, or NULL.
++        let gipa = unsafe {
++            std::mem::transmute::<
++                *mut std::ffi::c_void,
++                Option<reims_vgpu_vulkan::ash_vk::PFN_vkGetInstanceProcAddr>,
++            >(gipa)
++        };
++        // SAFETY: the caller's.
++        unsafe { reims_vgpu_vulkan::set_android_vulkan_gipa(gipa) };
++    }
++}
+diff --git a/crates/reims-vgpu/src/platform.rs b/crates/reims-vgpu/src/platform.rs
+index f669a6eb4e9eec69e8b94a3323e2f0e5601f179c..2184dc89a3fabc944424a1b367fb0f63c5eae75d 100644
+--- a/crates/reims-vgpu/src/platform.rs
++++ b/crates/reims-vgpu/src/platform.rs
+@@ -315,7 +315,7 @@ mod tests {
+     /// The Vulkan platform's lease of the guest's RAM lets views be made of the pages the host
+     /// names a file behind, showing the file from its offset, while it lives; never of a range
+     /// without a file
+-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
++    #[cfg(all(feature = "vulkan", any(target_os = "linux", target_os = "android")))]
+     #[test]
+     fn the_vulkan_lease_lets_views_be_made_of_the_guests_ram() {
+         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+diff --git a/crates/reims-vgpu/src/platform/vulkan.rs b/crates/reims-vgpu/src/platform/vulkan.rs
+index a30c30e415800f37e4d8511e4c35b45d2902c8ca..683f75e0ce0d76c06a9daeb657ca1a1508d3e84d 100644
+--- a/crates/reims-vgpu/src/platform/vulkan.rs
++++ b/crates/reims-vgpu/src/platform/vulkan.rs
+@@ -9,7 +9,7 @@ use reims_vgpu_vulkan::os::GuestRamFile;
+ 
+ use super::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod lent_memory;
+ 
+ /// The platform over metal2vulkan's runtime (architecture 2.2): the runtime's devices, and on
+@@ -106,7 +106,7 @@ impl ApiPlatform for VulkanPlatform {
+     /// udmabuf and as the surface's view of them, with an identity attached to the surface
+     /// (`platform/vulkan/lent_memory.rs`). On macOS none: there the Metal platform lends a
+     /// surface's IOSurface to VideoToolbox (`platform/metal/lent_memory.rs`).
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     fn surface_device_memory(
+         &self,
+         surface: &<Self as Platform>::Surface,
+diff --git a/crates/reims-vgpu/src/scaler/gpu/tests.rs b/crates/reims-vgpu/src/scaler/gpu/tests.rs
+index 5bdf9a005f9a9a492374cd4468c81efd44613f80..fef8731cf41971a443c525412e99b47b249f628c 100644
+--- a/crates/reims-vgpu/src/scaler/gpu/tests.rs
++++ b/crates/reims-vgpu/src/scaler/gpu/tests.rs
+@@ -739,7 +739,7 @@ fn platform_surfaces_are_reached_in_place() {
+         let source = platform_surface(sl.clone(), &picture_bytes(&sl, None), None);
+         let grey = picture_bytes(&dl, Some([0.5, 0.5, 0.5, 1.0]));
+         let destination = platform_surface(dl.clone(), &grey, Some(2));
+-        if cfg!(target_os = "linux") && destination.memory.is_some() {
++        if cfg!(any(target_os = "linux", target_os = "android")) && destination.memory.is_some() {
+             println!("{gpu}: a read-only destination: no such surface of the platform's own");
+             continue;
+         }
+diff --git a/crates/reims-vgpu/src/video/backend_choice.rs b/crates/reims-vgpu/src/video/backend_choice.rs
+index 285882a1a348b0241f3086379c6365b4e2d6936b..c71412ef1483af69d0515247a905ca970a93e337 100644
+--- a/crates/reims-vgpu/src/video/backend_choice.rs
++++ b/crates/reims-vgpu/src/video/backend_choice.rs
+@@ -372,7 +372,7 @@ pub(crate) fn choose(
+     #[cfg(target_os = "macos")]
+     let _ = need;
+     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+-    let _ = (open, runtime);
++    let _ = (open, runtime, need);
+     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+     let picked = Picked {
+         label: "none",
+diff --git a/crates/reims-vgpu/src/window.rs b/crates/reims-vgpu/src/window.rs
+index 6aad5cbbbf70aa42d963f766f185a5b26d4c8c4e..8ea4e0c68cefe4ae00ff9038be4a1b46bbebcd1a 100644
+--- a/crates/reims-vgpu/src/window.rs
++++ b/crates/reims-vgpu/src/window.rs
+@@ -387,7 +387,7 @@ impl<P: Platform> SinkDisplay<P> {
+     /// holds it on until the frame completes. So when the host has released the display in the
+     /// meantime, this draw's release, inside this entry, may be the display's end.
+     #[cfg_attr(
+-        target_os = "linux",
++        any(target_os = "linux", target_os = "android"),
+         expect(
+             dead_code,
+             reason = "Linux's sink draws each frame with its decoration"
+diff --git a/crates/reims-vgpu/src/window/vulkan.rs b/crates/reims-vgpu/src/window/vulkan.rs
+index c16496afb52c39cc2f782f76a656a955a951286a..c5b8a561c60c009a8c96737e6fd729e3a4c24cf4 100644
+--- a/crates/reims-vgpu/src/window/vulkan.rs
++++ b/crates/reims-vgpu/src/window/vulkan.rs
+@@ -2,7 +2,7 @@
+ //! the window's swapchain, on either OS (`swapchain.rs`), and each OS's window asks the sink for
+ //! it its own way (`linux.rs`, `macos.rs`).
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;

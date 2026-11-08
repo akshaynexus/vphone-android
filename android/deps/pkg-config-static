@@ -1,0 +1,5 @@
+#!/bin/sh
+# Every dependency in out/deps is a static archive, so QEMU must always see the
+# private link lines as well (Libs.private, Requires.private). Passing --static
+# here keeps QEMU's meson files free of Android cases for that.
+exec pkg-config --static "$@"

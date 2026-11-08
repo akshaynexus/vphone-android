@@ -1,0 +1,2916 @@
+diff --git a/backends/hostmem-memfd.c b/backends/hostmem-memfd.c
+index 923239f9cf695743dc79bc1bef8b4d9e1c729e5d..79cc0e17a600b5795683dbeb53b6008ba1f814c1 100644
+--- a/backends/hostmem-memfd.c
++++ b/backends/hostmem-memfd.c
+@@ -28,6 +28,7 @@ struct HostMemoryBackendMemfd {
+     bool hugetlb;
+     uint64_t hugetlbsize;
+     bool seal;
++    uint64_t align;
+ };
+ 
+ static bool
+@@ -37,6 +38,7 @@ memfd_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
+     g_autofree char *name = host_memory_backend_get_name(backend);
+     int fd = cpr_find_fd(name, 0);
+     uint32_t ram_flags;
++    uint64_t align;
+ 
+     if (!backend->size) {
+         error_setg(errp, "can't create backend with size 0");
+@@ -61,8 +63,18 @@ have_fd:
+     ram_flags = backend->share ? RAM_SHARED : RAM_PRIVATE;
+     ram_flags |= backend->reserve ? 0 : RAM_NORESERVE;
+     ram_flags |= backend->guest_memfd ? RAM_GUEST_MEMFD : 0;
+-    return memory_region_init_ram_from_fd(&backend->mr, OBJECT(backend), name,
+-                                          backend->size, ram_flags, fd, 0, errp);
++    /*
++     * The host mapping must be aligned past the guest's page size whatever
++     * the host's page size is: views of guest RAM (apple-gfx's, for one) map
++     * whole guest pages, and a 16 KiB guest page may not straddle two.
++     */
++    align = m->align;
++    if (!align && !m->hugetlb) {
++        align = QEMU_VMALLOC_ALIGN;
++    }
++    return memory_region_init_ram_from_fd_align(&backend->mr, OBJECT(backend),
++                                                name, backend->size, align,
++                                                ram_flags, fd, 0, errp);
+ }
+ 
+ static bool
+@@ -122,6 +134,38 @@ memfd_backend_set_seal(Object *o, bool value, Error **errp)
+     MEMORY_BACKEND_MEMFD(o)->seal = value;
+ }
+ 
++static void
++memfd_backend_get_align(Object *o, Visitor *v, const char *name, void *opaque,
++                        Error **errp)
++{
++    uint64_t value = MEMORY_BACKEND_MEMFD(o)->align;
++
++    visit_type_size(v, name, &value, errp);
++}
++
++static void
++memfd_backend_set_align(Object *o, Visitor *v, const char *name, void *opaque,
++                        Error **errp)
++{
++    HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(o);
++    uint64_t value;
++
++    if (host_memory_backend_mr_inited(MEMORY_BACKEND(o))) {
++        error_setg(errp, "cannot change property '%s' of %s", name,
++                   object_get_typename(o));
++        return;
++    }
++
++    if (!visit_type_size(v, name, &value, errp)) {
++        return;
++    }
++    if (value && !is_power_of_2(value)) {
++        error_setg(errp, "'%s' must be 0 or a power of 2", name);
++        return;
++    }
++    m->align = value;
++}
++
+ static void
+ memfd_backend_instance_init(Object *obj)
+ {
+@@ -157,6 +201,12 @@ memfd_backend_class_init(ObjectClass *oc, const void *data)
+                                    memfd_backend_set_seal);
+     object_class_property_set_description(oc, "seal",
+                                           "Seal growing & shrinking");
++    object_class_property_add(oc, "align", "int",
++                              memfd_backend_get_align,
++                              memfd_backend_set_align,
++                              NULL, NULL);
++    object_class_property_set_description(oc, "align",
++                                          "Alignment of the guest RAM mapping");
+ }
+ 
+ static const TypeInfo memfd_backend_info = {
+diff --git a/block.c b/block.c
+index 97ee78299bf7566a1c0c808dc7bbca7eaad82102..f967680fc16ffa1b007db3787a268f4a7b03666b 100644
+--- a/block.c
++++ b/block.c
+@@ -863,9 +863,11 @@ char *create_tmp_file(Error **errp)
+      * so the files can become very large. /tmp is often a tmpfs where as
+      * /var/tmp is usually on a disk, so more appropriate for disk images.
+      */
++#ifndef CONFIG_ANDROID /* no /var/tmp on Android: $TMPDIR is the app's own */
+     if (!g_strcmp0(tmpdir, "/tmp")) {
+         tmpdir = "/var/tmp";
+     }
++#endif
+ #endif
+ 
+     filename = g_strdup_printf("%s/vl.XXXXXX", tmpdir);
+diff --git a/hw/arm/apple-silicon/meson.build b/hw/arm/apple-silicon/meson.build
+index 8d0b0fab09ba6d442fd147a115b6e1dedfaa1b01..198f5266994b3f9698b85e7d63c4d9383005a614 100644
+--- a/hw/arm/apple-silicon/meson.build
++++ b/hw/arm/apple-silicon/meson.build
+@@ -1,4 +1,4 @@
+-arm_common_ss.add(when: 'CONFIG_APPLE_SOC', if_true: tasn1)
++arm_common_ss.add(when: 'CONFIG_APPLE_SOC', if_true: [tasn1, liblzfse])
+ 
+ # Optional: the agxemu library executes the jobs the GPU firmware kicks.
+ agxemu_dir = get_option('agxemu')
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index 22952cd1e4ce641a67b6a6c1222e93fb88252916..83eabf94b8441c1ff4b0383f4fccdffcbb2ce53e 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -33,6 +33,7 @@ system_virtio_ss.add(when: 'CONFIG_VIRTIO_NSM', if_true: [files('cbor-helpers.c'
+ 
+ virtio_pci_ss = ss.source_set()
+ virtio_pci_ss.add(when: 'CONFIG_VHOST_VSOCK', if_true: files('vhost-vsock-pci.c'))
++virtio_pci_ss.add(files('virtio-vsock-uds.c'))
+ virtio_pci_ss.add(when: 'CONFIG_VHOST_SCSI', if_true: files('vhost-scsi-pci.c'))
+ 
+ virtio_pci_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-host-pci.c'))
+diff --git a/hw/virtio/virtio-vsock-uds.c b/hw/virtio/virtio-vsock-uds.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2be384995bd9149a1d49fa88b041b587459bfffe
+--- /dev/null
++++ b/hw/virtio/virtio-vsock-uds.c
+@@ -0,0 +1,981 @@
++/*
++ * virtio-vsock with the datapath inside QEMU: a hybrid vsock device whose
++ * host side is a Unix socket. /dev/vhost-vsock is not reachable from an
++ * Android app; this needs no kernel vsock at all.
++ *
++ * Host to guest: connect to uds-path and write "CONNECT <port>\n"; on the
++ * guest's accept the device writes "OK <n>\n" and relays the stream. Any
++ * bytes the client wrote after the newline are the start of the stream.
++ * Guest to host: a connection to host port <port> is relayed to the Unix
++ * socket <uds-path>_<port>, if something listens there.
++ *
++ * Credit. Host-to-guest data respects the guest's own window exactly and
++ * nothing else caps it. With credit-request (the default) the device asks
++ * the guest for an update when it has used the window up, because the iOS
++ * driver only sends one unasked when its 512 KiB window is nearly full, and
++ * a host client that has less than that to send then stalls forever (the
++ * same reason a socket buffer of 256 KiB stalls with vhost-vsock). The
++ * credit advertised to the guest is a fixed window, bounded by what the
++ * device can buffer towards a slow client.
++ *
++ * Everything runs in the main loop under the BQL: the virtqueue handlers
++ * and the socket's fd handlers.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include <sys/socket.h>
++#include <sys/uio.h>
++#include "qapi/error.h"
++#include "hw/qdev-properties.h"
++#include "hw/virtio/virtio-pci.h"
++#include "hw/virtio/virtio-vsock-uds.h"
++#include "migration/vmstate.h"
++#include "qemu/error-report.h"
++#include "qemu/iov.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/sockets.h"
++#include "standard-headers/linux/virtio_ids.h"
++#include "standard-headers/linux/virtio_vsock.h"
++
++/*
++ * 256 entries, as vhost-vsock: the iOS driver assumes page-aligned rings,
++ * and with smaller tables its avail and used rings can overlap.
++ */
++#define VSOCK_UDS_QUEUE_SIZE 256
++
++#define VSOCK_UDS_HOST_CID 2
++#define VSOCK_UDS_HDR_SIZE sizeof(struct virtio_vsock_hdr)
++
++/* What the guest may have in flight towards a host client. */
++#define VSOCK_UDS_BUF_ALLOC (8 * 1024 * 1024)
++/* An unasked credit update once this much has been forwarded. */
++#define VSOCK_UDS_CREDIT_THRESHOLD (VSOCK_UDS_BUF_ALLOC / 2)
++
++#define VSOCK_UDS_CMD_MAX 64
++#define VSOCK_UDS_RX_BATCH 64
++#define VSOCK_UDS_RESPONSE_TIMEOUT_MS 10000
++
++typedef enum {
++    VSOCK_UDS_CONNECT_LINE,     /* host client: reading "CONNECT <port>\n" */
++    VSOCK_UDS_WAIT_RESPONSE,    /* REQUEST sent to the guest */
++    VSOCK_UDS_ESTABLISHED,
++} VsockUdsState;
++
++/* A header-only packet waiting for room in the guest's receive queue. */
++struct VsockUdsCtrl {
++    QTAILQ_ENTRY(VsockUdsCtrl) next;
++    struct virtio_vsock_hdr hdr;
++};
++
++struct VsockUdsConn {
++    QTAILQ_ENTRY(VsockUdsConn) next;
++    VirtIOVsockUds *s;
++    VsockUdsState state;
++    int fd;
++    uint32_t host_port, guest_port;
++    int64_t started_ms;
++
++    char cmd[VSOCK_UDS_CMD_MAX];
++    size_t cmd_len;
++
++    /* Device to guest: the guest's window and what we have sent of it. */
++    uint32_t peer_buf_alloc, peer_fwd_cnt;
++    uint32_t tx_cnt;
++    bool credit_requested;
++
++    /* Guest to device: bytes accepted by the host socket. */
++    uint32_t fwd_cnt, last_fwd_cnt;
++
++    /* Bytes the host socket could not take yet. */
++    uint8_t *pend;
++    size_t pend_off, pend_len, pend_cap;
++
++    bool host_eof;              /* the client's read side reached EOF */
++    bool host_gone;             /* writing to the client failed */
++    bool guest_shut_send;       /* guest will not send more */
++    bool guest_shut_rcv;        /* guest will not receive more */
++    bool shut_wr_done;
++};
++
++static void vsock_uds_conn_update_fds(VsockUdsConn *c);
++static void vsock_uds_conn_read(void *opaque);
++
++static void vsock_uds_trace(VirtIOVsockUds *s, const char *dir,
++                            const struct virtio_vsock_hdr *h)
++{
++    static const char *const ops[] = {
++        "INVALID", "REQUEST", "RESPONSE", "RST", "SHUTDOWN", "RW",
++        "CREDIT_UPDATE", "CREDIT_REQUEST",
++    };
++    uint16_t op = le16_to_cpu(h->op);
++
++    if (s->debug < (op == VIRTIO_VSOCK_OP_RW ? 2 : 1)) {
++        return;
++    }
++    fprintf(stderr, "vsock-uds %s %s %u:%u->%u:%u len=%u flags=%u "
++            "buf_alloc=%u fwd_cnt=%u\n", dir,
++            op < ARRAY_SIZE(ops) ? ops[op] : "?",
++            (unsigned)le64_to_cpu(h->src_cid), le32_to_cpu(h->src_port),
++            (unsigned)le64_to_cpu(h->dst_cid), le32_to_cpu(h->dst_port),
++            le32_to_cpu(h->len), le32_to_cpu(h->flags),
++            le32_to_cpu(h->buf_alloc), le32_to_cpu(h->fwd_cnt));
++}
++
++static void vsock_uds_fill_hdr(VsockUdsConn *c, struct virtio_vsock_hdr *h,
++                               uint16_t op, uint32_t flags, uint32_t len)
++{
++    VirtIOVsockUds *s = c->s;
++
++    h->src_cid = cpu_to_le64(VSOCK_UDS_HOST_CID);
++    h->dst_cid = cpu_to_le64(s->guest_cid);
++    h->src_port = cpu_to_le32(c->host_port);
++    h->dst_port = cpu_to_le32(c->guest_port);
++    h->len = cpu_to_le32(len);
++    h->type = cpu_to_le16(VIRTIO_VSOCK_TYPE_STREAM);
++    h->op = cpu_to_le16(op);
++    h->flags = cpu_to_le32(flags);
++    h->buf_alloc = cpu_to_le32(VSOCK_UDS_BUF_ALLOC);
++    h->fwd_cnt = cpu_to_le32(c->fwd_cnt);
++}
++
++/* Returns false if the guest has no receive buffers left. */
++static bool vsock_uds_flush_ctrl(VirtIOVsockUds *s)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    VsockUdsCtrl *p;
++    bool sent = false, ok = true;
++
++    while ((p = QTAILQ_FIRST(&s->ctrl))) {
++        VirtQueueElement *elem;
++
++        elem = virtqueue_pop(s->rx_vq, sizeof(VirtQueueElement));
++        if (!elem) {
++            s->rx_starved = true;
++            ok = false;
++            break;
++        }
++        if (iov_size(elem->in_sg, elem->in_num) < VSOCK_UDS_HDR_SIZE) {
++            /* A buffer too small for a header: not usable, drop it. */
++            virtqueue_detach_element(s->rx_vq, elem, 0);
++            g_free(elem);
++            continue;
++        }
++        iov_from_buf(elem->in_sg, elem->in_num, 0, &p->hdr, VSOCK_UDS_HDR_SIZE);
++        vsock_uds_trace(s, "to guest", &p->hdr);
++        virtqueue_push(s->rx_vq, elem, VSOCK_UDS_HDR_SIZE);
++        g_free(elem);
++        QTAILQ_REMOVE(&s->ctrl, p, next);
++        g_free(p);
++        sent = true;
++    }
++    if (sent) {
++        virtio_notify(vdev, s->rx_vq);
++    }
++    return ok;
++}
++
++static void vsock_uds_send_ctrl_hdr(VirtIOVsockUds *s,
++                                    const struct virtio_vsock_hdr *h)
++{
++    VsockUdsCtrl *p = g_new(VsockUdsCtrl, 1);
++
++    p->hdr = *h;
++    QTAILQ_INSERT_TAIL(&s->ctrl, p, next);
++    vsock_uds_flush_ctrl(s);
++}
++
++static void vsock_uds_send_ctrl(VsockUdsConn *c, uint16_t op, uint32_t flags)
++{
++    struct virtio_vsock_hdr h;
++
++    vsock_uds_fill_hdr(c, &h, op, flags, 0);
++    vsock_uds_send_ctrl_hdr(c->s, &h);
++}
++
++/* An RST for a packet that matches no connection. */
++static void vsock_uds_send_rst_for(VirtIOVsockUds *s,
++                                   const struct virtio_vsock_hdr *in)
++{
++    struct virtio_vsock_hdr h = {
++        .src_cid = cpu_to_le64(VSOCK_UDS_HOST_CID),
++        .dst_cid = cpu_to_le64(s->guest_cid),
++        .src_port = in->dst_port,
++        .dst_port = in->src_port,
++        .type = cpu_to_le16(VIRTIO_VSOCK_TYPE_STREAM),
++        .op = cpu_to_le16(VIRTIO_VSOCK_OP_RST),
++    };
++
++    vsock_uds_send_ctrl_hdr(s, &h);
++}
++
++static void vsock_uds_conn_free(VsockUdsConn *c)
++{
++    VirtIOVsockUds *s = c->s;
++
++    if (c->fd >= 0) {
++        qemu_set_fd_handler(c->fd, NULL, NULL, NULL);
++        close(c->fd);
++    }
++    QTAILQ_REMOVE(&s->conns, c, next);
++    g_free(c->pend);
++    g_free(c);
++}
++
++static void vsock_uds_conn_reset(VsockUdsConn *c)
++{
++    vsock_uds_send_ctrl(c, VIRTIO_VSOCK_OP_RST, 0);
++    vsock_uds_conn_free(c);
++}
++
++/*
++ * Both ends are done; whatever was in flight towards the client is gone.
++ * Returns true if the connection was freed.
++ */
++static bool vsock_uds_conn_maybe_finish(VsockUdsConn *c)
++{
++    if (c->pend_len) {
++        return false;
++    }
++    if (c->host_gone ||
++        (c->guest_shut_send && c->guest_shut_rcv) ||
++        (c->guest_shut_send && c->host_eof)) {
++        vsock_uds_conn_reset(c);
++        return true;
++    }
++    return false;
++}
++
++static void vsock_uds_credit_update_if_due(VsockUdsConn *c)
++{
++    if (c->fwd_cnt - c->last_fwd_cnt >= VSOCK_UDS_CREDIT_THRESHOLD) {
++        c->last_fwd_cnt = c->fwd_cnt;
++        vsock_uds_send_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_UPDATE, 0);
++    }
++}
++
++/* Writes the buffered bytes; c may not outlive a write failure. */
++static void vsock_uds_conn_flush_pend(VsockUdsConn *c)
++{
++    while (c->pend_len) {
++        ssize_t n = send(c->fd, c->pend + c->pend_off, c->pend_len,
++                         MSG_DONTWAIT | MSG_NOSIGNAL);
++
++        if (n < 0) {
++            if (errno == EAGAIN || errno == EWOULDBLOCK) {
++                break;
++            }
++            if (errno == EINTR) {
++                continue;
++            }
++            c->host_gone = true;
++            c->pend_len = 0;
++            break;
++        }
++        c->pend_off += n;
++        c->pend_len -= n;
++        c->fwd_cnt += n;
++    }
++    if (!c->pend_len) {
++        c->pend_off = 0;
++    }
++    if (c->host_gone) {
++        vsock_uds_conn_maybe_finish(c);
++        return;
++    }
++    vsock_uds_credit_update_if_due(c);
++    if (!c->pend_len && c->guest_shut_send && !c->shut_wr_done) {
++        shutdown(c->fd, SHUT_WR);
++        c->shut_wr_done = true;
++        if (vsock_uds_conn_maybe_finish(c)) {
++            return;
++        }
++    }
++    vsock_uds_conn_update_fds(c);
++}
++
++static void vsock_uds_conn_write(void *opaque)
++{
++    vsock_uds_conn_flush_pend(opaque);
++}
++
++static uint32_t vsock_uds_conn_credit(const VsockUdsConn *c)
++{
++    return c->peer_buf_alloc - (c->tx_cnt - c->peer_fwd_cnt);
++}
++
++/*
++ * Registers the handlers the connection needs now. Reading from the client
++ * waits for room towards the guest (rx buffers and credit), so a slow guest
++ * reaches the client as a blocked socket write and not as queued memory.
++ */
++static void vsock_uds_conn_update_fds(VsockUdsConn *c)
++{
++    VirtIOVsockUds *s = c->s;
++    IOHandler *rd = NULL, *wr = NULL;
++
++    switch (c->state) {
++    case VSOCK_UDS_CONNECT_LINE:
++        rd = vsock_uds_conn_read;
++        break;
++    case VSOCK_UDS_WAIT_RESPONSE:
++        break;
++    case VSOCK_UDS_ESTABLISHED:
++        if (!c->host_eof && !c->guest_shut_rcv && !s->rx_starved &&
++            vsock_uds_conn_credit(c) > 0) {
++            rd = vsock_uds_conn_read;
++        }
++        if (c->pend_len) {
++            wr = vsock_uds_conn_write;
++        }
++        break;
++    }
++    qemu_set_fd_handler(c->fd, rd, wr, c);
++}
++
++/* Parses the client's "CONNECT <port>\n" one byte at a time. */
++static void vsock_uds_conn_read_command(VsockUdsConn *c)
++{
++    VirtIOVsockUds *s = c->s;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    char *end;
++    unsigned long port;
++
++    for (;;) {
++        char ch;
++        ssize_t n = recv(c->fd, &ch, 1, MSG_DONTWAIT);
++
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            return;
++        }
++        if (n <= 0 && errno != EINTR) {
++            vsock_uds_conn_free(c);
++            return;
++        }
++        if (n <= 0) {
++            continue;
++        }
++        if (ch == '\n') {
++            break;
++        }
++        if (c->cmd_len == sizeof(c->cmd) - 1) {
++            vsock_uds_conn_free(c);
++            return;
++        }
++        c->cmd[c->cmd_len++] = ch;
++    }
++    c->cmd[c->cmd_len] = 0;
++    if (!strncmp(c->cmd, "CONNECT ", 8)) {
++        port = strtoul(c->cmd + 8, &end, 10);
++    } else {
++        end = c->cmd;
++        port = 0;
++    }
++    if (*end || end == c->cmd + 8 || port > UINT32_MAX ||
++        !(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++        /* Not a request we can pass on, or no guest driver yet. */
++        vsock_uds_conn_free(c);
++        return;
++    }
++    c->guest_port = port;
++    c->host_port = s->next_host_port++;
++    c->state = VSOCK_UDS_WAIT_RESPONSE;
++    c->started_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    if (!timer_pending(s->timer)) {
++        timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
++    }
++    vsock_uds_conn_update_fds(c);
++    vsock_uds_send_ctrl(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++}
++
++/* Reads from the client into the guest's rx buffers; returns on no more. */
++static void vsock_uds_conn_pump(VsockUdsConn *c)
++{
++    VirtIOVsockUds *s = c->s;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    bool sent = false;
++    int batch;
++
++    for (batch = 0; batch < VSOCK_UDS_RX_BATCH; batch++) {
++        VirtQueueElement *elem;
++        struct virtio_vsock_hdr h;
++        struct iovec iov[VIRTQUEUE_MAX_SIZE];
++        unsigned iov_cnt;
++        size_t cap;
++        uint32_t credit;
++        ssize_t n;
++
++        if (!vsock_uds_flush_ctrl(s)) {
++            break;
++        }
++        credit = vsock_uds_conn_credit(c);
++        if (credit == 0) {
++            if (s->credit_request && !c->credit_requested) {
++                c->credit_requested = true;
++                vsock_uds_send_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_REQUEST, 0);
++            }
++            break;
++        }
++
++        elem = virtqueue_pop(s->rx_vq, sizeof(VirtQueueElement));
++        if (!elem) {
++            s->rx_starved = true;
++            break;
++        }
++        cap = iov_size(elem->in_sg, elem->in_num);
++        if (cap <= VSOCK_UDS_HDR_SIZE) {
++            virtqueue_detach_element(s->rx_vq, elem, 0);
++            g_free(elem);
++            continue;
++        }
++        cap = MIN(cap - VSOCK_UDS_HDR_SIZE, credit);
++        iov_cnt = iov_copy(iov, ARRAY_SIZE(iov), elem->in_sg, elem->in_num,
++                           VSOCK_UDS_HDR_SIZE, cap);
++        n = readv(c->fd, iov, iov_cnt);
++        if (n <= 0) {
++            virtqueue_unpop(s->rx_vq, elem, 0);
++            g_free(elem);
++            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
++                          errno == EINTR)) {
++                break;
++            }
++            /*
++             * The client closed its write side, or is gone: no more data
++             * towards the guest. Bytes already buffered towards the client
++             * still go until a write fails.
++             */
++            c->host_eof = true;
++            vsock_uds_send_ctrl(c, VIRTIO_VSOCK_OP_SHUTDOWN,
++                                VIRTIO_VSOCK_SHUTDOWN_SEND);
++            if (!vsock_uds_conn_maybe_finish(c)) {
++                /* Stops the read handler, which EOF would keep firing. */
++                vsock_uds_conn_update_fds(c);
++            }
++            goto out_notify;
++        }
++        vsock_uds_fill_hdr(c, &h, VIRTIO_VSOCK_OP_RW, 0, n);
++        vsock_uds_trace(s, "to guest", &h);
++        iov_from_buf(elem->in_sg, elem->in_num, 0, &h, sizeof(h));
++        virtqueue_push(s->rx_vq, elem, VSOCK_UDS_HDR_SIZE + n);
++        g_free(elem);
++        c->tx_cnt += n;
++        sent = true;
++        if ((size_t)n < cap) {
++            /* The socket has nothing more just now. */
++            break;
++        }
++    }
++    vsock_uds_conn_update_fds(c);
++
++out_notify:
++    if (sent) {
++        virtio_notify(vdev, s->rx_vq);
++    }
++}
++
++static void vsock_uds_conn_read(void *opaque)
++{
++    VsockUdsConn *c = opaque;
++
++    if (c->state == VSOCK_UDS_CONNECT_LINE) {
++        vsock_uds_conn_read_command(c);
++    } else {
++        vsock_uds_conn_pump(c);
++    }
++}
++
++/* The guest has given us receive buffers: restart everything we stopped. */
++static void vsock_uds_rx_restart(VirtIOVsockUds *s)
++{
++    VsockUdsConn *c, *tmp;
++
++    s->rx_starved = false;
++    if (!vsock_uds_flush_ctrl(s)) {
++        return;
++    }
++    QTAILQ_FOREACH_SAFE(c, &s->conns, next, tmp) {
++        vsock_uds_conn_update_fds(c);
++    }
++}
++
++static void vsock_uds_accept(void *opaque)
++{
++    VirtIOVsockUds *s = opaque;
++    VsockUdsConn *c;
++    int fd;
++
++    fd = qemu_accept(s->listen_fd, NULL, NULL);
++    if (fd < 0) {
++        return;
++    }
++    qemu_set_blocking(fd, false, &error_abort);
++    c = g_new0(VsockUdsConn, 1);
++    c->s = s;
++    c->fd = fd;
++    c->state = VSOCK_UDS_CONNECT_LINE;
++    QTAILQ_INSERT_TAIL(&s->conns, c, next);
++    vsock_uds_conn_update_fds(c);
++}
++
++static VsockUdsConn *vsock_uds_find(VirtIOVsockUds *s, uint32_t host_port,
++                                    uint32_t guest_port)
++{
++    VsockUdsConn *c;
++
++    QTAILQ_FOREACH(c, &s->conns, next) {
++        if (c->state != VSOCK_UDS_CONNECT_LINE && c->host_port == host_port &&
++            c->guest_port == guest_port) {
++            return c;
++        }
++    }
++    return NULL;
++}
++
++/* A guest connection to a host port: <uds-path>_<port>, if there is one. */
++static void vsock_uds_guest_connect(VirtIOVsockUds *s,
++                                    const struct virtio_vsock_hdr *h)
++{
++    g_autofree char *path = g_strdup_printf("%s_%u", s->uds_path,
++                                            le32_to_cpu(h->dst_port));
++    Error *err = NULL;
++    VsockUdsConn *c;
++    int fd;
++
++    fd = unix_connect(path, &err);
++    if (fd < 0) {
++        error_free(err);
++        vsock_uds_send_rst_for(s, h);
++        return;
++    }
++    qemu_set_blocking(fd, false, &error_abort);
++
++    c = g_new0(VsockUdsConn, 1);
++    c->s = s;
++    c->fd = fd;
++    c->state = VSOCK_UDS_ESTABLISHED;
++    c->host_port = le32_to_cpu(h->dst_port);
++    c->guest_port = le32_to_cpu(h->src_port);
++    c->peer_buf_alloc = le32_to_cpu(h->buf_alloc);
++    c->peer_fwd_cnt = le32_to_cpu(h->fwd_cnt);
++    QTAILQ_INSERT_TAIL(&s->conns, c, next);
++    vsock_uds_send_ctrl(c, VIRTIO_VSOCK_OP_RESPONSE, 0);
++    vsock_uds_conn_update_fds(c);
++}
++
++static void vsock_uds_rw_from_guest(VsockUdsConn *c,
++                                    VirtQueueElement *elem, uint32_t len)
++{
++    size_t avail = iov_size(elem->out_sg, elem->out_num);
++    size_t off = 0;
++
++    if (avail < VSOCK_UDS_HDR_SIZE + (size_t)len) {
++        /* Advertised more than it provided. */
++        vsock_uds_conn_reset(c);
++        return;
++    }
++
++    if (!c->pend_len) {
++        struct iovec iov[VIRTQUEUE_MAX_SIZE];
++        unsigned cnt = iov_copy(iov, ARRAY_SIZE(iov), elem->out_sg,
++                                elem->out_num, VSOCK_UDS_HDR_SIZE, len);
++        struct msghdr msg = { .msg_iov = iov, .msg_iovlen = cnt };
++        ssize_t n;
++
++        do {
++            n = sendmsg(c->fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
++        } while (n < 0 && errno == EINTR);
++        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++            c->host_gone = true;
++            vsock_uds_conn_maybe_finish(c);
++            return;
++        }
++        if (n > 0) {
++            off = n;
++            c->fwd_cnt += n;
++        }
++    }
++
++    if (off < len) {
++        size_t rest = len - off;
++
++        if (c->pend_len + rest > VSOCK_UDS_BUF_ALLOC) {
++            /* Beyond the credit we advertised. */
++            vsock_uds_conn_reset(c);
++            return;
++        }
++        if (c->pend_off + c->pend_len + rest > c->pend_cap) {
++            size_t want = c->pend_len + rest;
++
++            if (want > c->pend_cap) {
++                c->pend_cap = MIN(MAX(want, c->pend_cap * 2),
++                                  VSOCK_UDS_BUF_ALLOC);
++                c->pend = g_realloc(c->pend, c->pend_cap);
++            }
++            memmove(c->pend, c->pend + c->pend_off, c->pend_len);
++            c->pend_off = 0;
++        }
++        iov_to_buf(elem->out_sg, elem->out_num, VSOCK_UDS_HDR_SIZE + off,
++                   c->pend + c->pend_off + c->pend_len, rest);
++        c->pend_len += rest;
++    }
++    vsock_uds_credit_update_if_due(c);
++    vsock_uds_conn_update_fds(c);
++}
++
++static void vsock_uds_handle_packet(VirtIOVsockUds *s, VirtQueueElement *elem)
++{
++    struct virtio_vsock_hdr h;
++    VsockUdsConn *c;
++    uint16_t op, type;
++    uint32_t len, flags;
++
++    if (iov_to_buf(elem->out_sg, elem->out_num, 0, &h, sizeof(h)) != sizeof(h)) {
++        return;
++    }
++    vsock_uds_trace(s, "from guest", &h);
++    op = le16_to_cpu(h.op);
++    type = le16_to_cpu(h.type);
++    len = le32_to_cpu(h.len);
++    flags = le32_to_cpu(h.flags);
++
++    if (le64_to_cpu(h.dst_cid) != VSOCK_UDS_HOST_CID) {
++        return;
++    }
++    if (type != VIRTIO_VSOCK_TYPE_STREAM) {
++        vsock_uds_send_rst_for(s, &h);
++        return;
++    }
++
++    c = vsock_uds_find(s, le32_to_cpu(h.dst_port), le32_to_cpu(h.src_port));
++    if (!c) {
++        if (op == VIRTIO_VSOCK_OP_REQUEST) {
++            vsock_uds_guest_connect(s, &h);
++        } else if (op != VIRTIO_VSOCK_OP_RST) {
++            vsock_uds_send_rst_for(s, &h);
++        }
++        return;
++    }
++
++    /* Every packet carries the sender's credit. */
++    c->peer_buf_alloc = le32_to_cpu(h.buf_alloc);
++    c->peer_fwd_cnt = le32_to_cpu(h.fwd_cnt);
++    c->credit_requested = false;
++
++    switch (op) {
++    case VIRTIO_VSOCK_OP_RESPONSE:
++        if (c->state == VSOCK_UDS_WAIT_RESPONSE) {
++            g_autofree char *ok = g_strdup_printf("OK %u\n", c->host_port);
++            size_t ok_len = strlen(ok);
++            ssize_t n;
++
++            /* The socket buffer is empty; this cannot block or be short. */
++            do {
++                n = send(c->fd, ok, ok_len, MSG_DONTWAIT | MSG_NOSIGNAL);
++            } while (n < 0 && errno == EINTR);
++            if (n != (ssize_t)ok_len) {
++                vsock_uds_conn_reset(c);
++                return;
++            }
++            c->state = VSOCK_UDS_ESTABLISHED;
++            vsock_uds_conn_update_fds(c);
++        }
++        break;
++
++    case VIRTIO_VSOCK_OP_RST:
++        vsock_uds_conn_free(c);
++        break;
++
++    case VIRTIO_VSOCK_OP_SHUTDOWN:
++        c->guest_shut_rcv |= !!(flags & VIRTIO_VSOCK_SHUTDOWN_RCV);
++        c->guest_shut_send |= !!(flags & VIRTIO_VSOCK_SHUTDOWN_SEND);
++        if (c->guest_shut_send && !c->pend_len && !c->shut_wr_done) {
++            shutdown(c->fd, SHUT_WR);
++            c->shut_wr_done = true;
++        }
++        if (!vsock_uds_conn_maybe_finish(c)) {
++            vsock_uds_conn_update_fds(c);
++        }
++        break;
++
++    case VIRTIO_VSOCK_OP_RW:
++        if (c->state != VSOCK_UDS_ESTABLISHED) {
++            vsock_uds_conn_reset(c);
++            break;
++        }
++        vsock_uds_rw_from_guest(c, elem, len);
++        break;
++
++    case VIRTIO_VSOCK_OP_CREDIT_UPDATE:
++        vsock_uds_conn_update_fds(c);
++        break;
++
++    case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
++        vsock_uds_send_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_UPDATE, 0);
++        vsock_uds_conn_update_fds(c);
++        break;
++
++    case VIRTIO_VSOCK_OP_REQUEST:
++        /* Already connected: not valid. */
++        vsock_uds_conn_reset(c);
++        break;
++
++    default:
++        vsock_uds_conn_reset(c);
++        break;
++    }
++}
++
++static void vsock_uds_handle_tx(VirtIODevice *vdev, VirtQueue *vq)
++{
++    VirtIOVsockUds *s = VIRTIO_VSOCK_UDS(vdev);
++    VirtQueueElement *elem;
++    bool done = false;
++
++    while ((elem = virtqueue_pop(vq, sizeof(VirtQueueElement)))) {
++        vsock_uds_handle_packet(s, elem);
++        virtqueue_push(vq, elem, 0);
++        g_free(elem);
++        done = true;
++    }
++    if (done) {
++        virtio_notify(vdev, vq);
++    }
++}
++
++static void vsock_uds_handle_rx(VirtIODevice *vdev, VirtQueue *vq)
++{
++    vsock_uds_rx_restart(VIRTIO_VSOCK_UDS(vdev));
++}
++
++static void vsock_uds_handle_event(VirtIODevice *vdev, VirtQueue *vq)
++{
++    /* The event queue only carries a transport reset, after a migration. */
++}
++
++/* Drops a host client's connect that the guest never answered. */
++static void vsock_uds_timer(void *opaque)
++{
++    VirtIOVsockUds *s = opaque;
++    VsockUdsConn *c, *tmp;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    bool waiting = false;
++
++    QTAILQ_FOREACH_SAFE(c, &s->conns, next, tmp) {
++        if (c->state != VSOCK_UDS_WAIT_RESPONSE) {
++            continue;
++        }
++        if (now - c->started_ms > VSOCK_UDS_RESPONSE_TIMEOUT_MS) {
++            vsock_uds_conn_free(c);
++        } else {
++            waiting = true;
++        }
++    }
++    if (waiting) {
++        timer_mod(s->timer, now + 1000);
++    }
++}
++
++static void vsock_uds_close_all(VirtIOVsockUds *s)
++{
++    VsockUdsConn *c;
++    VsockUdsCtrl *p;
++
++    while ((c = QTAILQ_FIRST(&s->conns))) {
++        vsock_uds_conn_free(c);
++    }
++    while ((p = QTAILQ_FIRST(&s->ctrl))) {
++        QTAILQ_REMOVE(&s->ctrl, p, next);
++        g_free(p);
++    }
++    s->rx_starved = false;
++}
++
++static void vsock_uds_get_config(VirtIODevice *vdev, uint8_t *config)
++{
++    VirtIOVsockUds *s = VIRTIO_VSOCK_UDS(vdev);
++    struct virtio_vsock_config cfg = {
++        .guest_cid = cpu_to_le64(s->guest_cid),
++    };
++
++    memcpy(config, &cfg, sizeof(cfg));
++}
++
++static uint64_t vsock_uds_get_features(VirtIODevice *vdev, uint64_t features,
++                                       Error **errp)
++{
++    return features;
++}
++
++static void vsock_uds_reset(VirtIODevice *vdev)
++{
++    vsock_uds_close_all(VIRTIO_VSOCK_UDS(vdev));
++}
++
++static int vsock_uds_set_status(VirtIODevice *vdev, uint8_t status)
++{
++    /* The driver went away (including a guest driver reset): start over. */
++    if (!(status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++        vsock_uds_close_all(VIRTIO_VSOCK_UDS(vdev));
++    }
++    return 0;
++}
++
++static void vsock_uds_realize(DeviceState *dev, Error **errp)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    VirtIOVsockUds *s = VIRTIO_VSOCK_UDS(dev);
++    const char *debug;
++
++    if (s->guest_cid <= VSOCK_UDS_HOST_CID || s->guest_cid >= UINT32_MAX) {
++        error_setg(errp, "guest-cid must be between 3 and 2^32-2");
++        return;
++    }
++    if (!s->uds_path) {
++        error_setg(errp, "uds-path is required");
++        return;
++    }
++
++    s->listen_fd = unix_listen(s->uds_path, errp);
++    if (s->listen_fd < 0) {
++        return;
++    }
++
++    /* Local ports for host-initiated connections, as Firecracker's. */
++    s->next_host_port = 1u << 30;
++    debug = getenv("VPHONE_VSOCK_DEBUG");
++    s->debug = debug ? atoi(debug) : 0;
++    QTAILQ_INIT(&s->conns);
++    QTAILQ_INIT(&s->ctrl);
++    s->timer = timer_new_ms(QEMU_CLOCK_REALTIME, vsock_uds_timer, s);
++
++    virtio_init(vdev, VIRTIO_ID_VSOCK, sizeof(struct virtio_vsock_config));
++    s->rx_vq = virtio_add_queue(vdev, VSOCK_UDS_QUEUE_SIZE, vsock_uds_handle_rx);
++    s->tx_vq = virtio_add_queue(vdev, VSOCK_UDS_QUEUE_SIZE, vsock_uds_handle_tx);
++    s->event_vq = virtio_add_queue(vdev, VSOCK_UDS_QUEUE_SIZE,
++                                   vsock_uds_handle_event);
++
++    qemu_set_fd_handler(s->listen_fd, vsock_uds_accept, NULL, s);
++}
++
++static void vsock_uds_unrealize(DeviceState *dev)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    VirtIOVsockUds *s = VIRTIO_VSOCK_UDS(dev);
++
++    vsock_uds_close_all(s);
++    if (s->listen_fd >= 0) {
++        qemu_set_fd_handler(s->listen_fd, NULL, NULL, NULL);
++        close(s->listen_fd);
++        unlink(s->uds_path);
++        s->listen_fd = -1;
++    }
++    timer_free(s->timer);
++    s->timer = NULL;
++    virtio_delete_queue(s->rx_vq);
++    virtio_delete_queue(s->tx_vq);
++    virtio_delete_queue(s->event_vq);
++    virtio_cleanup(vdev);
++}
++
++/* In-flight state is in host sockets, which cannot be saved. */
++static const VMStateDescription vmstate_vsock_uds = {
++    .name = "virtio-vsock-uds",
++    .unmigratable = 1,
++};
++
++static const Property vsock_uds_properties[] = {
++    DEFINE_PROP_UINT64("guest-cid", VirtIOVsockUds, guest_cid, 0),
++    DEFINE_PROP_STRING("uds-path", VirtIOVsockUds, uds_path),
++    DEFINE_PROP_BOOL("credit-request", VirtIOVsockUds, credit_request, true),
++};
++
++static void vsock_uds_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, vsock_uds_properties);
++    dc->vmsd = &vmstate_vsock_uds;
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    vdc->realize = vsock_uds_realize;
++    vdc->unrealize = vsock_uds_unrealize;
++    vdc->get_features = vsock_uds_get_features;
++    vdc->get_config = vsock_uds_get_config;
++    vdc->set_status = vsock_uds_set_status;
++    vdc->reset = vsock_uds_reset;
++}
++
++static const TypeInfo vsock_uds_info = {
++    .name = TYPE_VIRTIO_VSOCK_UDS,
++    .parent = TYPE_VIRTIO_DEVICE,
++    .instance_size = sizeof(VirtIOVsockUds),
++    .class_init = vsock_uds_class_init,
++};
++
++/* virtio-vsock-uds-pci */
++
++#define TYPE_VIRTIO_VSOCK_UDS_PCI "virtio-vsock-uds-pci-base"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOVsockUdsPCI, VIRTIO_VSOCK_UDS_PCI)
++
++struct VirtIOVsockUdsPCI {
++    VirtIOPCIProxy parent_obj;
++    VirtIOVsockUds vdev;
++};
++
++static const Property vsock_uds_pci_properties[] = {
++    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 3),
++};
++
++static void vsock_uds_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
++{
++    VirtIOVsockUdsPCI *dev = VIRTIO_VSOCK_UDS_PCI(vpci_dev);
++    DeviceState *vdev = DEVICE(&dev->vdev);
++    VirtIODevice *virtio_dev = VIRTIO_DEVICE(vdev);
++
++    if (!virtio_legacy_check_disabled(virtio_dev)) {
++        virtio_pci_force_virtio_1(vpci_dev);
++    }
++    qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
++}
++
++static void vsock_uds_pci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
++    PCIDeviceClass *pcidev_k = PCI_DEVICE_CLASS(klass);
++
++    k->realize = vsock_uds_pci_realize;
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    device_class_set_props(dc, vsock_uds_pci_properties);
++    pcidev_k->vendor_id = PCI_VENDOR_ID_REDHAT_QUMRANET;
++    pcidev_k->device_id = PCI_DEVICE_ID_VIRTIO_VSOCK;
++    pcidev_k->revision = 0x00;
++    pcidev_k->class_id = PCI_CLASS_COMMUNICATION_OTHER;
++}
++
++static void vsock_uds_pci_instance_init(Object *obj)
++{
++    VirtIOVsockUdsPCI *dev = VIRTIO_VSOCK_UDS_PCI(obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_VSOCK_UDS);
++}
++
++static const VirtioPCIDeviceTypeInfo vsock_uds_pci_info = {
++    .base_name             = TYPE_VIRTIO_VSOCK_UDS_PCI,
++    .generic_name          = "virtio-vsock-uds-pci",
++    .non_transitional_name = "virtio-vsock-uds-pci-non-transitional",
++    .instance_size = sizeof(VirtIOVsockUdsPCI),
++    .instance_init = vsock_uds_pci_instance_init,
++    .class_init    = vsock_uds_pci_class_init,
++};
++
++static void vsock_uds_register_types(void)
++{
++    type_register_static(&vsock_uds_info);
++    virtio_pci_types_register(&vsock_uds_pci_info);
++}
++
++type_init(vsock_uds_register_types)
+diff --git a/include/hw/virtio/virtio-vsock-uds.h b/include/hw/virtio/virtio-vsock-uds.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca8c4060eb471ccc627d27b01ae04e16aafd07a8
+--- /dev/null
++++ b/include/hw/virtio/virtio-vsock-uds.h
+@@ -0,0 +1,45 @@
++/*
++ * virtio-vsock with the datapath inside QEMU and a Unix socket host side
++ * (hybrid vsock, as Firecracker's): a host client connects to the socket and
++ * writes "CONNECT <port>\n"; once the guest accepts, it reads "OK <n>\n" and
++ * the stream is a vsock stream to the guest's <port>. A guest connection to
++ * a host port <port> is a connection to the Unix socket <uds-path>_<port>.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_VIRTIO_VSOCK_UDS_H
++#define QEMU_VIRTIO_VSOCK_UDS_H
++
++#include "hw/virtio/virtio.h"
++#include "qemu/queue.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_VIRTIO_VSOCK_UDS "virtio-vsock-uds"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOVsockUds, VIRTIO_VSOCK_UDS)
++
++typedef struct VsockUdsConn VsockUdsConn;
++typedef struct VsockUdsCtrl VsockUdsCtrl;
++
++struct VirtIOVsockUds {
++    VirtIODevice parent_obj;
++
++    VirtQueue *rx_vq;
++    VirtQueue *tx_vq;
++    VirtQueue *event_vq;
++
++    uint64_t guest_cid;
++    char *uds_path;
++    bool credit_request;
++
++    int listen_fd;
++    uint32_t next_host_port;
++    int debug;
++    bool rx_starved;
++
++    QEMUTimer *timer;
++    QTAILQ_HEAD(, VsockUdsConn) conns;
++    QTAILQ_HEAD(, VsockUdsCtrl) ctrl;
++};
++
++#endif
+diff --git a/include/system/memory.h b/include/system/memory.h
+index 26225f4f1e15b3f4fc5de63108a37e6294c88014..0310d994315a8557877700a02130cca3d928e09b 100644
+--- a/include/system/memory.h
++++ b/include/system/memory.h
+@@ -1437,6 +1437,32 @@ bool memory_region_init_ram_from_file(MemoryRegion *mr,
+                                       ram_addr_t offset,
+                                       Error **errp);
+ 
++/**
++ * memory_region_init_ram_from_fd_align:  Like memory_region_init_ram_from_fd,
++ *                                        for a mapping aligned to @align.
++ *
++ * @mr: the #MemoryRegion to be initialized.
++ * @owner: the object that tracks the region's reference count
++ * @name: the name of the region.
++ * @size: size of the region.
++ * @align: alignment of the region's host mapping, 0 for the fd's page size
++ * @ram_flags: as for memory_region_init_ram_from_fd
++ * @fd: the fd to mmap.
++ * @offset: offset within the file referenced by fd
++ * @errp: pointer to Error*, to store an error if it happens.
++ *
++ * Return: true on success, else false setting @errp with error.
++ */
++bool memory_region_init_ram_from_fd_align(MemoryRegion *mr,
++                                          Object *owner,
++                                          const char *name,
++                                          uint64_t size,
++                                          uint64_t align,
++                                          uint32_t ram_flags,
++                                          int fd,
++                                          ram_addr_t offset,
++                                          Error **errp);
++
+ /**
+  * memory_region_init_ram_from_fd:  Initialize RAM memory region with a
+  *                                  mmap-ed backend.
+diff --git a/meson.build b/meson.build
+index 1380d7c4dc98fbccae3d116483eb9f6525226d41..8dc90e0587dfd3bad0b096e0a18a10709b78a9a0 100644
+--- a/meson.build
++++ b/meson.build
+@@ -64,6 +64,8 @@ sh = find_program('sh')
+ python = import('python').find_installation()
+ 
+ cc = meson.get_compiler('c')
++# Android's Linux is a Linux host with bionic for libc, and QEMU runs in an app's process there.
++host_is_android = host_machine.system() == 'linux' and cc.get_define('__ANDROID__') != ''
+ all_languages = ['c']
+ if host_os == 'windows' and add_languages('cpp', required: false, native: false)
+   all_languages += ['cpp']
+@@ -365,7 +367,10 @@ endif
+ #
+ # Emscripten doesn't support -no-pie but meson can't catch the compiler
+ # warning. So explicitly omit the flag for Emscripten.
+-if not get_option('b_pie') and host_os != 'emscripten'
++if host_is_android
++  # The emulator is a shared library on Android, whose objects must all be PIC.
++  qemu_common_flags += '-fPIC'
++elif not get_option('b_pie') and host_os != 'emscripten'
+   qemu_common_flags += cc.get_supported_arguments('-fno-pie', '-no-pie')
+ endif
+ 
+@@ -2400,6 +2405,7 @@ config_host_data.set('CONFIG_GNUTLS_CRYPTO', gnutls_crypto.found())
+ config_host_data.set('CONFIG_GNUTLS_BUG1717_WORKAROUND', gnutls_bug1717_workaround)
+ config_host_data.set('CONFIG_TASN1', tasn1.found())
+ config_host_data.set('CONFIG_GCRYPT', gcrypt.found())
++config_host_data.set('CONFIG_ANDROID', host_is_android)
+ config_host_data.set('CONFIG_NETTLE', nettle.found())
+ config_host_data.set('CONFIG_CRYPTO_SM4', crypto_sm4.found())
+ config_host_data.set('CONFIG_CRYPTO_SM3', crypto_sm3.found())
+@@ -3889,6 +3895,20 @@ endif
+ 
+ traceable = []
+ emulators = {}
++android_exports = files('system/android-exports.map')
++# Without -u the linker leaves out the archive members that nothing in QEMU
++# references, which are the ones the app calls through JNI.
++android_link_args = ['-Wl,--version-script=' + android_exports[0].full_path(),
++                     '-Wl,-z,max-page-size=16384']
++if pvg.found()
++  foreach sym : ['rvg_android_set_vulkan_gipa', 'rvg_android_set_window',
++                 'rvg_android_pointer']
++    android_link_args += '-Wl,-u,' + sym
++  endforeach
++else
++  # The map names reims-vgpu's symbols, which a build without it does not have.
++  android_link_args += '-Wl,--undefined-version'
++endif
+ foreach target : target_dirs
+   config_target = config_target_mak[target]
+   target_name = config_target['TARGET_NAME']
+@@ -4002,14 +4022,25 @@ foreach target : target_dirs
+       exe_name += '-unsigned'
+     endif
+ 
+-    emulator = executable(exe_name, exe['sources'],
+-               install: true,
+-               c_args: c_args,
+-               dependencies: arch_deps + exe['dependencies'],
+-               objects: lib.extract_all_objects(recursive: true),
+-               link_depends: [block_syms, qemu_syms],
+-               link_args: link_args,
+-               win_subsystem: exe['win_subsystem'])
++    if host_is_android and target.endswith('-softmmu')
++      # In an app's process, called through qemu_android_main (system/main.c).
++      emulator = shared_library('qemu-vphone', exe['sources'],
++                 install: true,
++                 c_args: c_args,
++                 dependencies: arch_deps + exe['dependencies'],
++                 objects: lib.extract_all_objects(recursive: true),
++                 link_depends: [block_syms, qemu_syms, android_exports],
++                 link_args: link_args + android_link_args)
++    else
++      emulator = executable(exe_name, exe['sources'],
++                 install: true,
++                 c_args: c_args,
++                 dependencies: arch_deps + exe['dependencies'],
++                 objects: lib.extract_all_objects(recursive: true),
++                 link_depends: [block_syms, qemu_syms],
++                 link_args: link_args,
++                 win_subsystem: exe['win_subsystem'])
++    endif
+ 
+     if host_os == 'darwin'
+       icon = 'pc-bios/qemu.rsrc'
+diff --git a/qapi/qom.json b/qapi/qom.json
+index c483fda69e5baedb2da63b67a268e7512b73af48..1f003b1bc820a089482ddbd59ca91651b8c96471 100644
+--- a/qapi/qom.json
++++ b/qapi/qom.json
+@@ -749,13 +749,18 @@
+ # @seal: if true, create a sealed-file, which will block further
+ #     resizing of the memory (default: true)
+ #
++# @align: the alignment of the guest RAM mapping, a power of 2.  0
++#     selects 2 MiB, or the huge page size if @hugetlb is true.
++#     (default: 0)
++#
+ # Since: 2.12
+ ##
+ { 'struct': 'MemoryBackendMemfdProperties',
+   'base': 'MemoryBackendProperties',
+   'data': { '*hugetlb': 'bool',
+             '*hugetlbsize': 'size',
+-            '*seal': 'bool' },
++            '*seal': 'bool',
++            '*align': 'size' },
+   'if': 'CONFIG_LINUX' }
+ 
+ ##
+diff --git a/system/android-exports.map b/system/android-exports.map
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8c21f59eb4d7853c6661c1c53f0128b7f472495
+--- /dev/null
++++ b/system/android-exports.map
+@@ -0,0 +1,13 @@
++/*
++ * What libqemu-vphone.so shows to the app: QEMU's entry point and the entry
++ * points the app calls in reims-vgpu's static library.
++ */
++{
++  global:
++    qemu_android_main;
++    rvg_android_set_vulkan_gipa;
++    rvg_android_set_window;
++    rvg_android_pointer;
++  local:
++    *;
++};
+diff --git a/system/cpus.c b/system/cpus.c
+index 2171847691413350cce816dcb0f8b8082a518e7f..c5fb2407960c06be2478e02dfade52984f0b7444 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -359,7 +359,11 @@ void cpu_handle_guest_debug(CPUState *cpu)
+     }
+ }
+ 
+-#ifdef CONFIG_LINUX
++/*
++ * Android leaves SIGBUS to ART, which needs it for its GC, and QEMU's only use
++ * of it is reporting machine checks to KVM, which never runs in an app.
++ */
++#if defined(CONFIG_LINUX) && !defined(CONFIG_ANDROID)
+ static void sigbus_reraise(void)
+ {
+     sigset_t set;
+@@ -411,11 +415,11 @@ static void qemu_init_sigbus(void)
+ 
+     prctl(PR_MCE_KILL, PR_MCE_KILL_SET, PR_MCE_KILL_EARLY, 0, 0);
+ }
+-#else /* !CONFIG_LINUX */
++#else /* !CONFIG_LINUX || CONFIG_ANDROID */
+ static void qemu_init_sigbus(void)
+ {
+ }
+-#endif /* !CONFIG_LINUX */
++#endif /* !CONFIG_LINUX || CONFIG_ANDROID */
+ 
+ static QemuThread io_thread;
+ 
+diff --git a/system/main.c b/system/main.c
+index a1782a8507d2b4b8799cf177120e2a9a96e554de..5dbfc59fbfb61693e0502c815c02c3046d9d9fc3 100644
+--- a/system/main.c
++++ b/system/main.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/atomic.h"
+ #include "qemu-main.h"
+ #include "qemu/main-loop.h"
+ #include "system/replay.h"
+@@ -66,6 +67,32 @@ static int os_darwin_cfrunloop_main(void)
+ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
+ #endif
+ 
++#ifdef CONFIG_ANDROID
++/*
++ * The entry point of libqemu-vphone.so: QEMU's main() for an app's process, on
++ * the caller's thread. QEMU's global state cannot be built twice, so an app
++ * runs one VM per process and ends that process after this returns.
++ */
++int qemu_android_main(int argc, char **argv);
++
++int qemu_android_main(int argc, char **argv)
++{
++    static bool started;
++    int status;
++
++    if (qatomic_xchg(&started, true)) {
++        return 1;
++    }
++
++    /* qemu_init leaves the BQL and the replay mutex held for this thread. */
++    qemu_init(argc, argv);
++    status = qemu_main_loop();
++    qemu_cleanup(status);
++    bql_unlock();
++    replay_mutex_unlock();
++    return status;
++}
++#else
+ int main(int argc, char **argv)
+ {
+     qemu_init(argc, argv);
+@@ -94,3 +121,4 @@ int main(int argc, char **argv)
+         assert_not_reached();
+     }
+ }
++#endif
+diff --git a/system/memory.c b/system/memory.c
+index 86006123076d51be4de1099ebbdd474ed8b2edd9..82845176f6c8ec9d95232c20dd9eea81684b102b 100644
+--- a/system/memory.c
++++ b/system/memory.c
+@@ -1632,19 +1632,30 @@ bool memory_region_init_ram_from_file(MemoryRegion *mr, Object *owner,
+     return memory_region_set_ram_block(mr, rb);
+ }
+ 
+-bool memory_region_init_ram_from_fd(MemoryRegion *mr, Object *owner,
+-                                    const char *name, uint64_t size,
+-                                    uint32_t ram_flags, int fd,
+-                                    ram_addr_t offset, Error **errp)
++bool memory_region_init_ram_from_fd_align(MemoryRegion *mr, Object *owner,
++                                          const char *name, uint64_t size,
++                                          uint64_t align, uint32_t ram_flags,
++                                          int fd, ram_addr_t offset,
++                                          Error **errp)
+ {
+     RAMBlock *rb;
+ 
+     memory_region_init(mr, owner, name, size);
+     mr->readonly = !!(ram_flags & RAM_READONLY);
++    mr->align = align;
+     rb = qemu_ram_alloc_from_fd(size, size, NULL, mr, ram_flags, fd, offset,
+                                 false, errp);
+     return memory_region_set_ram_block(mr, rb);
+ }
++
++bool memory_region_init_ram_from_fd(MemoryRegion *mr, Object *owner,
++                                    const char *name, uint64_t size,
++                                    uint32_t ram_flags, int fd,
++                                    ram_addr_t offset, Error **errp)
++{
++    return memory_region_init_ram_from_fd_align(mr, owner, name, size, 0,
++                                                ram_flags, fd, offset, errp);
++}
+ #endif
+ 
+ static void memory_region_set_ram_ptr(MemoryRegion *mr, uint64_t size,
+diff --git a/target/arm/tcg/host-fpcr.h b/target/arm/tcg/host-fpcr.h
+index 982f302b5cb1e7e872c54b11d1cca629dbb4679e..e3e94dc1ae374063a49c34f8ddb76635a5ff6043 100644
+--- a/target/arm/tcg/host-fpcr.h
++++ b/target/arm/tcg/host-fpcr.h
+@@ -3,6 +3,13 @@
+  *
+  * Host FP control/status synchronisation for native guest FP execution.
+  *
++ * On an x86-64 host (below) MXCSR follows the guest's rounding mode; on an
++ * AArch64 host FPCR follows the guest's rounding mode, FZ, FZ16, DN and AHP,
++ * and FPSR's cumulative flag bits accumulate the guest's flags, folded into
++ * env->vfp.fpsr the same way; exception traps stay disabled and the host's
++ * NEP/AH/FIZ are never set (the translator only uses the native path when
++ * the guest has them clear; see fp_native_ok()).
++ *
+  * Ported from Inferno (AppleHax) 2eed395 "arm: native A64 FP / NEON on TCG".
+  *
+  * While a vCPU thread runs generated code (between cpu_exec_enter and
+@@ -27,7 +34,153 @@
+ /* Set once at startup from VPHONE_NATIVE_FP (default on); see cpu.c. */
+ extern bool arm_native_fp_enabled;
+ 
+-#if defined(__x86_64__) && defined(CONFIG_TCG)
++#if defined(__aarch64__) && defined(CONFIG_TCG)
++
++/* FPCR bits that follow the guest; everything else stays as the host's. */
++#define ARM_HOST_FPCR_GUEST (FPCR_AHP | FPCR_DN | FPCR_FZ | FPCR_FZ16 | \
++                             (3u << 22) /* RMode */)
++/* IOC DZC OFC UFC IXC IDC; QC is the guest's vfp.qc, not ours to fold. */
++#define ARM_HOST_FPSR_FLAGS (FPSR_IOC | FPSR_DZC | FPSR_OFC | FPSR_UFC | \
++                             FPSR_IXC | FPSR_IDC)
++
++static inline uint64_t arm_host_fpcr_read(void)
++{
++    uint64_t v;
++    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
++    return v;
++}
++
++static inline void arm_host_fpcr_write(uint64_t v)
++{
++    __asm__ volatile("msr fpcr, %0" :: "r"(v));
++}
++
++static inline uint64_t arm_host_fpsr_read(void)
++{
++    uint64_t v;
++    __asm__ volatile("mrs %0, fpsr" : "=r"(v));
++    return v;
++}
++
++static inline void arm_host_fpsr_write(uint64_t v)
++{
++    __asm__ volatile("msr fpsr, %0" :: "r"(v));
++}
++
++static inline bool arm_host_fp_mine(CPUARMState *env)
++{
++    return env->host_fp_active && current_cpu == env_cpu(env);
++}
++
++static inline uint64_t arm_host_fpcr_want(CPUARMState *env, uint64_t cur)
++{
++    return (cur & ~(uint64_t)ARM_HOST_FPCR_GUEST) |
++           (env->vfp.fpcr & ARM_HOST_FPCR_GUEST);
++}
++
++static inline void arm_host_fpcr_enter(CPUARMState *env)
++{
++    uint64_t saved, want;
++
++    if (!arm_native_fp_enabled) {
++        return;
++    }
++    saved = arm_host_fpcr_read();
++    want = arm_host_fpcr_want(env, saved);
++    env->host_fpcr_saved = saved;
++    env->host_fp_active = true;
++    if (want != saved) {
++        arm_host_fpcr_write(want);
++    }
++    /* The C runtime's flags are not the guest's. */
++    if (arm_host_fpsr_read() & ARM_HOST_FPSR_FLAGS) {
++        arm_host_fpsr_write(0);
++    }
++}
++
++/*
++ * The translator's C code, not the guest, runs between a TB's lookup miss
++ * and its first execution, and some of it raises FP flags (glib's
++ * GHashTable, behind TCG's constant cache, raises Inexact). The host FPSR
++ * holds the guest's accumulated flags during that time, so they are saved at
++ * the start of translation; tcg_out_tb_start() puts them back after the
++ * passes that use the hash table. See tcg/aarch64/tcg-target.c.inc.
++ */
++extern __thread uint64_t tcg_aarch64_guest_fpsr;
++extern __thread bool tcg_aarch64_guest_fpsr_valid;
++
++static inline void arm_host_fpsr_translation_save(void)
++{
++    if (arm_native_fp_enabled) {
++        tcg_aarch64_guest_fpsr = arm_host_fpsr_read();
++        tcg_aarch64_guest_fpsr_valid = true;
++    }
++}
++
++/* Must not change state: the cpreg reset check reads FPSR twice. */
++static inline uint64_t arm_host_fpsr_peek(CPUARMState *env)
++{
++    if (!arm_host_fp_mine(env)) {
++        return 0;
++    }
++    return arm_host_fpsr_read() & ARM_HOST_FPSR_FLAGS;
++}
++
++static inline void arm_host_fpsr_drain(CPUARMState *env)
++{
++    uint64_t cur;
++
++    if (!arm_host_fp_mine(env)) {
++        return;
++    }
++    cur = arm_host_fpsr_read();
++    if (!(cur & ARM_HOST_FPSR_FLAGS)) {
++        return;
++    }
++    env->vfp.fpsr |= cur & ARM_HOST_FPSR_FLAGS;
++    arm_host_fpsr_write(cur & ~(uint64_t)ARM_HOST_FPSR_FLAGS);
++}
++
++/* The guest wrote FPSR (or reset it): forget what the host accumulated. */
++static inline void arm_host_fpsr_ack(CPUARMState *env)
++{
++    uint64_t cur;
++
++    if (!arm_host_fp_mine(env)) {
++        return;
++    }
++    cur = arm_host_fpsr_read();
++    if (cur & ARM_HOST_FPSR_FLAGS) {
++        arm_host_fpsr_write(cur & ~(uint64_t)ARM_HOST_FPSR_FLAGS);
++    }
++}
++
++/* The guest wrote FPCR (or reset it): follow it. */
++static inline void arm_host_fpcr_reload(CPUARMState *env)
++{
++    uint64_t cur, want;
++
++    if (!arm_host_fp_mine(env)) {
++        return;
++    }
++    cur = arm_host_fpcr_read();
++    want = arm_host_fpcr_want(env, cur);
++    if (cur != want) {
++        arm_host_fpcr_write(want);
++    }
++}
++
++static inline void arm_host_fpcr_exit(CPUARMState *env)
++{
++    if (!arm_host_fp_mine(env)) {
++        return;
++    }
++    arm_host_fpsr_drain(env);
++    arm_host_fpcr_write(env->host_fpcr_saved);
++    env->host_fp_active = false;
++}
++
++#elif defined(__x86_64__) && defined(CONFIG_TCG)
+ /* Only the rounding mode follows the guest; exceptions masked, no FTZ/DAZ. */
+ #define ARM_HOST_MXCSR_BASE  0x1f80
+ #define ARM_HOST_MXCSR_FLAGS 0x3f
+diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
+index 209d0379272b84ef37339d353b82c8905747716b..90b826f93795d7fe7bab6630cc2be36066ab3ddf 100644
+--- a/target/arm/tcg/translate-a64.c
++++ b/target/arm/tcg/translate-a64.c
+@@ -22,6 +22,7 @@
+ #include "translate.h"
+ #include "translate-a64.h"
+ #include "host-fpcr.h"
++#include "fpu/softfloat.h"
+ #include "qemu/log.h"
+ #include "arm_ldst.h"
+ #include "semihosting/semihost.h"
+@@ -5482,12 +5483,34 @@ typedef struct FPScalar {
+  * guard"). The helper path recomputes from the untouched inputs; the flags
+  * the native attempt raised are a subset of what the helper raises.
+  *
++ * On an AArch64 host, an exact one, none of this applies: each op is the
++ * guest's own instruction, host FPCR follows FPCR.{AHP,DN,FZ,FZ16,RMode}
++ * (host-fpcr.h), and there are no guards.
++ *
+  * Only with FPCR.{AH,NEP,FIZ} clear, and FZ clear on an inexact host (x86
+  * has no input-flush that matches Arm), and when arm_native_fp_enabled
+  * (VPHONE_NATIVE_FP, default on).
+  */
+ typedef void GenFPVec3Fn(unsigned, TCGv_vec, TCGv_vec, TCGv_vec);
+ 
++#if defined(__aarch64__)
++/*
++ * VPHONE_NATIVE_FP on an AArch64 host (target/arm/cpu.c sets this flag for
++ * x86-64 hosts only). Softfloat's hardfloat path reads the host's FP status
++ * and rounding, which belong to the guest while it runs native FP, so it
++ * goes off too, as there.
++ */
++static void __attribute__((constructor)) arm_native_fp_aarch64_init(void)
++{
++    const char *e = getenv("VPHONE_NATIVE_FP");
++
++    arm_native_fp_enabled = !(e && *e == '0');
++    if (arm_native_fp_enabled) {
++        softfloat_hardfloat_disabled = true;
++    }
++}
++#endif
++
+ static bool fp_native_ok(DisasContext *s)
+ {
+     return arm_native_fp_enabled && !s->fpcr_ah && !s->fpcr_nep &&
+@@ -12385,6 +12408,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
+ {
+     DisasContext *dc = container_of(dcbase, DisasContext, base);
+     CPUARMState *env = cpu_env(cpu);
++
++#if defined(__aarch64__)
++    arm_host_fpsr_translation_save();
++#endif
+     ARMCPU *arm_cpu = env_archcpu(env);
+     CPUARMTBFlags tb_flags = arm_tbflags_from_tb(dc->base.tb);
+     int bound, core_mmu_idx;
+diff --git a/target/arm/tcg/vec-f32-fast.h b/target/arm/tcg/vec-f32-fast.h
+index a8bbd4cb05851a52e97e2d1b669c5c6ed454d4c5..84788491379bde3b63c50d20a572c2e04ed9feb7 100644
+--- a/target/arm/tcg/vec-f32-fast.h
++++ b/target/arm/tcg/vec-f32-fast.h
+@@ -40,7 +40,163 @@
+  * succeeds the only flag it can have raised is inexact, which the status
+  * already holds.
+  */
+-#if defined(__x86_64__)
++#if defined(__aarch64__)
++#include <arm_neon.h>
++
++/*
++ * The same conditions on NEON, with one more: FPCR.FZ must be clear (under
++ * native FP, FPCR is the guest's), or a difference of two normals that is
++ * denormal would be flushed to a zero the checks below would pass. The
++ * checks are integer compares on the bit patterns, which raise nothing; the
++ * FP flags the arithmetic itself raised are undone whether or not a lane
++ * failed (the guest's Inexact, if the vector is taken, is already in the
++ * status).
++ */
++enum { VF32_ADD, VF32_SUB, VF32_MUL, VF32_FMA, VF32_FMS };
++
++static int vf32_mode = -1;      /* -1 unknown, 0 off, 1 on */
++
++static int vf32_init(void)
++{
++    const char *e = getenv("VPHONE_FAST_F32");
++    int mode = !(e && *e == '0');
++
++    qatomic_set(&vf32_mode, mode);
++    return mode;
++}
++
++/* Lanes that are zero or normal: |v| == 0, or minnorm <= |v| <= maxnorm. */
++static inline uint32x4_t vf32_zon(uint32x4_t v, uint32x4_t abs_mask)
++{
++    uint32x4_t a = vandq_u32(v, abs_mask);
++    uint32x4_t normal = vandq_u32(vcgeq_u32(a, vdupq_n_u32(0x00800000)),
++                                  vcleq_u32(a, vdupq_n_u32(0x7f7fffff)));
++
++    return vorrq_u32(normal, vceqq_u32(a, vdupq_n_u32(0)));
++}
++
++/* Lanes whose result passes (see above); zero_ok marks the exact zeros. */
++static inline uint32x4_t vf32_result_ok(uint32x4_t r, uint32x4_t zero_ok,
++                                        uint32x4_t abs_mask)
++{
++    uint32x4_t a = vandq_u32(r, abs_mask);
++    uint32x4_t big = vandq_u32(vcgtq_u32(a, vdupq_n_u32(0x00800000)),
++                               vcleq_u32(a, vdupq_n_u32(0x7f7fffff)));
++
++    return vorrq_u32(big, vandq_u32(vceqq_u32(a, vdupq_n_u32(0)), zero_ok));
++}
++
++/*
++ * d = n op m (op ADD, SUB, MUL) or d = a + n * m (FMA) / a - n * m (FMS),
++ * oprsz bytes; m[idx] of each 16-byte segment broadcast when idx >= 0.
++ * Returns false, having written nothing, when the vector must take the
++ * generic loop.
++ */
++static bool vf32_fast(void *vd, const void *vn, const void *vm, const void *va,
++                      float_status *s, intptr_t oprsz, int op, intptr_t idx)
++{
++    int mode = qatomic_read(&vf32_mode);
++    uint32_t out[64];
++
++    if (unlikely(mode < 0)) {
++        mode = vf32_init();
++    }
++    if (mode == 0 ||
++        !(s->float_exception_flags & float_flag_inexact) ||
++        s->float_rounding_mode != float_round_nearest_even ||
++        (oprsz & 7) || oprsz > (intptr_t)sizeof(out)) {
++        return false;
++    }
++
++    /*
++     * The compiler does not order NEON arithmetic against FPSR/FPCR
++     * accesses: as for x86, the pointers come out of the asm that reads
++     * them, and the restore takes the checks' result as an input.
++     */
++    uint64_t fpcr, fpsr, now;
++    const uint32_t *n = vn, *m = vm, *a = va;
++
++    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++    if (fpcr & (3u << 22 | 1u << 24)) {        /* RMode, FZ */
++        return false;
++    }
++    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
++    __asm__ volatile("" : "+r"(n), "+r"(m), "+r"(a));
++
++    const uint32x4_t abs_mask = vdupq_n_u32(0x7fffffffu);
++    const uint32x4_t zero = vdupq_n_u32(0);
++    uint32x4_t ok = vdupq_n_u32(0xffffffffu);
++
++    for (intptr_t i = 0; i < oprsz / 4; i += 4) {
++        bool half = oprsz - i * 4 == 8;     /* a 64-bit vector: two lanes */
++        uint32x4_t vn_, vm_, va_ = zero, zero_ok;
++        float32x4_t r;
++
++        if (half) {
++            vn_ = vcombine_u32(vld1_u32(n + i), vdup_n_u32(0));
++            vm_ = idx >= 0 ? vcombine_u32(vdup_n_u32(m[i + idx]), vdup_n_u32(0))
++                           : vcombine_u32(vld1_u32(m + i), vdup_n_u32(0));
++            if (op >= VF32_FMA) {
++                va_ = vcombine_u32(vld1_u32(a + i), vdup_n_u32(0));
++            }
++        } else {
++            vn_ = vld1q_u32(n + i);
++            vm_ = idx >= 0 ? vdupq_n_u32(m[i + idx]) : vld1q_u32(m + i);
++            if (op >= VF32_FMA) {
++                va_ = vld1q_u32(a + i);
++            }
++        }
++        ok = vandq_u32(ok, vandq_u32(vf32_zon(vn_, abs_mask),
++                                     vf32_zon(vm_, abs_mask)));
++        switch (op) {
++        case VF32_ADD:
++            r = vaddq_f32(vreinterpretq_f32_u32(vn_),
++                          vreinterpretq_f32_u32(vm_));
++            zero_ok = ok;
++            break;
++        case VF32_SUB:
++            r = vsubq_f32(vreinterpretq_f32_u32(vn_),
++                          vreinterpretq_f32_u32(vm_));
++            zero_ok = ok;
++            break;
++        case VF32_MUL:
++            r = vmulq_f32(vreinterpretq_f32_u32(vn_),
++                          vreinterpretq_f32_u32(vm_));
++            zero_ok = vorrq_u32(vceqq_u32(vandq_u32(vn_, abs_mask), zero),
++                                vceqq_u32(vandq_u32(vm_, abs_mask), zero));
++            break;
++        default: /* FMA, FMS */
++            ok = vandq_u32(ok, vf32_zon(va_, abs_mask));
++            r = op == VF32_FMS
++                ? vfmsq_f32(vreinterpretq_f32_u32(va_),
++                            vreinterpretq_f32_u32(vn_),
++                            vreinterpretq_f32_u32(vm_))
++                : vfmaq_f32(vreinterpretq_f32_u32(va_),
++                            vreinterpretq_f32_u32(vn_),
++                            vreinterpretq_f32_u32(vm_));
++            zero_ok = vorrq_u32(vceqq_u32(vandq_u32(vn_, abs_mask), zero),
++                                vceqq_u32(vandq_u32(vm_, abs_mask), zero));
++            break;
++        }
++        ok = vandq_u32(ok, vf32_result_ok(vreinterpretq_u32_f32(r), zero_ok,
++                                          abs_mask));
++        vst1q_u32(out + i, vreinterpretq_u32_f32(r));
++    }
++    /*
++     * Restored on both paths: under native FP, FPSR is the guest's, and an
++     * accepted vector owes it nothing (its Inexact is already in the status).
++     */
++    __asm__ volatile("mrs %0, fpsr" : "=r"(now) : "w"(ok));
++    if (now != fpsr) {
++        __asm__ volatile("msr fpsr, %0" :: "r"(fpsr));
++    }
++    if (vminvq_u32(ok) != 0xffffffffu) {
++        return false;
++    }
++    memcpy(vd, out, oprsz);
++    return true;
++}
++#elif defined(__x86_64__)
+ #include <float.h>
+ #include <immintrin.h>
+ 
+diff --git a/tcg/aarch64/tcg-target-con-set.h b/tcg/aarch64/tcg-target-con-set.h
+index d0622e65fb0a833f65c83fe4afe21b3583b8e825..260c959af951efced06495b13ecf2e623d0f50ce 100644
+--- a/tcg/aarch64/tcg-target-con-set.h
++++ b/tcg/aarch64/tcg-target-con-set.h
+@@ -16,6 +16,7 @@ C_O0_I2(w, r)
+ C_O0_I3(rz, rz, r)
+ C_O1_I1(r, r)
+ C_O1_I1(w, r)
++C_O1_I1(r, w)
+ C_O1_I1(w, w)
+ C_O1_I1(w, wr)
+ C_O1_I2(r, r, r)
+@@ -28,11 +29,13 @@ C_O1_I2(r, rZ, rA)
+ C_O1_I2(r, rz, rMZ)
+ C_O1_I2(r, rz, rz)
+ C_O1_I2(r, rZ, rZ)
++C_O1_I2(r, w, w)
+ C_O1_I2(w, 0, w)
+ C_O1_I2(w, w, w)
+ C_O1_I2(w, w, wN)
+ C_O1_I2(w, w, wO)
+ C_O1_I2(w, w, wZ)
+ C_O1_I3(w, w, w, w)
++C_O1_I3(w, 0, w, w)
+ C_O1_I4(r, r, rC, rz, rz)
+ C_O2_I1(r, r, r)
+diff --git a/tcg/aarch64/tcg-target-has.h b/tcg/aarch64/tcg-target-has.h
+index 37f504cf54d4d51b4af3d25049238af3c64b8525..3a8da5c841dbe70b4d5c466b54968dfd89c7a12b 100644
+--- a/tcg/aarch64/tcg-target-has.h
++++ b/tcg/aarch64/tcg-target-has.h
+@@ -44,6 +44,13 @@
+ #define TCG_TARGET_HAS_cmpsel_vec       0
+ #define TCG_TARGET_HAS_tst_vec          1
+ 
++/*
++ * vphone-linux: the floating-point opcodes (tcg-opc.h). The opcodes are the
++ * guest's own instructions, so no fallback is ever needed for an A64 guest.
++ */
++#define TCG_TARGET_HAS_fp               1
++#define TCG_TARGET_FP_ARM_EXACT         1
++
+ #define TCG_TARGET_extract_valid(type, ofs, len)   1
+ #define TCG_TARGET_sextract_valid(type, ofs, len)  1
+ #define TCG_TARGET_deposit_valid(type, ofs, len)   1
+diff --git a/tcg/aarch64/tcg-target.c.inc b/tcg/aarch64/tcg-target.c.inc
+index e85fcdc97a88fc282da6d0bca0504189b598288d..5d052bff8512a633aa6b9e1086443b43fd9208e6 100644
+--- a/tcg/aarch64/tcg-target.c.inc
++++ b/tcg/aarch64/tcg-target.c.inc
+@@ -17,6 +17,10 @@
+ #define TCG_TARGET_STACK_ALIGN          16
+ #define TCG_TARGET_CALL_STACK_OFFSET    0
+ #define TCG_TARGET_CALL_ARG_I32         TCG_CALL_ARG_NORMAL
++#if defined(CONFIG_LINUX) || defined(CONFIG_ELF_AUX_INFO)
++# include <sys/auxv.h> /* AT_HWCAP */
++#endif
++
+ #define TCG_TARGET_CALL_ARG_I64         TCG_CALL_ARG_NORMAL
+ #ifdef CONFIG_DARWIN
+ # define TCG_TARGET_CALL_ARG_I128       TCG_CALL_ARG_NORMAL
+@@ -449,6 +453,9 @@ typedef enum {
+     I3312_LDRSHX    = 0x38000000 | LDST_LD_S_X << 22 | MO_16 << 30,
+     I3312_LDRSWX    = 0x38000000 | LDST_LD_S_X << 22 | MO_32 << 30,
+ 
++    I3312_LDRVH     = 0x3c000000 | LDST_LD << 22 | MO_16 << 30,
++    I3312_STRVH     = 0x3c000000 | LDST_ST << 22 | MO_16 << 30,
++
+     I3312_LDRVS     = 0x3c000000 | LDST_LD << 22 | MO_32 << 30,
+     I3312_STRVS     = 0x3c000000 | LDST_ST << 22 | MO_32 << 30,
+ 
+@@ -1243,6 +1250,9 @@ static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
+         /* FALLTHRU */
+ 
+     case TCG_TYPE_V64:
++    case TCG_TYPE_F16:
++    case TCG_TYPE_F32:
++    case TCG_TYPE_F64:
+         tcg_debug_assert(ret >= 32 && arg >= 32);
+         tcg_out_insn(s, 3616, ORR, 0, 0, ret, arg, arg);
+         break;
+@@ -1272,6 +1282,15 @@ static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret,
+         insn = (ret < 32 ? I3312_LDRX : I3312_LDRVD);
+         lgsz = 3;
+         break;
++    case TCG_TYPE_F16:
++        insn = I3312_LDRVH;
++        lgsz = 1;
++        break;
++    case TCG_TYPE_F32:
++        insn = I3312_LDRVS;
++        lgsz = 2;
++        break;
++    case TCG_TYPE_F64:
+     case TCG_TYPE_V64:
+         insn = I3312_LDRVD;
+         lgsz = 3;
+@@ -1301,6 +1320,15 @@ static void tcg_out_st(TCGContext *s, TCGType type, TCGReg src,
+         insn = (src < 32 ? I3312_STRX : I3312_STRVD);
+         lgsz = 3;
+         break;
++    case TCG_TYPE_F16:
++        insn = I3312_STRVH;
++        lgsz = 1;
++        break;
++    case TCG_TYPE_F32:
++        insn = I3312_STRVS;
++        lgsz = 2;
++        break;
++    case TCG_TYPE_F64:
+     case TCG_TYPE_V64:
+         insn = I3312_STRVD;
+         lgsz = 3;
+@@ -1974,17 +2002,27 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
+ 
+ static void tcg_out_goto_tb(TCGContext *s, int which)
+ {
++    intptr_t i_off;
++
+     /*
+-     * Direct branch, or indirect address load, will be patched
+-     * by tb_target_set_jmp_target.  Assert indirect load offset
+-     * in range early, regardless of direct branch distance.
++     * The jump is always a B, only ever patched to another B: it and the
++     * instruction it replaces are both in the set the architecture allows
++     * to be modified while another CPU executes them (B, BL, NOP, ...);
++     * LDR (literal) is not, which upstream's B <-> LDR patching relied on.
++     * A destination out of B's range (+/-128 MiB, reached in a large code
++     * cache) is taken through the fixed trampoline below, which loads
++     * tb->jmp_target_addr; tb_target_set_jmp_target points the B at it.
++     * Direct-reach exits cost nothing extra; out of range, one more taken
++     * branch than the LDR-in-place form.
+      */
+-    intptr_t i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
+-    tcg_debug_assert(i_off == sextract64(i_off, 0, 21));
+-
+     set_jmp_insn_offset(s, which);
+     tcg_out32(s, I3206_B);
++
++    i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
++    tcg_debug_assert(i_off == sextract64(i_off, 0, 21));
++    tcg_out_insn(s, 3305, LDR, i_off >> 2, TCG_REG_TMP0);
+     tcg_out_insn(s, 3207, BR, TCG_REG_TMP0);
++
+     set_jmp_reset_offset(s, which);
+     tcg_out_bti(s, BTI_J);
+ }
+@@ -2001,16 +2039,11 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
+     ptrdiff_t d_offset = d_addr - jmp_rx;
+     tcg_insn_unit insn;
+ 
+-    /* Either directly branch, or indirect branch load. */
+-    if (d_offset == sextract64(d_offset, 0, 28)) {
+-        insn = deposit32(I3206_B, 0, 26, d_offset >> 2);
+-    } else {
+-        uintptr_t i_addr = (uintptr_t)&tb->jmp_target_addr[n];
+-        ptrdiff_t i_offset = i_addr - jmp_rx;
+-
+-        /* Note that we asserted this in range in tcg_out_goto_tb. */
+-        insn = deposit32(I3305_LDR | TCG_REG_TMP0, 5, 19, i_offset >> 2);
++    /* Either the destination itself or, out of range, the LDR/BR after us. */
++    if (d_offset != sextract64(d_offset, 0, 28)) {
++        d_offset = 4;
+     }
++    insn = deposit32(I3206_B, 0, 26, d_offset >> 2);
+     qatomic_set((uint32_t *)jmp_rw, insn);
+     flush_idcache_range(jmp_rx, jmp_rw, 4);
+ }
+@@ -3308,10 +3341,621 @@ void tcg_expand_vec_op(TCGOpcode opc, TCGType type, unsigned vece,
+     }
+ }
+ 
++#if TCG_TARGET_HAS_fp
++/*
++ * vphone-linux: the TCG floating-point opcodes (tcg-opc.h) as A64 FP and
++ * Advanced SIMD instructions. Each one is the instruction the guest asked
++ * for, run with the host's FPCR following the guest's (target/arm/tcg/
++ * host-fpcr.h), so results and FPSR flags are the architecture's without
++ * the fallbacks an x86 host needs. See tcg_fp_arm_exact().
++ *
++ * The scalar arithmetic forms are "data-processing (FP)", which take the
++ * half-precision forms from FEAT_FP16; the scalar/vector advanced-SIMD
++ * three-same and two-register-misc forms get theirs as noted below.
++ */
++static bool have_fp16;
++
++static unsigned tcg_fp_ftype(unsigned esz)
++{
++    return esz == MO_16 ? 3 : esz == MO_64 ? 1 : 0;
++}
++
++/* The operand size of an FP op: scalar type, or vector element size. */
++static unsigned tcg_fp_esz(TCGType type, unsigned vece)
++{
++    switch (type) {
++    case TCG_TYPE_F16:
++        return MO_16;
++    case TCG_TYPE_F32:
++        return MO_32;
++    case TCG_TYPE_F64:
++        return MO_64;
++    default:
++        return vece;
++    }
++}
++
++static bool tcg_fp_is_vector(TCGType type)
++{
++    return type == TCG_TYPE_V64 || type == TCG_TYPE_V128;
++}
++
++/* FMADD, ... : 3-source */
++static void tcg_out_fp_3src(TCGContext *s, unsigned esz, bool sub,
++                            TCGReg rd, TCGReg rn, TCGReg rm, TCGReg ra)
++{
++    tcg_out32(s, 0x1f000000 | tcg_fp_ftype(esz) << 22 | (rm & 0x1f) << 16 |
++                 sub << 15 | (ra & 0x1f) << 10 | (rn & 0x1f) << 5 |
++                 (rd & 0x1f));
++}
++
++/* FMUL, ... : data-processing, 2 sources (opcode in bits 15:12) */
++static void tcg_out_fp_s2(TCGContext *s, unsigned op, unsigned esz,
++                          TCGReg rd, TCGReg rn, TCGReg rm)
++{
++    tcg_out32(s, 0x1e200800 | tcg_fp_ftype(esz) << 22 | (rm & 0x1f) << 16 |
++                 op << 12 | (rn & 0x1f) << 5 | (rd & 0x1f));
++}
++
++/* FABS, ... : data-processing, 1 source (opcode in bits 20:15) */
++static void tcg_out_fp_s1(TCGContext *s, unsigned op, unsigned esz,
++                          TCGReg rd, TCGReg rn)
++{
++    tcg_out32(s, 0x1e204000 | tcg_fp_ftype(esz) << 22 | op << 15 |
++                 (rn & 0x1f) << 5 | (rd & 0x1f));
++}
++
++/*
++ * Advanced SIMD three-same (FP), given by its 32-bit-vector encoding. The
++ * scalar form sets bits 30:28 (U stays); half precision is the FP16 group:
++ * bit 22 set, bits 21 and 15:14 clear (a in bit 23 and U as they were);
++ * double sets sz (bit 22).
++ */
++static void tcg_out_fp_3same(TCGContext *s, uint32_t insn, bool scalar,
++                             bool q, unsigned esz,
++                             TCGReg rd, TCGReg rn, TCGReg rm)
++{
++    if (esz == MO_16) {
++        insn = (insn & ~(1u << 21 | 3u << 14)) | 1u << 22;
++    } else if (esz == MO_64) {
++        insn |= 1u << 22;
++    }
++    insn |= scalar ? 0x50000000u : (uint32_t)q << 30;
++    tcg_out32(s, insn | (rm & 0x1f) << 16 | (rn & 0x1f) << 5 | (rd & 0x1f));
++}
++
++/*
++ * Advanced SIMD two-register misc (FP), given by its 32-bit-vector
++ * encoding; half precision (FP16) ors in 0x00580000, double sets sz.
++ */
++static void tcg_out_fp_2misc(TCGContext *s, uint32_t insn, bool scalar,
++                             bool q, unsigned esz, TCGReg rd, TCGReg rn)
++{
++    if (esz == MO_16) {
++        insn |= 0x00580000u;
++    } else if (esz == MO_64) {
++        insn |= 1u << 22;
++    }
++    insn |= scalar ? 0x50000000u : (uint32_t)q << 30;
++    tcg_out32(s, insn | (rn & 0x1f) << 5 | (rd & 0x1f));
++}
++
++/* SCVTF/UCVTF/FCVTZS/FCVTZU (fixed-point), scalar or vector. */
++static void tcg_out_fp_fixed(TCGContext *s, uint32_t insn, bool scalar,
++                             bool q, unsigned esz, unsigned fbits,
++                             TCGReg rd, TCGReg rn)
++{
++    insn |= ((16u << esz) - fbits) << 16;
++    insn |= scalar ? 0x50000000u : (uint32_t)q << 30;
++    tcg_out32(s, insn | (rn & 0x1f) << 5 | (rd & 0x1f));
++}
++
++/* rint: FRINTN/M/P/Z/A/I/X, opcode for scalar, encoding for vector. */
++static void tcg_out_fp_rint(TCGContext *s, TCGArg round, bool vec, bool q,
++                            unsigned esz, TCGReg rd, TCGReg rn)
++{
++    static const uint8_t s_op[] = {
++        [TCG_FP_ROUND_NEAREST_EVEN]  = 8,  /* 001000 */
++        [TCG_FP_ROUND_UP]            = 9,  /* 001001 */
++        [TCG_FP_ROUND_DOWN]          = 10, /* 001010 */
++        [TCG_FP_ROUND_TO_ZERO]       = 11, /* 001011 */
++        [TCG_FP_ROUND_TIES_AWAY]     = 12, /* 001100 */
++        [TCG_FP_ROUND_CURRENT]       = 15, /* 001111 FRINTI */
++        [TCG_FP_ROUND_CURRENT_EXACT] = 14, /* 001110 FRINTX */
++    };
++    static const uint32_t v_op[] = {
++        [TCG_FP_ROUND_NEAREST_EVEN]  = 0x0e218800,
++        [TCG_FP_ROUND_UP]            = 0x0ea18800,
++        [TCG_FP_ROUND_DOWN]          = 0x0e219800,
++        [TCG_FP_ROUND_TO_ZERO]       = 0x0ea19800,
++        [TCG_FP_ROUND_TIES_AWAY]     = 0x2e218800,
++        [TCG_FP_ROUND_CURRENT]       = 0x2ea19800,
++        [TCG_FP_ROUND_CURRENT_EXACT] = 0x2e219800,
++    };
++
++    if (vec) {
++        tcg_out_fp_2misc(s, v_op[round], false, q, esz, rd, rn);
++    } else {
++        tcg_out_fp_s1(s, s_op[round], esz, rd, rn);
++    }
++}
++
++/* fp -> int, same width, in FP/SIMD registers: vector or scalar. */
++static void tcg_out_fp_cvt_same(TCGContext *s, bool uns, TCGArg round,
++                                unsigned fbits, bool vec, bool q,
++                                unsigned esz, TCGReg rd, TCGReg rn)
++{
++    /* FCVTNS, FCVTMS, FCVTPS, FCVTZS, FCVTAS; the unsigned ones set U. */
++    static const uint32_t op[] = {
++        [TCG_FP_ROUND_NEAREST_EVEN] = 0x0e21a800,
++        [TCG_FP_ROUND_DOWN]         = 0x0e21b800,
++        [TCG_FP_ROUND_UP]           = 0x0ea1a800,
++        [TCG_FP_ROUND_TO_ZERO]      = 0x0ea1b800,
++        [TCG_FP_ROUND_TIES_AWAY]    = 0x0e21c800,
++    };
++
++    if (fbits) {
++        tcg_debug_assert(round == TCG_FP_ROUND_TO_ZERO);
++        tcg_out_fp_fixed(s, uns ? 0x2f00fc00 : 0x0f00fc00, !vec, q, esz,
++                         fbits, rd, rn);
++    } else {
++        tcg_out_fp_2misc(s, op[round] | (uint32_t)uns << 29, !vec, q, esz,
++                         rd, rn);
++    }
++}
++
++bool tcg_can_emit_fp_op(TCGOpcode opc, TCGType type, unsigned vece)
++{
++    switch (opc) {
++    case INDEX_op_cvtn_fp:
++    case INDEX_op_cvtl_fp:
++        /* vece is the narrow size. */
++        return type == TCG_TYPE_V128 && (vece == MO_16 || vece == MO_32);
++    case INDEX_op_cvtxn_fp:
++        return type == TCG_TYPE_V128 && vece == MO_32;
++    case INDEX_op_cvt_f2i_s:
++    case INDEX_op_cvt_f2i_u:
++        /* type is the integer type; see tcg_can_emit_fp_cvt(). */
++        return type == TCG_TYPE_I32 || type == TCG_TYPE_I64;
++    case INDEX_op_cvt_fp:
++        /* FCVT is in the base FP set, half precision included. */
++        return type == TCG_TYPE_F16 || type == TCG_TYPE_F32 ||
++               type == TCG_TYPE_F64;
++    case INDEX_op_fpchk_fp:
++        /* Only for a host that is not tcg_fp_arm_exact(). */
++        return false;
++    default:
++        break;
++    }
++
++    if (tcg_fp_is_vector(type)) {
++        /* Advanced SIMD has .4h/.8h, .2s/.4s and .2d, and no .1d. */
++        if (vece < MO_16 || vece > MO_64 ||
++            (vece == MO_16 && !have_fp16) ||
++            (vece == MO_64 && type == TCG_TYPE_V64)) {
++            return false;
++        }
++    } else if (type == TCG_TYPE_F16) {
++        if (!have_fp16) {
++            return false;
++        }
++    } else if (type != TCG_TYPE_F32 && type != TCG_TYPE_F64) {
++        return false;
++    }
++
++    switch (opc) {
++    case INDEX_op_add_fp:
++    case INDEX_op_sub_fp:
++    case INDEX_op_mul_fp:
++    case INDEX_op_div_fp:
++    case INDEX_op_sqrt_fp:
++    case INDEX_op_rint_fp:
++    case INDEX_op_min_fp:
++    case INDEX_op_max_fp:
++    case INDEX_op_minnum_fp:
++    case INDEX_op_maxnum_fp:
++    case INDEX_op_neg_fp:
++    case INDEX_op_abs_fp:
++    case INDEX_op_mulx_fp:
++    case INDEX_op_recps_fp:
++    case INDEX_op_rsqrts_fp:
++    case INDEX_op_recpe_fp:
++    case INDEX_op_rsqrte_fp:
++    case INDEX_op_fma_fp:
++    case INDEX_op_fms_fp:
++    case INDEX_op_cmp_fp:
++    case INDEX_op_cvt_s_fp:
++    case INDEX_op_cvt_u_fp:
++    case INDEX_op_cvt_fp_s:
++    case INDEX_op_cvt_fp_u:
++        return true;
++    case INDEX_op_addp_fp:
++    case INDEX_op_maxp_fp:
++    case INDEX_op_minp_fp:
++    case INDEX_op_maxnump_fp:
++    case INDEX_op_minnump_fp:
++        return tcg_fp_is_vector(type);
++    case INDEX_op_recpx_fp:
++    case INDEX_op_fcmp_fp:
++    case INDEX_op_cvt_s_i2f:
++    case INDEX_op_cvt_u_i2f:
++        return !tcg_fp_is_vector(type);
++    default:
++        return false;
++    }
++}
++
++bool tcg_can_emit_fp_cvt(TCGOpcode opc, TCGType type, unsigned other,
++                         TCGArg round, TCGArg fbits)
++{
++    bool fp = type == TCG_TYPE_F16 || type == TCG_TYPE_F32 ||
++              type == TCG_TYPE_F64;
++    bool int_other = other == TCG_TYPE_I32 || other == TCG_TYPE_I64;
++    unsigned esz = tcg_fp_esz(type, other);
++    unsigned width = 8u << esz;
++
++    switch (opc) {
++    case INDEX_op_cvt_fp:
++        return fbits == 0 && fp && other != type &&
++               (other == TCG_TYPE_F16 || other == TCG_TYPE_F32 ||
++                other == TCG_TYPE_F64);
++    case INDEX_op_rint_fp:
++        return fbits == 0 && round <= TCG_FP_ROUND_CURRENT_EXACT &&
++               tcg_can_emit_fp_op(opc, type, other);
++    case INDEX_op_cvt_s_fp:
++    case INDEX_op_cvt_u_fp:
++        return tcg_can_emit_fp_op(opc, type, other) && fbits <= width;
++    case INDEX_op_cvt_fp_s:
++    case INDEX_op_cvt_fp_u:
++        /* The fixed-point forms only truncate. */
++        return tcg_can_emit_fp_op(opc, type, other) && fbits <= width &&
++               round <= TCG_FP_ROUND_TIES_AWAY &&
++               (fbits == 0 || round == TCG_FP_ROUND_TO_ZERO);
++    case INDEX_op_cvt_s_i2f:
++    case INDEX_op_cvt_u_i2f:
++        return fp && int_other && (type != TCG_TYPE_F16 || have_fp16) &&
++               fbits <= (other == TCG_TYPE_I64 ? 64 : 32);
++    case INDEX_op_cvt_f2i_s:
++    case INDEX_op_cvt_f2i_u:
++        return fp && int_other && (type != TCG_TYPE_F16 || have_fp16) &&
++               round <= TCG_FP_ROUND_TIES_AWAY &&
++               fbits <= (other == TCG_TYPE_I64 ? 64 : 32) &&
++               (fbits == 0 || round == TCG_FP_ROUND_TO_ZERO);
++    default:
++        return false;
++    }
++}
++
++static void tcg_out_fp_op(TCGContext *s, TCGOpcode opc, TCGType type,
++                          unsigned vece, const TCGArg args[TCG_MAX_OP_ARGS],
++                          const int const_args[TCG_MAX_OP_ARGS])
++{
++    TCGReg a0 = args[0], a1 = args[1], a2 = args[2];
++    bool vec = tcg_fp_is_vector(type);
++    bool q = type == TCG_TYPE_V128;
++    unsigned esz = tcg_fp_esz(type, vece);
++    uint32_t insn;
++
++    switch (opc) {
++    case INDEX_op_add_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x0e20d400, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 2, esz, a0, a1, a2);
++        }
++        break;
++    case INDEX_op_sub_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x0ea0d400, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 3, esz, a0, a1, a2);
++        }
++        break;
++    case INDEX_op_mul_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x2e20dc00, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 0, esz, a0, a1, a2);
++        }
++        break;
++    case INDEX_op_div_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x2e20fc00, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 1, esz, a0, a1, a2);
++        }
++        break;
++    case INDEX_op_max_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x0e20f400, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 4, esz, a0, a1, a2);
++        }
++        break;
++    case INDEX_op_min_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x0ea0f400, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 5, esz, a0, a1, a2);
++        }
++        break;
++    case INDEX_op_maxnum_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x0e20c400, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 6, esz, a0, a1, a2);
++        }
++        break;
++    case INDEX_op_minnum_fp:
++        if (vec) {
++            tcg_out_fp_3same(s, 0x0ea0c400, false, q, esz, a0, a1, a2);
++        } else {
++            tcg_out_fp_s2(s, 7, esz, a0, a1, a2);
++        }
++        break;
++
++    case INDEX_op_addp_fp:
++        tcg_out_fp_3same(s, 0x2e20d400, false, q, esz, a0, a1, a2);
++        break;
++    case INDEX_op_maxp_fp:
++        tcg_out_fp_3same(s, 0x2e20f400, false, q, esz, a0, a1, a2);
++        break;
++    case INDEX_op_minp_fp:
++        tcg_out_fp_3same(s, 0x2ea0f400, false, q, esz, a0, a1, a2);
++        break;
++    case INDEX_op_maxnump_fp:
++        tcg_out_fp_3same(s, 0x2e20c400, false, q, esz, a0, a1, a2);
++        break;
++    case INDEX_op_minnump_fp:
++        tcg_out_fp_3same(s, 0x2ea0c400, false, q, esz, a0, a1, a2);
++        break;
++
++    case INDEX_op_mulx_fp:
++        tcg_out_fp_3same(s, 0x0e20dc00, !vec, q, esz, a0, a1, a2);
++        break;
++    case INDEX_op_recps_fp:
++        tcg_out_fp_3same(s, 0x0e20fc00, !vec, q, esz, a0, a1, a2);
++        break;
++    case INDEX_op_rsqrts_fp:
++        tcg_out_fp_3same(s, 0x0ea0fc00, !vec, q, esz, a0, a1, a2);
++        break;
++
++    case INDEX_op_cmp_fp:
++        switch (args[3]) {
++        case TCG_COND_EQ:
++            insn = 0x0e20e400;
++            break;
++        case TCG_COND_GE:
++            insn = 0x2e20e400;
++            break;
++        case TCG_COND_GT:
++            insn = 0x2ea0e400;
++            break;
++        case TCG_COND_LE:
++            insn = 0x2e20e400;
++            a2 = a1, a1 = args[2];
++            break;
++        case TCG_COND_LT:
++            insn = 0x2ea0e400;
++            a2 = a1, a1 = args[2];
++            break;
++        default:
++            g_assert_not_reached();
++        }
++        tcg_out_fp_3same(s, insn, !vec, q, esz, a0, a1, a2);
++        break;
++
++    case INDEX_op_fma_fp:
++    case INDEX_op_fms_fp:
++        /* a0 = a1 +/- a2 * a3; the vector forms have a0 tied to a1. */
++        if (vec) {
++            tcg_debug_assert(a0 == a1);
++            tcg_out_fp_3same(s, opc == INDEX_op_fma_fp ? 0x0e20cc00 : 0x0ea0cc00,
++                             false, q, esz, a0, a2, args[3]);
++        } else {
++            tcg_out_fp_3src(s, esz, opc == INDEX_op_fms_fp, a0, a2, args[3], a1);
++        }
++        break;
++
++    case INDEX_op_sqrt_fp:
++        if (vec) {
++            tcg_out_fp_2misc(s, 0x2ea1f800, false, q, esz, a0, a1);
++        } else {
++            tcg_out_fp_s1(s, 3, esz, a0, a1);
++        }
++        break;
++    case INDEX_op_neg_fp:
++        if (vec) {
++            tcg_out_fp_2misc(s, 0x2ea0f800, false, q, esz, a0, a1);
++        } else {
++            tcg_out_fp_s1(s, 2, esz, a0, a1);
++        }
++        break;
++    case INDEX_op_abs_fp:
++        if (vec) {
++            tcg_out_fp_2misc(s, 0x0ea0f800, false, q, esz, a0, a1);
++        } else {
++            tcg_out_fp_s1(s, 1, esz, a0, a1);
++        }
++        break;
++    case INDEX_op_rint_fp:
++        tcg_out_fp_rint(s, a2, vec, q, esz, a0, a1);
++        break;
++    case INDEX_op_recpe_fp:
++        tcg_out_fp_2misc(s, 0x0ea1d800, !vec, q, esz, a0, a1);
++        break;
++    case INDEX_op_rsqrte_fp:
++        tcg_out_fp_2misc(s, 0x2ea1d800, !vec, q, esz, a0, a1);
++        break;
++    case INDEX_op_recpx_fp:
++        tcg_out_fp_2misc(s, 0x0ea1f800, true, false, esz, a0, a1);
++        break;
++
++    case INDEX_op_fcmp_fp:
++        /* a0 = NZCV of the compare, in the position of the NZCV register. */
++        tcg_out32(s, 0x1e202000 | tcg_fp_ftype(esz) << 22 | (a2 & 0x1f) << 16 |
++                     (a1 & 0x1f) << 5 | (args[3] ? 0x10 : 0));
++        tcg_out32(s, 0xd53b4200 | a0);
++        break;
++
++    case INDEX_op_cvt_fp: {
++        /* FCVT: a2 is the source type, type the destination. */
++        unsigned dst = tcg_fp_ftype(esz);
++
++        tcg_out32(s, 0x1e224000 |
++                     tcg_fp_ftype(tcg_fp_esz((TCGType)a2, 0)) << 22 |
++                     dst << 15 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
++        break;
++    }
++
++    case INDEX_op_cvt_s_fp:
++    case INDEX_op_cvt_u_fp: {
++        bool uns = opc == INDEX_op_cvt_u_fp;
++
++        if (a2) {
++            tcg_out_fp_fixed(s, uns ? 0x2f00e400 : 0x0f00e400, !vec, q, esz,
++                             a2, a0, a1);
++        } else {
++            tcg_out_fp_2misc(s, uns ? 0x2e21d800 : 0x0e21d800, !vec, q, esz,
++                             a0, a1);
++        }
++        break;
++    }
++
++    case INDEX_op_cvt_fp_s:
++        tcg_out_fp_cvt_same(s, false, a2, args[3], vec, q, esz, a0, a1);
++        break;
++    case INDEX_op_cvt_fp_u:
++        tcg_out_fp_cvt_same(s, true, a2, args[3], vec, q, esz, a0, a1);
++        break;
++
++    case INDEX_op_cvtn_fp:
++        /* vece is the narrow size; a0 is tied to a1, which FCVTN2 keeps. */
++        tcg_debug_assert(a0 == a1);
++        tcg_out32(s, 0x0e216800 | (uint32_t)args[3] << 30 |
++                     (uint32_t)(vece == MO_32) << 22 |
++                     (a2 & 0x1f) << 5 | (a0 & 0x1f));
++        break;
++    case INDEX_op_cvtxn_fp:
++        tcg_debug_assert(a0 == a1);
++        tcg_out32(s, 0x2e616800 | (uint32_t)args[3] << 30 |
++                     (a2 & 0x1f) << 5 | (a0 & 0x1f));
++        break;
++    case INDEX_op_cvtl_fp:
++        tcg_out32(s, 0x0e217800 | (uint32_t)a2 << 30 |
++                     (uint32_t)(vece == MO_32) << 22 |
++                     (a1 & 0x1f) << 5 | (a0 & 0x1f));
++        break;
++
++    case INDEX_op_cvt_s_i2f:
++    case INDEX_op_cvt_u_i2f: {
++        /* a0 float, a1 integer, a2 its type, args[3] fbits. */
++        uint32_t sf = (TCGType)a2 == TCG_TYPE_I64;
++        uint32_t op = opc == INDEX_op_cvt_u_i2f ? 3 : 2;
++        unsigned fbits = args[3];
++
++        tcg_out32(s, (fbits ? 0x1e000000 : 0x1e200000) | sf << 31 |
++                     tcg_fp_ftype(esz) << 22 | op << 16 |
++                     (fbits ? (64 - fbits) << 10 : 0) |
++                     (a1 & 0x1f) << 5 | (a0 & 0x1f));
++        break;
++    }
++
++    case INDEX_op_cvt_f2i_s:
++    case INDEX_op_cvt_f2i_u: {
++        /* a0 integer, type its type; a1 float, a2 its type; round; fbits. */
++        unsigned fesz = tcg_fp_esz((TCGType)a2, 0);
++        bool uns = opc == INDEX_op_cvt_f2i_u;
++        uint32_t sf = type == TCG_TYPE_I64;
++        TCGArg round = args[3];
++        unsigned fbits = args[4];
++        uint32_t rmode, o = uns;
++
++        switch (round) {
++        case TCG_FP_ROUND_NEAREST_EVEN:
++            rmode = 0;
++            break;
++        case TCG_FP_ROUND_TIES_AWAY:
++            rmode = 0;
++            o |= 4;
++            break;
++        case TCG_FP_ROUND_UP:
++            rmode = 1;
++            break;
++        case TCG_FP_ROUND_DOWN:
++            rmode = 2;
++            break;
++        case TCG_FP_ROUND_TO_ZERO:
++            rmode = 3;
++            break;
++        default:
++            g_assert_not_reached();
++        }
++        tcg_out32(s, (fbits ? 0x1e000000 : 0x1e200000) | sf << 31 |
++                     tcg_fp_ftype(fesz) << 22 | rmode << 19 | o << 16 |
++                     (fbits ? (64 - fbits) << 10 : 0) |
++                     (a1 & 0x1f) << 5 | a0);
++        break;
++    }
++
++    default:
++        g_assert_not_reached();
++    }
++}
++#endif /* TCG_TARGET_HAS_fp */
++
+ static TCGConstraintSetIndex
+ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
+ {
+     switch (op) {
++    case INDEX_op_add_fp:
++    case INDEX_op_sub_fp:
++    case INDEX_op_mul_fp:
++    case INDEX_op_div_fp:
++    case INDEX_op_min_fp:
++    case INDEX_op_max_fp:
++    case INDEX_op_minnum_fp:
++    case INDEX_op_maxnum_fp:
++    case INDEX_op_addp_fp:
++    case INDEX_op_maxp_fp:
++    case INDEX_op_minp_fp:
++    case INDEX_op_maxnump_fp:
++    case INDEX_op_minnump_fp:
++    case INDEX_op_mulx_fp:
++    case INDEX_op_recps_fp:
++    case INDEX_op_rsqrts_fp:
++    case INDEX_op_cmp_fp:
++        return C_O1_I2(w, w, w);
++    case INDEX_op_sqrt_fp:
++    case INDEX_op_rint_fp:
++    case INDEX_op_neg_fp:
++    case INDEX_op_abs_fp:
++    case INDEX_op_recpe_fp:
++    case INDEX_op_rsqrte_fp:
++    case INDEX_op_recpx_fp:
++    case INDEX_op_cvt_fp:
++    case INDEX_op_cvt_s_fp:
++    case INDEX_op_cvt_u_fp:
++    case INDEX_op_cvt_fp_s:
++    case INDEX_op_cvt_fp_u:
++    case INDEX_op_cvtl_fp:
++        return C_O1_I1(w, w);
++    case INDEX_op_cvtn_fp:
++    case INDEX_op_cvtxn_fp:
++        return C_O1_I2(w, 0, w);
++    case INDEX_op_fcmp_fp:
++        return C_O1_I2(r, w, w);
++    case INDEX_op_fma_fp:
++    case INDEX_op_fms_fp:
++        return tcg_fp_is_vector(type) ? C_O1_I3(w, 0, w, w)
++                                      : C_O1_I3(w, w, w, w);
++    case INDEX_op_cvt_s_i2f:
++    case INDEX_op_cvt_u_i2f:
++        return C_O1_I1(w, r);
++    case INDEX_op_cvt_f2i_s:
++    case INDEX_op_cvt_f2i_u:
++        return C_O1_I1(r, w);
++
+     case INDEX_op_add_vec:
+     case INDEX_op_sub_vec:
+     case INDEX_op_mul_vec:
+@@ -3367,6 +4011,18 @@ static void tcg_target_init(TCGContext *s)
+     tcg_target_available_regs[TCG_TYPE_I64] = 0xffffffffu;
+     tcg_target_available_regs[TCG_TYPE_V64] = 0xffffffff00000000ull;
+     tcg_target_available_regs[TCG_TYPE_V128] = 0xffffffff00000000ull;
++    tcg_target_available_regs[TCG_TYPE_F16] = 0xffffffff00000000ull;
++    tcg_target_available_regs[TCG_TYPE_F32] = 0xffffffff00000000ull;
++    tcg_target_available_regs[TCG_TYPE_F64] = 0xffffffff00000000ull;
++
++#if defined(CONFIG_LINUX) || defined(CONFIG_ELF_AUX_INFO)
++    {
++        /* HWCAP_FPHP | HWCAP_ASIMDHP: scalar and vector half precision. */
++        unsigned long hwcap = qemu_getauxval(AT_HWCAP);
++
++        have_fp16 = (hwcap & (1ul << 9 | 1ul << 10)) == (1ul << 9 | 1ul << 10);
++    }
++#endif
+ 
+     tcg_target_call_clobber_regs = -1ull;
+     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X19);
+@@ -3473,8 +4129,20 @@ static void tcg_target_qemu_prologue(TCGContext *s)
+     tcg_out_insn(s, 3207, RET, TCG_REG_LR);
+ }
+ 
++/*
++ * vphone-linux: the guest's FP flags during translation; see
++ * arm_host_fpsr_translation_save() in target/arm/tcg/host-fpcr.h. By here the
++ * passes that use glib's hash tables (optimize, constant temps) are over.
++ */
++__thread uint64_t tcg_aarch64_guest_fpsr;
++__thread bool tcg_aarch64_guest_fpsr_valid;
++
+ static void tcg_out_tb_start(TCGContext *s)
+ {
++    if (tcg_aarch64_guest_fpsr_valid) {
++        __asm__ volatile("msr fpsr, %0" :: "r"(tcg_aarch64_guest_fpsr));
++        tcg_aarch64_guest_fpsr_valid = false;
++    }
+     tcg_out_bti(s, BTI_J);
+ }
+ 
+diff --git a/tests/fp/vphone-f32-fast.c b/tests/fp/vphone-f32-fast.c
+index f680043c6f7280972ce9c507c62594e9d154ac1c..a47be033ffc7bc928fe8be7e8ab53ba7eaf0a951 100644
+--- a/tests/fp/vphone-f32-fast.c
++++ b/tests/fp/vphone-f32-fast.c
+@@ -8,15 +8,93 @@
+  * through softfloat lane by lane, as the generic helpers do. Wherever
+  * vf32_fast() accepts a vector, its lanes must equal softfloat's bit for bit,
+  * and softfloat must have raised no flag the status did not already hold.
+- * Where it refuses, the host's MXCSR must be as it was (with native FP the
+- * MXCSR flags are the guest's), and with MXCSR not rounding to nearest (the
+- * guest's FPCR.RMode under native FP) it must refuse everything.
++ * Where it refuses, the host's FP status must be as it was (MXCSR on x86-64,
++ * FPCR and FPSR on AArch64: with native FP its flags are the guest's), and
++ * with the host not rounding to nearest (or, on AArch64, flushing to zero)
++ * it must refuse everything.
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ #include "qemu/osdep.h"
+ #include "../../target/arm/tcg/vec-f32-fast.h"
+ 
++#if defined(__aarch64__)
++/* FPCR (RMode, FZ) in the high word, FPSR in the low word. */
++static uint64_t hw_get(void)
++{
++    uint64_t fpcr, fpsr;
++
++    __asm__ volatile("mrs %0, fpcr\n mrs %1, fpsr" : "=r"(fpcr), "=r"(fpsr));
++    return fpcr << 32 | fpsr;
++}
++
++static void hw_set(uint64_t v)
++{
++    __asm__ volatile("msr fpcr, %0\n msr fpsr, %1" :: "r"(v >> 32),
++                     "r"(v & 0xffffffffu));
++}
++
++static uint64_t hw_default(void)
++{
++    return 0;
++}
++
++static uint64_t hw_pick(uint32_t r)
++{
++    uint64_t fpcr = 0;
++
++    if (r % 16 == 0) {
++        fpcr = (uint64_t)(1 + (r >> 8) % 3) << 22;
++    }
++    if ((r >> 4) % 16 == 0) {
++        fpcr |= 1u << 24;   /* FZ */
++    }
++    /* The guest's flags, which a refusal must leave alone. */
++    return fpcr << 32 | (r % 7 ? 0 : 0x10);
++}
++
++static bool hw_refuses(uint64_t v)
++{
++    return v & ((uint64_t)(3u << 22 | 1u << 24) << 32);
++}
++
++/* An accepted vector puts FPSR back: its Inexact is already in the status. */
++static uint64_t hw_extra(uint64_t before, uint64_t after)
++{
++    return before != after;
++}
++#else
++static uint64_t hw_get(void)
++{
++    return _mm_getcsr();
++}
++
++static void hw_set(uint64_t v)
++{
++    _mm_setcsr(v);
++}
++
++static uint64_t hw_default(void)
++{
++    return 0x1f80;
++}
++
++static uint64_t hw_pick(uint32_t r)
++{
++    return 0x1f80 | (r % 16 == 0 ? (1 + (r >> 8) % 3) << 13 : 0);
++}
++
++static bool hw_refuses(uint64_t v)
++{
++    return v & 0x6000;
++}
++
++static uint64_t hw_extra(uint64_t before, uint64_t after)
++{
++    return (after & ~before) & 0x1f;
++}
++#endif
++
+ static uint64_t rng = 0x9e3779b97f4a7c15ULL;
+ 
+ static uint32_t rnd32(void)
+@@ -100,19 +178,31 @@ int main(int argc, char **argv)
+         }
+ 
+         float_status fs = s;
+-        unsigned csr = 0x1f80 | (rnd32() % 16 == 0 ? (1 + rnd32() % 3) << 13 : 0);
++        uint64_t csr = hw_pick(rnd32());
+         bool ok;
+ 
+-        _mm_setcsr(csr);
++        hw_set(csr);
+         run[op]++;
+         ok = vf32_fast(d, n, m, op >= VF32_FMA ? a : NULL, &fs, oprsz, op, idx);
+-        if ((!ok && _mm_getcsr() != csr) || (ok && (csr & 0x6000))) {
+-            if (failures++ < 10) {
+-                printf("MXCSR %s: %#x -> %#x, %s\n", names[op], csr,
+-                       _mm_getcsr(), ok ? "taken" : "refused");
++        {
++            uint64_t now = hw_get();
++
++            hw_set(hw_default());
++            if ((!ok && now != csr) || (ok && hw_refuses(csr)) ||
++                (ok && hw_extra(csr, now))) {
++                if (failures++ < 10) {
++                    printf("HOST FP STATE %s: %#llx -> %#llx, %s\n", names[op],
++                           (unsigned long long)csr, (unsigned long long)now,
++                           ok ? "taken" : "refused");
++                    for (int i = 0; i < oprsz / 4; i++) {
++                        printf("  lane %d: n %08x m %08x a %08x\n", i, n[i],
++                               idx >= 0 ? m[(i / (oprsz < 16 ? oprsz / 4 : 4)) *
++                                            (oprsz < 16 ? oprsz / 4 : 4) + idx]
++                                        : m[i], a[i]);
++                    }
++                }
+             }
+         }
+-        _mm_setcsr(0x1f80);
+         if (!ok) {
+             continue;
+         }
+diff --git a/util/main-loop.c b/util/main-loop.c
+index b877aaea1da1a01b1f1065380caaab072252bc51..5e9fc1ef7c7b4ec31785101a16cb98dc6618494c 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -99,7 +99,13 @@ static int qemu_signal_init(Error **errp)
+     sigaddset(&set, SIG_IPI);
+     sigaddset(&set, SIGIO);
+     sigaddset(&set, SIGALRM);
++#ifndef CONFIG_ANDROID
++    /*
++     * Not in an app's process: ART's userfaultfd GC takes SIGBUS on managed
++     * heap pages, and this thread may be attached to ART.
++     */
+     sigaddset(&set, SIGBUS);
++#endif
+     /* SIGINT cannot be handled via signalfd, so that ^C can be used
+      * to interrupt QEMU when it is being run under gdb.  SIGHUP and
+      * SIGTERM are also handled asynchronously, even though it is not
+diff --git a/util/oslib-posix.c b/util/oslib-posix.c
+index 14cf94ac03417f2c38a0b40582afd59eaf0e0b79..24f76b8edcd2b02abe5a6f235f46809eccd15a11 100644
+--- a/util/oslib-posix.c
++++ b/util/oslib-posix.c
+@@ -60,6 +60,7 @@
+ 
+ #include "qemu/memalign.h"
+ #include "qemu/mmap-alloc.h"
++#include "qemu/memfd.h"
+ 
+ #define MAX_MEM_PREALLOC_THREAD_COUNT 16
+ 
+@@ -973,6 +974,13 @@ void qemu_close_all_open_fd(const int *skip, unsigned int nskip)
+     }
+ }
+ 
++#ifdef CONFIG_ANDROID
++/* bionic has no shm_open; a memfd is a nameless shared memory object anyway. */
++int qemu_shm_alloc(size_t size, Error **errp)
++{
++    return qemu_memfd_create("qemu-shm", size, false, 0, 0, errp);
++}
++#else
+ int qemu_shm_alloc(size_t size, Error **errp)
+ {
+     g_autoptr(GString) shm_name = g_string_new(NULL);
+@@ -1024,3 +1032,4 @@ int qemu_shm_alloc(size_t size, Error **errp)
+ 
+     return fd;
+ }
++#endif /* !CONFIG_ANDROID */
+diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
+index 22b4a77f16bba26e4cb90e92a64905b600e58eda..5d18826d162f84f35fe3d501ee1af0d2143fa020 100644
+--- a/util/qemu-thread-posix.c
++++ b/util/qemu-thread-posix.c
+@@ -17,6 +17,7 @@
+ #include "qemu-thread-common.h"
+ #include "qemu/tsan.h"
+ #include "qemu/bitmap.h"
++#include "qemu/units.h"
+ 
+ #ifdef CONFIG_PTHREAD_SET_NAME_NP
+ #include <pthread_np.h>
+@@ -420,12 +421,29 @@ void qemu_thread_create(QemuThread *thread, const char *name,
+         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+     }
+ 
++#ifdef CONFIG_ANDROID
++    /*
++     * bionic's default stack is 1 MiB and glibc's is the 8 MiB QEMU is written
++     * for. A vCPU thread runs device models and block code on this stack, and
++     * a stack this size only costs address space until its pages are touched.
++     */
++    err = pthread_attr_setstacksize(&attr, 8 * MiB);
++    if (err) {
++        error_exit(err, __func__);
++    }
++#endif
++
+     /* Leave signal handling to the iothread.  */
+     sigfillset(&set);
+     /* Blocking the signals can result in undefined behaviour. */
+     sigdelset(&set, SIGSEGV);
+     sigdelset(&set, SIGFPE);
+     sigdelset(&set, SIGILL);
++#ifdef CONFIG_ANDROID
++    /* A blocked synchronous signal kills a thread with no tombstone. */
++    sigdelset(&set, SIGBUS);
++    sigdelset(&set, SIGSYS);
++#endif
+     /* TODO avoid SIGBUS loss on macOS */
+     pthread_sigmask(SIG_SETMASK, &set, &oldset);
+ 

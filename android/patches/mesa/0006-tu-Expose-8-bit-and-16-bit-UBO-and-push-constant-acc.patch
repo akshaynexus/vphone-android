@@ -1,0 +1,55 @@
+From aa5b05537312e0eae64826a6104f9cee32de1fc2 Mon Sep 17 00:00:00 2001
+From: vphone <vphone@localhost>
+Date: Mon, 9 Nov 2026 03:15:08 +0530
+Subject: [PATCH 6/6] tu: Expose 8-bit and 16-bit UBO and push constant access
+
+The constant file is dword-addressed, so 8-bit and 16-bit loads are
+widened to dword loads and shifted by nir_lower_mem_access_bit_sizes.
+
+Generated-by: LLM
+---
+ src/freedreno/ir3/ir3_nir.c       | 4 +++-
+ src/freedreno/vulkan/tu_device.cc | 8 ++++----
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 6e6f09e7b08..a9b1316237e 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1211,7 +1211,9 @@ ir3_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes,
+    else if (bit_size >= 32)
+       bit_size = 32;
+ 
+-   if (intrin == nir_intrinsic_load_ubo)
++   /* Constants are read as whole dwords. */
++   if (intrin == nir_intrinsic_load_ubo ||
++       intrin == nir_intrinsic_load_push_constant)
+       bit_size = 32;
+ 
+    return (nir_mem_access_size_align){
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 530d945b808..af961427615 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -508,8 +508,8 @@ tu_get_features(struct tu_physical_device *pdevice,
+ 
+    /* Vulkan 1.1 */
+    features->storageBuffer16BitAccess            = pdevice->info->props.storage_16bit;
+-   features->uniformAndStorageBuffer16BitAccess  = false;
+-   features->storagePushConstant16               = false;
++   features->uniformAndStorageBuffer16BitAccess  = pdevice->info->props.storage_16bit;
++   features->storagePushConstant16               = pdevice->info->chip >= 7;
+    features->storageInputOutput16                = pdevice->info->chip >= 7;
+    features->multiview                           = true;
+    /* Multiview + GS seems to hang on a6xx. We also don't yet support the
+@@ -529,8 +529,8 @@ tu_get_features(struct tu_physical_device *pdevice,
+    features->samplerMirrorClampToEdge            = true;
+    features->drawIndirectCount                   = true;
+    features->storageBuffer8BitAccess             = pdevice->info->props.storage_8bit;
+-   features->uniformAndStorageBuffer8BitAccess   = false;
+-   features->storagePushConstant8                = false;
++   features->uniformAndStorageBuffer8BitAccess   = pdevice->info->props.storage_8bit;
++   features->storagePushConstant8                = pdevice->info->chip >= 7;
+    features->shaderBufferInt64Atomics =
+       pdevice->info->props.has_64b_ssbo_atomics;
+    features->shaderSharedInt64Atomics            = false;

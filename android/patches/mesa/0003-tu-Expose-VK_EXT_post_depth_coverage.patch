@@ -1,0 +1,26 @@
+From 6be8edf8d613f4aa53524f75e0a1b4e51bd01b5b Mon Sep 17 00:00:00 2001
+From: vphone <vphone@localhost>
+Date: Mon, 9 Nov 2026 03:13:19 +0530
+Subject: [PATCH 3/6] tu: Expose VK_EXT_post_depth_coverage
+
+ir3 already forwards ExecutionModePostDepthCoverage to
+RB_PS_INPUT_CNTL.POSTDEPTHCOVERAGE (tu6_emit_fs_inputs), the same bit
+the gallium driver uses for GL_ARB_post_depth_coverage.
+
+Generated-by: LLM
+---
+ src/freedreno/vulkan/tu_device.cc | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 41d4cd38b12..cdf4e1999ae 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -376,6 +376,7 @@ get_device_extensions(const struct tu_physical_device *device,
+       .EXT_physical_device_drm = !is_kgsl(device->instance),
+       .EXT_pipeline_creation_cache_control = true,
+       .EXT_pipeline_creation_feedback = true,
++      .EXT_post_depth_coverage = true,
+ #ifdef TU_USE_WSI_PLATFORM
+       .EXT_present_timing = device->info->props.has_persistent_counter,
+ #endif

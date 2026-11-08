@@ -1,0 +1,321 @@
+//! The JNI entry points behind `com.vphone.android.Native`.
+
+use crate::bundle;
+use crate::config::{self, VmConfig};
+use crate::import;
+use crate::meminfo::MemInfo;
+use crate::paths::Paths;
+use crate::runtime;
+use jni::objects::{JObject, JString};
+use jni::sys::{jfloat, jint, jintArray, jlong, jstring};
+use jni::JNIEnv;
+use serde_json::json;
+use std::fs::File;
+use std::os::fd::FromRawFd;
+use std::os::raw::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+#[link(name = "android")]
+extern "C" {
+    fn ANativeWindow_fromSurface(env: *mut c_void, surface: *mut c_void) -> *mut c_void;
+    fn ANativeWindow_release(window: *mut c_void);
+}
+
+fn text(env: &mut JNIEnv, s: &JString) -> String {
+    env.get_string(s).map(String::from).unwrap_or_default()
+}
+
+fn out(env: &mut JNIEnv, s: &str) -> jstring {
+    env.new_string(s)
+        .map_or(std::ptr::null_mut(), |j| j.into_raw())
+}
+
+/// A panic must not cross into the JVM: it becomes the returned text.
+fn guarded(env: &mut JNIEnv, f: impl FnOnce(&mut JNIEnv) -> String) -> jstring {
+    let result = catch_unwind(AssertUnwindSafe(|| f(env)));
+    let s = result.unwrap_or_else(|_| json!({"error": "internal error; see logcat"}).to_string());
+    out(env, &s)
+}
+
+fn quiet(f: impl FnOnce()) {
+    let _ = catch_unwind(AssertUnwindSafe(f));
+}
+
+fn result_text(r: Result<(), String>) -> String {
+    r.err().unwrap_or_default()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_setup(
+    mut env: JNIEnv,
+    _this: JObject,
+    files: JString,
+    cache: JString,
+    external: JString,
+    native_lib: JString,
+) {
+    let paths = Paths {
+        files: text(&mut env, &files).into(),
+        cache: text(&mut env, &cache).into(),
+        external: text(&mut env, &external).into(),
+        native_lib: text(&mut env, &native_lib).into(),
+    };
+    quiet(|| {
+        std::panic::set_hook(Box::new(|info| {
+            crate::platform::log("vphone-panic", &info.to_string())
+        }));
+        let _ = std::fs::create_dir_all(paths.vms());
+        import::remove_stale(&paths.vms());
+        Paths::set(paths);
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_listVms(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| {
+        serde_json::to_string(&bundle::list(&Paths::get().vms())).unwrap_or_default()
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_deviceInfo(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| {
+        let mem = MemInfo::read();
+        json!({
+            "totalMib": mem.total_mib,
+            "availableMib": mem.available_mib,
+            "cpus": config::online_cpus(),
+            "defaults": VmConfig::default(),
+        })
+        .to_string()
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_saveVmConfig(
+    mut env: JNIEnv,
+    _this: JObject,
+    name: JString,
+    config_json: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let name = text(env, &name);
+        let json = text(env, &config_json);
+        match serde_json::from_str::<VmConfig>(&json) {
+            Ok(cfg) => result_text(cfg.save(&Paths::get().vms().join(name))),
+            Err(e) => e.to_string(),
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_preflight(
+    mut env: JNIEnv,
+    _this: JObject,
+    name: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let name = text(env, &name);
+        serde_json::to_string(&runtime::preflight(&name)).unwrap_or_default()
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_boot(
+    mut env: JNIEnv,
+    _this: JObject,
+    name: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let name = text(env, &name);
+        result_text(runtime::boot(&name))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_state(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| {
+        serde_json::to_string(&runtime::state()).unwrap_or_default()
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_takeNotice(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| runtime::take_notice())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_stop(_env: JNIEnv, _this: JObject) {
+    quiet(runtime::stop);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_lastRun(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| {
+        runtime::last_run().map_or_else(String::new, |r| {
+            serde_json::to_string(&r).unwrap_or_default()
+        })
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_recordDeath(
+    mut env: JNIEnv,
+    _this: JObject,
+    reason: JString,
+) {
+    let reason = text(&mut env, &reason);
+    quiet(|| runtime::record_death(&reason));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_logTail(
+    mut env: JNIEnv,
+    _this: JObject,
+    path: JString,
+    bytes: jlong,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let path = text(env, &path);
+        runtime::log_tail(&path, bytes.max(0) as u64)
+    })
+}
+
+/// The Surface for the guest's screen, or null when it is gone.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_setSurface(
+    env: JNIEnv,
+    _this: JObject,
+    surface: JObject,
+) {
+    quiet(|| {
+        let window = if surface.is_null() {
+            std::ptr::null_mut()
+        } else {
+            // SAFETY: env and surface are the live JNI references of this call.
+            unsafe { ANativeWindow_fromSurface(env.get_raw().cast(), surface.as_raw().cast()) }
+        };
+        let old = runtime::swap_window(window as usize);
+        if old != 0 {
+            // SAFETY: swap_window handed back the reference this function acquired earlier.
+            unsafe { ANativeWindow_release(old as *mut c_void) };
+        }
+    });
+}
+
+/// The image's `[left, top, width, height]` in a container; touches then come in that view's size.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_layoutImage(
+    env: JNIEnv,
+    _this: JObject,
+    w: jint,
+    h: jint,
+) -> jintArray {
+    let s = runtime::state();
+    let rect = runtime::fit(w, h, s.width, s.height);
+    runtime::set_view(rect[2], rect[3]);
+    match env.new_int_array(4) {
+        Ok(array) => {
+            let _ = env.set_int_array_region(&array, 0, &rect);
+            array.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_touch(
+    _env: JNIEnv,
+    _this: JObject,
+    action: jint,
+    x: jfloat,
+    y: jfloat,
+) {
+    quiet(|| runtime::touch(action, x, y));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_home(_env: JNIEnv, _this: JObject) {
+    quiet(runtime::home);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_lock(_env: JNIEnv, _this: JObject) {
+    quiet(runtime::lock);
+}
+
+/// Starts an import; `{"name": ...}` or `{"error": ...}`.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_importBegin(
+    mut env: JNIEnv,
+    _this: JObject,
+    folder: JString,
+    total: jlong,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let folder = text(env, &folder);
+        match import::begin(&Paths::get().vms(), &folder, total.max(0) as u64) {
+            Ok(name) => json!({"name": name}).to_string(),
+            Err(e) => json!({"error": e}).to_string(),
+        }
+    })
+}
+
+/// Copies one file, taking ownership of `fd`. Blocks until done; an error's text, or "".
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_importFile(
+    mut env: JNIEnv,
+    _this: JObject,
+    fd: jint,
+    rel: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let rel = text(env, &rel);
+        // SAFETY: Kotlin detached this descriptor from its ParcelFileDescriptor and gave it up.
+        let file = unsafe { File::from_raw_fd(fd) };
+        result_text(import::file(file, &rel))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_importFinish(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| result_text(import::finish()))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_importAbort(_env: JNIEnv, _this: JObject) {
+    quiet(import::abort);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_importCancel(_env: JNIEnv, _this: JObject) {
+    quiet(import::cancel);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_importProgress(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| {
+        serde_json::to_string(&import::progress()).unwrap_or_default()
+    })
+}

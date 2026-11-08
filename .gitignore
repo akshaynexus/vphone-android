@@ -41,3 +41,10 @@ sshramdisk/
 linux-create/Shims/libarchive/lib/
 /cpu-tree/
 __pycache__/
+
+# Android build output
+/android/build/
+/android/app/build/
+/android/app/.gradle/
+/android/.gradle/
+/android/local.properties

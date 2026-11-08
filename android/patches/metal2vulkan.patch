@@ -1,0 +1,1119 @@
+diff --git a/crates/metal2vulkan-runtime/src/copied.rs b/crates/metal2vulkan-runtime/src/copied.rs
+index e44173e72ac788c6c29ba88b2b135e2d147334f5..d336e5e9fc5d94085b5fa5d7c7000a09bb82c0b7 100644
+--- a/crates/metal2vulkan-runtime/src/copied.rs
++++ b/crates/metal2vulkan-runtime/src/copied.rs
+@@ -832,7 +832,7 @@ pub(crate) unsafe fn read_caller(
+ /// page the process cannot read (unmapped, or mapped without read permission) with a failure, not a
+ /// fault: `false` then. On Linux `process_vm_readv` of the process's own pages; on macOS
+ /// `mach_vm_read_overwrite` of its own task's; elsewhere nothing is read and the answer is `false`.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+     let mut done = 0;
+     while done < into.len() {
+@@ -885,7 +885,7 @@ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+ }
+ 
+ /// [`read_pages`] where the system is not asked: nothing is copied.
+-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++#[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
+ pub(crate) fn read_pages(_pages: NonNull<u8>, _into: &mut [u8]) -> bool {
+     false
+ }
+diff --git a/crates/metal2vulkan-runtime/src/device/create.rs b/crates/metal2vulkan-runtime/src/device/create.rs
+index a67216d61a5102a1cf25700bcdeb6d72238c67a9..9ff36758962347b4e4f86632a487eb25f0dc0dca 100644
+--- a/crates/metal2vulkan-runtime/src/device/create.rs
++++ b/crates/metal2vulkan-runtime/src/device/create.rs
+@@ -603,6 +603,12 @@ pub(crate) fn default_loaders(vulkan_sdk: Option<&Path>) -> Vec<PathBuf> {
+ /// The Vulkan loader: `loader` where the options name one, else the first of
+ /// [`default_loaders`] that opens. [`Error::LoaderNotFound`] names each library tried.
+ pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
++    #[cfg(target_os = "android")]
++    if loader.is_none() {
++        if let Some(entry) = android_entry() {
++            return Ok(entry);
++        }
++    }
+     let tried = match loader {
+         Some(path) => vec![path.to_path_buf()],
+         None => default_loaders(std::env::var_os("VULKAN_SDK").as_deref().map(Path::new)),
+@@ -616,6 +622,46 @@ pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
+     Err(Error::LoaderNotFound(LoaderNotFound { tried }))
+ }
+ 
++/// The app's `vkGetInstanceProcAddr` on Android ([`set_android_vulkan_gipa`]): 0 where none is
++/// registered, and the system's loader is opened by name.
++#[cfg(target_os = "android")]
++static ANDROID_GIPA: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++/// Registers the `vkGetInstanceProcAddr` every instance of this process goes through on Android,
++/// before the first device is made: the app loads its Vulkan driver itself (libadrenotools'
++/// hooked system loader), so nothing here may open `libvulkan.so` by name and get the system's
++/// driver instead. `None` goes back to the system's loader.
++///
++/// # Safety
++///
++/// `gipa` is a valid `vkGetInstanceProcAddr` that stays loaded for the life of the process.
++#[cfg(target_os = "android")]
++pub unsafe fn set_android_vulkan_gipa(gipa: Option<vk::PFN_vkGetInstanceProcAddr>) {
++    let address = gipa.map_or(0, |gipa| gipa as usize);
++    ANDROID_GIPA.store(address, std::sync::atomic::Ordering::Release);
++}
++
++/// The entry over the `vkGetInstanceProcAddr` the app registered ([`set_android_vulkan_gipa`]);
++/// `None` where it registered none.
++#[cfg(target_os = "android")]
++pub fn android_entry() -> Option<ash::Entry> {
++    let address = ANDROID_GIPA.load(std::sync::atomic::Ordering::Acquire);
++    if address == 0 {
++        return None;
++    }
++    // SAFETY: a non-zero address is the `PFN_vkGetInstanceProcAddr` it was registered as, which
++    // the caller of `set_android_vulkan_gipa` keeps loaded for the life of the process.
++    let get_instance_proc_addr =
++        unsafe { std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(address) };
++    // SAFETY: the function is a valid `vkGetInstanceProcAddr`; the entry loads the global
++    // commands through it and keeps no library of its own open.
++    Some(unsafe {
++        ash::Entry::from_static_fn(ash::StaticFn {
++            get_instance_proc_addr,
++        })
++    })
++}
++
+ /// `vkCreateInstance` of `info` from `entry`: every instance the runtime creates, its devices' and
+ /// the drivers' keeper's (`keeper.rs`), is made here, and the exit guard's hook registers again
+ /// after it, whatever it answered ([`exit_guard::instance_made`]): a layer registers an exit
+@@ -812,6 +858,10 @@ pub(crate) fn layers_dropped(dropped: &[CString], device: &str) -> Option<String
+ /// sends as it is made ([`layers_dropped`]).
+ pub(crate) const LAYERS_DROPPED: &str = "metal2vulkan-instance-layers-dropped";
+ 
++/// The id name of the informational message a device on an Adreno GPU under Turnip sends as it is
++/// made, naming the GPU (`DeviceDescription::adreno`) and how many driver facts apply.
++pub(crate) const ADRENO_IDENTITY: &str = "metal2vulkan-adreno-identity";
++
+ /// The physical devices of `instance` that `options` admit, in the order
+ /// `Device::system_default` prefers them (by [`DeviceKind`], then enumeration order).
+ fn ranked(
+@@ -1582,6 +1632,18 @@ fn create_on(
+     if let Some(text) = layers_dropped(&instance.dropped_layers, device.name()) {
+         device.inform(LAYERS_DROPPED, text);
+     }
++    if let Some(gpu) = device.properties().description.adreno() {
++        let measured = device.properties().driver_facts.len();
++        device.inform(
++            ADRENO_IDENTITY,
++            format!(
++                "metal2vulkan: the device is {} ({:?}) on Turnip, with {measured} measured driver \
++                 facts: the rest take the routes the runtime names for a driver without them \
++                 [{ADRENO_IDENTITY}]",
++                gpu.name, gpu.generation
++            ),
++        );
++    }
+     if let Some(why) = cache_kept {
+         let object = format!("the device, on {}", device.name());
+         if kept_cache_is_metals(device.properties().description.driver_id) {
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 380f21fb8f3e1b2625b69956a751b62566be23d3..1a3734e5bdd5e50d7a035ad6ec50a13ba0be0fde 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -33,6 +33,8 @@ pub(crate) mod submit_stalls;
+ 
+ pub use adopt::RawDevice;
+ pub(crate) use compiles::holding;
++#[cfg(target_os = "android")]
++pub use create::{android_entry, set_android_vulkan_gipa};
+ pub use create::{
+     DebugMessage, DeviceOptions, LayerSetting, LayerSettingValue, MessageKind, MessageSeverity,
+     MessageSink,
+diff --git a/crates/metal2vulkan-runtime/src/dma_buf.rs b/crates/metal2vulkan-runtime/src/dma_buf.rs
+index 6a844ebbbbb17d3249df9aee081f96852e280844..675b34624681dd64cca4db665207105d1fa5923b 100644
+--- a/crates/metal2vulkan-runtime/src/dma_buf.rs
++++ b/crates/metal2vulkan-runtime/src/dma_buf.rs
+@@ -355,7 +355,7 @@ fn answers(chunks: &[DmaBufChunk], request: &DmaBufRequest, page: u64) -> bool {
+ 
+ /// The bytes of the dma-buf `fd`; `None` where it is no dma-buf (its file is not on the kernel's
+ /// dma-buf file system).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn dma_buf_length(fd: BorrowedFd<'_>) -> Option<u64> {
+     use std::os::fd::AsRawFd;
+     /// `DMA_BUF_MAGIC` of Linux's `include/uapi/linux/magic.h`.
+@@ -378,7 +378,7 @@ fn dma_buf_length(fd: BorrowedFd<'_>) -> Option<u64> {
+ }
+ 
+ /// No file is a dma-buf on this system.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ fn dma_buf_length(_fd: BorrowedFd<'_>) -> Option<u64> {
+     None
+ }
+diff --git a/crates/metal2vulkan-runtime/src/exit_guard.rs b/crates/metal2vulkan-runtime/src/exit_guard.rs
+index 25cb2dc732b9b42f4c9e40b25dd22fb8b4ce189f..e187a147fa9d05e08536970cdbd8285c17549fc8 100644
+--- a/crates/metal2vulkan-runtime/src/exit_guard.rs
++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs
+@@ -169,14 +169,14 @@ use std::time::{Duration, Instant};
+ /// submission, one poll (at most 100 ms), one counter read, one save's read, or one object's
+ /// release (a device's: its threads' stops, `vkDeviceWaitIdle`, its destruction); it outlasts this
+ /// only when a driver or a message sink blocks.
+-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
++#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu")))]
+ pub(crate) const BOUND: Duration = Duration::from_secs(2);
+ 
+ /// The longest the hook waits, where it learns no exit status (macOS), while a driver's making of
+ /// a `VkPipeline` is in progress in a section ([`driver_making`]), for the sections in progress: a
+ /// making takes 20 to 50 s on NVIDIA (`pipeline/piece_holds.rs`), and Metal's process waited for
+ /// all of it at the state's creation, before its exit.
+-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
++#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu")))]
+ pub(crate) const MAKING_BOUND: Duration = Duration::from_secs(60);
+ 
+ /// The longest a blocked wait goes without looking at the guard.
+@@ -1003,7 +1003,7 @@ fn run_at_user_interactive() {
+ /// Ask the scheduler to treat this thread as fully busy whenever it runs, and no thread it starts:
+ /// a thread of the runtime's own that takes command buffers to their handlers
+ /// ([`spawn_user_interactive`]), as macOS runs them at the user-interactive class.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn run_at_user_interactive() {
+     // `SCHED_FLAG_RESET_ON_FORK`, `SCHED_FLAG_KEEP_PARAMS` and `SCHED_FLAG_UTIL_CLAMP_MIN`
+     // (`<linux/sched.h>`).
+@@ -1049,7 +1049,7 @@ fn run_at_user_interactive() {
+ 
+ /// `struct sched_attr` of `sched_setattr(2)` and `sched_getattr(2)` (`<linux/sched/types.h>`), its
+ /// 56-byte version, the first with the utilization clamps.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ #[repr(C)]
+ #[derive(Clone, Copy, Debug, Default)]
+ pub(crate) struct SchedAttr {
+@@ -1065,7 +1065,7 @@ pub(crate) struct SchedAttr {
+     pub(crate) sched_util_max: u32,
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ impl SchedAttr {
+     /// Its size, which `size` states.
+     const SIZE: u32 = std::mem::size_of::<SchedAttr>() as u32;
+@@ -1073,6 +1073,10 @@ impl SchedAttr {
+     /// The calling thread's attributes (`sched_getattr(2)`), `size` its own; `None` where the
+     /// kernel refuses.
+     pub(crate) fn own() -> Option<SchedAttr> {
++        // Android's seccomp filter may kill an app for this call, and its scheduler is the OS's.
++        if cfg!(target_os = "android") {
++            return None;
++        }
+         let mut attr = SchedAttr {
+             size: Self::SIZE,
+             ..SchedAttr::default()
+@@ -1096,6 +1100,9 @@ impl SchedAttr {
+     /// Set the calling thread's attributes to these (`sched_setattr(2)`); whether the kernel
+     /// took them.
+     pub(crate) fn set_own(mut self) -> bool {
++        if cfg!(target_os = "android") {
++            return false;
++        }
+         // SAFETY: `sched_setattr(0, &mut attr, 0)` reads `attr`, whose `size` is its own, and sets
+         // the calling thread's attributes from it. A kernel whose struct is shorter, and that
+         // finds a field past its end set, writes its own size into `attr.size` before it refuses
+@@ -1107,7 +1114,7 @@ impl SchedAttr {
+ }
+ 
+ /// Nothing: no such hint here ([`run_at_user_interactive`] on macOS and Linux).
+-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
++#[cfg(not(any(target_os = "macos", any(target_os = "linux", target_os = "android"))))]
+ fn run_at_user_interactive() {}
+ 
+ /// Whether this thread runs at the user-initiated quality of service or above: its class is
+@@ -1381,7 +1388,7 @@ fn register_again() {
+ 
+ /// Register [`exit_handler`] with the C library's exit handlers: through `on_exit(3)`, which
+ /// shares `atexit`'s order and passes the exit's status.
+-#[cfg(all(target_os = "linux", target_env = "gnu"))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
+ fn install() {
+     INSTALLED.fetch_add(1, Ordering::Relaxed);
+     // SAFETY: `exit_handler` takes the status and an argument it does not read, and never
+@@ -1391,7 +1398,7 @@ fn install() {
+ }
+ 
+ /// Register [`exit_handler`] with the C library's exit handlers.
+-#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
++#[cfg(all(unix, not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))))]
+ fn install() {
+     INSTALLED.fetch_add(1, Ordering::Relaxed);
+     // SAFETY: `exit_handler` is a function with no arguments that never unwinds. Registration
+@@ -1407,7 +1414,7 @@ fn install() {}
+ // The GNU C library's `on_exit(3)` (`<stdlib.h>`), which `libc` does not declare: `function` is
+ // called with `exit`'s status and `argument`, among the handlers `atexit` registers, in the
+ // reverse order of their registration.
+-#[cfg(all(target_os = "linux", target_env = "gnu"))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
+ unsafe extern "C" {
+     fn on_exit(
+         function: extern "C" fn(std::ffi::c_int, *mut std::ffi::c_void),
+@@ -1418,7 +1425,7 @@ unsafe extern "C" {
+ /// The exit handler, where it learns the exit's status: the hook waits for nothing, and where the
+ /// driver is running what the runtime gave it, the process ends at once with that status
+ /// ([`end_at_once`]).
+-#[cfg(all(target_os = "linux", target_env = "gnu"))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
+ extern "C" fn exit_handler(status: std::ffi::c_int, _: *mut std::ffi::c_void) {
+     let ended = hook(
+         &GUARD,
+@@ -1436,7 +1443,7 @@ extern "C" fn exit_handler(status: std::ffi::c_int, _: *mut std::ffi::c_void) {
+ 
+ /// The exit handler, where it learns no status (`atexit`): the hook waits at most [`BOUND`], or
+ /// [`MAKING_BOUND`] while a making is in progress, and returns.
+-#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
++#[cfg(all(unix, not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))))]
+ extern "C" fn exit_handler() {
+     hook(
+         &GUARD,
+@@ -1454,9 +1461,9 @@ extern "C" fn exit_handler() {
+ /// the child inherits.
+ #[cfg(all(test, unix))]
+ pub(crate) fn run_on_exit(status: std::ffi::c_int) {
+-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
++    #[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
+     exit_handler(status, std::ptr::null_mut());
+-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
++    #[cfg(not(all(any(target_os = "linux", target_os = "android"), target_env = "gnu")))]
+     {
+         let _ = status;
+         exit_handler();
+@@ -1464,7 +1471,7 @@ pub(crate) fn run_on_exit(status: std::ffi::c_int) {
+ }
+ 
+ /// What [`end_at_once`] writes on standard error, one line in a degrade notice's form.
+-#[cfg(all(target_os = "linux", target_env = "gnu"))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
+ pub(crate) const AT_ONCE_NOTICE: &str = "metal2vulkan: the process's exit: the Vulkan driver is \
+     still running the runtime's work (a call, a pipeline's making, or a CPU device's commands); \
+     the process ends at once with its status, and the exit handlers registered before the \
+@@ -1475,7 +1482,7 @@ pub(crate) const AT_ONCE_NOTICE: &str = "metal2vulkan: the process's exit: the V
+ /// work. One line on standard error ([`AT_ONCE_NOTICE`]), the C library's output streams flushed
+ /// (as `exit` flushes them after its handlers), then `_exit`: no later exit handler or destructor
+ /// runs, beside the driver's call or after it.
+-#[cfg(all(target_os = "linux", target_env = "gnu"))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "gnu"))]
+ fn end_at_once(status: std::ffi::c_int) -> ! {
+     // SAFETY: writes the notice's bytes, live for the call, to standard error; a failed write
+     // is ignored, as the exit goes on.
+diff --git a/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs b/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
+index 59062a3d739ecfb28f760135991837af5abb5de6..0a0f9dad7617aea8b5f645358e96a01a1fbcdaa2 100644
+--- a/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
++++ b/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
+@@ -19,10 +19,15 @@
+ //! (`image_plan.rs`; a caller's image made without that usage is not, `texture/wrapped.rs`, and
+ //! a pass that fetches it renders it into a scratch image that has it, `attachment_stand_in.rs`),
+ //! every pass's draws' subpass reads each color attachment as the input attachment of its index
+-//! with rasterization-order access (`render_target.rs`), and every
+-//! graphics pipeline made for such a subpass orders its color attachment accesses so
+-//! (`pipeline/graphics.rs`): a fetch then reads what each earlier fragment of the pixel wrote,
+-//! whichever pipeline drew it. Every attachment rests in `GENERAL`, the layout an attachment
++//! with rasterization-order access (`render_target.rs`). A pipeline whose fragment function fetches
++//! orders its color attachment accesses so (`pipeline/graphics.rs`), and one that does not draws
++//! unordered, since the ordering costs some drivers on every overlapping primitive (Turnip's
++//! `GRAS_SC_CNTL.SINGLE_PRIM_MODE`, read from its source). Where an instance's draws change between
++//! the two a barrier of the subpass's dependency on itself records between them ([`InputOrder`]),
++//! so a fetch still reads what each earlier fragment of the pixel wrote, whichever pipeline drew
++//! it, and a later draw's writes follow an earlier fetch's reads. The commands of an indirect
++//! command buffer are ordered whether they fetch or not (`render/executions.rs`), the barrier then
++//! taken around their run. Every attachment rests in `GENERAL`, the layout an attachment
+ //! read as both needs.
+ //!
+ //! The storage form ([`through_storage`]): a draw's fetched attachments are storage images it
+@@ -106,6 +111,35 @@ use metal2vulkan::pipeline::StorageAttachmentUse;
+ use metal2vulkan::vk::{Format, ImageCreateFlags, ImageUsageFlags, NumericFormat};
+ use std::collections::BTreeMap;
+ 
++/// How the draws an instance has recorded so far of a pass that fetches through input attachments
++/// ([`through_inputs`]) order their color attachment accesses (the module docs).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) enum InputOrder {
++    /// No draw has recorded in the instance: the pass's own dependencies order what came before.
++    #[default]
++    Unset,
++    /// The last draw's pipeline orders them by rasterization.
++    Ordered,
++    /// The last draw's pipeline does not.
++    Unordered,
++}
++
++impl InputOrder {
++    /// Note a draw whose pipeline does (`ordered`) or does not order its color attachment accesses
++    /// by rasterization, and answer whether it records after a barrier from the draws before it:
++    /// where the two change. Rasterization order alone covers two ordered draws; two unordered
++    /// draws read no attachment, and their writes follow each other as color writes do.
++    pub(crate) fn step(&mut self, ordered: bool) -> bool {
++        let now = match ordered {
++            true => InputOrder::Ordered,
++            false => InputOrder::Unordered,
++        };
++        let barrier = !matches!(*self, InputOrder::Unset) && *self != now;
++        *self = now;
++        barrier
++    }
++}
++
+ /// Whether the compile layer reads `profile`'s fetched color attachments as input attachments
+ /// in rasterization order (`lower::fragment::fetch`): where the device has
+ /// `rasterizationOrderColorAttachmentAccess`.
+@@ -510,3 +544,30 @@ impl Device {
+         Ok(if free { candidate } else { plan })
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::InputOrder;
++
++    /// A draw that fetches through input attachments orders its color accesses by rasterization and
++    /// one that does not, unordered: a barrier records only where an instance's draws change between
++    /// the two, in either direction, and not before the instance's first draw.
++    #[test]
++    fn input_order_records_a_barrier_where_the_draws_change() {
++        let mut order = InputOrder::default();
++        // The first draw of an instance: the pass's own dependencies order what came before.
++        assert!(!order.step(false));
++        // Unordered draws read no attachment.
++        assert!(!order.step(false));
++        // A fetch after them reads what they wrote.
++        assert!(order.step(true));
++        // Two fetches are ordered by rasterization alone.
++        assert!(!order.step(true));
++        // A write after a fetch follows the fetch's read.
++        assert!(order.step(false));
++        assert_eq!(order, InputOrder::Unordered);
++        let mut order = InputOrder::default();
++        assert!(!order.step(true));
++        assert_eq!(order, InputOrder::Ordered);
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
+index 1efe71c6c545414490f445823b688fdb5c671231..d0955055cd8dfa9e09b6f73d4b0a1e752773f45c 100644
+--- a/crates/metal2vulkan-runtime/src/host_memory.rs
++++ b/crates/metal2vulkan-runtime/src/host_memory.rs
+@@ -662,7 +662,7 @@ pub(super) fn import_refused(error: vk::Result) -> Error {
+ /// the reading, which cost about 4.5 ms per import in a process of 34,000 mappings. Each mapping
+ /// asked is counted in `counts` (`WorkCounts::host_mappings_queried`). When the file cannot be
+ /// opened, every import is refused as not implemented here.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Result<(), Error> {
+     let mut asked = 0;
+     let answer = mappings_permitted(
+@@ -701,14 +701,14 @@ impl super::Device {
+ 
+ /// Whether the kernel pins every mapping over `size` bytes of host pages at `pages`
+ /// ([`Access::Pin`]); `false` where the mappings cannot be asked.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn kernel_pins(pages: NonNull<u8>, size: u64) -> bool {
+     let start = pages.as_ptr() as u64;
+     mappings_permitted(start, start.saturating_add(size), Access::Pin, &mut 0) == Some(true)
+ }
+ 
+ /// [`kernel_pins`] off Linux, where no driver is kept from host pages: `true`.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ fn kernel_pins(_pages: NonNull<u8>, _size: u64) -> bool {
+     true
+ }
+@@ -717,13 +717,13 @@ fn kernel_pins(_pages: NonNull<u8>, _size: u64) -> bool {
+ /// answers now ([`mappings_permitted`]): where it does, the CPU reads the bytes with plain loads,
+ /// as a copied host buffer's comparisons read them at each commit (`copied.rs`). `false` where
+ /// the mappings cannot be read (`/proc/self/maps` does not open).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(super) fn mapped_readable(start: u64, end: u64) -> bool {
+     mappings_permitted(start, end, Access::Read, &mut 0) == Some(true)
+ }
+ 
+ /// [`mapped_readable`] where the runtime does not ask the system for its mappings: `false`.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ pub(super) fn mapped_readable(_start: u64, _end: u64) -> bool {
+     false
+ }
+@@ -732,7 +732,7 @@ pub(super) fn mapped_readable(_start: u64, _end: u64) -> bool {
+ /// answers now ([`mappings_permitted`]): where it does not, a copied host buffer of the pages drops
+ /// the GPU's writes rather than write them back (`copied.rs`). `false` where the mappings cannot be
+ /// read (`/proc/self/maps` does not open), so that no write back faults.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+     mappings_permitted(start, end, Access::Write, &mut 0) == Some(true)
+ }
+@@ -792,13 +792,13 @@ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+ 
+ /// [`mapped_writable`] where the runtime does not ask the system for its mappings: `false` (and no
+ /// copy is made here: the runtime reads no caller's page, [`mapped_readable`]).
+-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++#[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "macos")))]
+ pub(super) fn mapped_writable(_start: u64, _end: u64) -> bool {
+     false
+ }
+ 
+ /// A permission the process's mappings are asked for.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(super) enum Access {
+     /// `VM_READ`, the `r` of a mapping's line in the maps: a copy reads the pages (`copied.rs`).
+@@ -814,7 +814,7 @@ pub(super) enum Access {
+     Pin,
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ impl Access {
+     /// The mapping's flag of the permission in `PROCMAP_QUERY`'s answer (`vma_flags`).
+     fn queried(self) -> u64 {
+@@ -850,7 +850,7 @@ impl Access {
+ /// answers now: for the mappings over it ([`queried_permitted`]), or from the lines of
+ /// `/proc/self/maps` where the kernel predates the query ([`permitted`]); `None` when that file
+ /// cannot be opened. Each mapping asked is added to `asked`.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) -> Option<bool> {
+     use std::io::BufRead;
+     let maps = kept_maps()?;
+@@ -870,7 +870,7 @@ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) ->
+ /// answers as one opened for the call, without the opening, which cost each import about as much
+ /// as its queries (an import over 57 mappings, the consumer's guest pages). A process forked
+ /// since holds the file of its parent's mappings, so one of another id opens its own.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
+     static KEPT: Mutex<Option<(u32, std::sync::Arc<std::fs::File>)>> = Mutex::new(None);
+     let process = std::process::id();
+@@ -885,7 +885,7 @@ pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
+ 
+ /// `struct procmap_query` of Linux's `include/uapi/linux/fs.h` (Linux 6.11): the argument of
+ /// [`PROCMAP_QUERY`].
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ #[repr(C)]
+ #[derive(Default)]
+ struct ProcmapQuery {
+@@ -906,21 +906,21 @@ struct ProcmapQuery {
+     build_id_addr: u64,
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ const _: () = assert!(std::mem::size_of::<ProcmapQuery>() == 104);
+ 
+ /// `PROCMAP_QUERY`, `_IOWR('f', 17, struct procmap_query)` in the generic ioctl encoding (an
+ /// architecture of another encoding answers `ENOTTY`, and its imports take the lines).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ const PROCMAP_QUERY: u64 =
+     (3 << 30) | ((std::mem::size_of::<ProcmapQuery>() as u64) << 16) | ((b'f' as u64) << 8) | 17;
+ 
+ /// `PROCMAP_QUERY_VMA_READABLE`: the mapping's `VM_READ`, the `r` of its line in the maps.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ const PROCMAP_QUERY_VMA_READABLE: u64 = 0x01;
+ 
+ /// `PROCMAP_QUERY_VMA_WRITABLE`: the mapping's `VM_WRITE`, the `w` of its line in the maps.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
+ 
+ /// Whether the process maps `[start, end)` without a gap, each mapping with `access`, as the
+@@ -929,7 +929,7 @@ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
+ /// and each added to `asked`. `None` where the kernel does not answer the query (before Linux
+ /// 6.11, `ENOTTY`) or fails it otherwise; a missing mapping (`ENOENT`) is an answer, not
+ /// permitted.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(super) fn queried_permitted(
+     maps: &std::fs::File,
+     start: u64,
+@@ -973,7 +973,7 @@ pub(super) fn queried_permitted(
+ 
+ /// Refuse the window's pages unless the process can write them: no check off Linux (MoltenVK
+ /// hands the range to Metal, which reads read-only pages).
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> Result<(), Error> {
+     Ok(())
+ }
+@@ -982,7 +982,7 @@ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> R
+ /// `[start, end)` without a gap, each with `access`, adding to `asked` each mapping it judged (one
+ /// ending past the address it reached). Reading stops at the first line past `end`; a line that
+ /// does not parse is skipped.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub(super) fn permitted(
+     maps: impl IntoIterator<Item = String>,
+     start: u64,
+@@ -1011,7 +1011,7 @@ pub(super) fn permitted(
+ }
+ 
+ /// One line of `/proc/<pid>/maps`: the mapping's start, its end, and whether it has `access`.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn mapping(line: &str, access: Access) -> Option<(u64, u64, bool)> {
+     let mut fields = line.split_ascii_whitespace();
+     let (from, to) = fields.next()?.split_once('-')?;
+diff --git a/crates/metal2vulkan-runtime/src/host_residency.rs b/crates/metal2vulkan-runtime/src/host_residency.rs
+index fd889f8313a4c1ca26e7364c67d44677aa193ac7..95ecef1bb4b090e3430b2380633ee1f7dc83c26e 100644
+--- a/crates/metal2vulkan-runtime/src/host_residency.rs
++++ b/crates/metal2vulkan-runtime/src/host_residency.rs
+@@ -493,7 +493,7 @@ impl Sweeper {
+ 
+     /// Release every releasable import idle now (`force`: whatever its window), on this thread:
+     /// how many.
+-    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
++    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
+     pub(super) fn sweep(&self, force: bool) -> usize {
+         sweep(&self.shared, force)
+     }
+@@ -554,7 +554,7 @@ fn sweep(shared: &Shared, force: bool) -> usize {
+ }
+ 
+ /// The crate's device tests' hooks (`tests/host_residency.rs`).
+-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
++#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), any(target_os = "linux", target_os = "android")))]
+ impl Device {
+     /// Release now every import of a no-copy buffer's dma-bufs that the device releases while
+     /// idle, whatever its idle window: those no command buffer holds, whose Metal address was
+diff --git a/crates/metal2vulkan-runtime/src/host_shared_pointers.rs b/crates/metal2vulkan-runtime/src/host_shared_pointers.rs
+index 4c166a5c14a810779f5298a8763d1f90e52379c5..4766a1ebc35f1fcb2248cf0312ee5844cf3f37b1 100644
+--- a/crates/metal2vulkan-runtime/src/host_shared_pointers.rs
++++ b/crates/metal2vulkan-runtime/src/host_shared_pointers.rs
+@@ -107,7 +107,7 @@ impl SharedPages {
+     }
+ 
+     /// The mapping's flags and file: a `memfd` of `length` bytes on Linux.
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     fn backing(length: usize) -> Option<(libc::c_int, Option<std::os::fd::OwnedFd>)> {
+         use std::os::fd::FromRawFd;
+         // SAFETY: a name and flags the call takes.
+@@ -126,7 +126,7 @@ impl SharedPages {
+     }
+ 
+     /// The mapping's flags: anonymous shared memory off Linux.
+-    #[cfg(not(target_os = "linux"))]
++    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+     fn backing(_length: usize) -> Option<(libc::c_int, Option<std::os::fd::OwnedFd>)> {
+         Some((libc::MAP_SHARED | libc::MAP_ANON, None))
+     }
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index c2e31fe2f61da8761bfd2e8d1751aefae3f7a010..a9ebf2f4776a3c59d229571e39a7ca0cab3f674c 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -253,6 +253,8 @@ pub use copy_plan::{BlitOption, CopyProblem};
+ pub use degradation::{Degradation, DegradationCategory, DegradeNotice};
+ pub use degradation::{MisplacedNotice, NoticePlace};
+ pub use depth_stencil::DepthStencilState;
++#[cfg(target_os = "android")]
++pub use device::{android_entry, set_android_vulkan_gipa};
+ pub use device::{
+     DebugMessage, Device, DeviceHandles, DeviceKind, DeviceOptions, LayerSetting,
+     LayerSettingValue, MessageKind, MessageSeverity, MessageSink, PhysicalDeviceIdentity,
+diff --git a/crates/metal2vulkan-runtime/src/loaded.rs b/crates/metal2vulkan-runtime/src/loaded.rs
+index 0514c9ba88724454742b49d6e3a425bba8f2887c..7a3b9e6fd31b9992424ef252bb14cbeae2a034bc 100644
+--- a/crates/metal2vulkan-runtime/src/loaded.rs
++++ b/crates/metal2vulkan-runtime/src/loaded.rs
+@@ -4,7 +4,7 @@
+ 
+ /// The shared objects the process has loaded since it started, unloaded ones included: the C
+ /// library's count (`dlpi_adds`). `None` where it keeps none.
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(any(target_os = "linux", target_os = "android"), target_os = "android"))]
+ pub(crate) fn count() -> Option<u64> {
+     use std::ffi::{c_int, c_void};
+     /// Read the count from the first object, and stop.
+@@ -51,7 +51,7 @@ pub(crate) fn count() -> Option<u64> {
+ }
+ 
+ /// No count on other hosts: the exit guard registers its hook at every device there.
+-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
++#[cfg(not(any(any(target_os = "linux", target_os = "android"), target_os = "android", target_vendor = "apple")))]
+ pub(crate) fn count() -> Option<u64> {
+     None
+ }
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+index ab57509dfece6549ab7c63cc6662f2f0a10e9db7..2bb184da90721fa4abd07735a269ff5f82615448 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+@@ -185,6 +185,11 @@ pub(crate) struct FixedState {
+     /// `VkPipelineRasterizationProvokingVertexStateCreateInfoEXT` with
+     /// `VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT`, never dynamic.
+     pub(crate) provoking_last: bool,
++    /// A command of an indirect command buffer in a pass that fetches through input attachments
++    /// (`framebuffer_fetch.rs`): its pipeline orders its color attachment accesses by rasterization
++    /// whether its fragment function fetches or not, since no barrier records between the
++    /// commands of a run.
++    pub(crate) orders_color_access: bool,
+ }
+ 
+ /// The depth clip and clamp of a draw through a viewport depth range past `[0, 1]`
+@@ -617,6 +622,7 @@ impl GraphicsContent {
+                     &graphics.color_attachments,
+                     key.fixed.masks_color,
+                     key.pass.fetch_inputs,
++                    graphics.rasterization_order_attachment_access || key.fixed.orders_color_access,
+                     graphics.logic_op,
+                 ))
+                 .text(&multisample())
+@@ -1037,15 +1043,20 @@ impl VariantObjects {
+                     }
+                 })
+                 .collect();
+-        // In a pass whose draws fetch through input attachments every pipeline orders its color
+-        // attachment accesses by rasterization (`framebuffer_fetch.rs`), so a fetch reads what an
+-        // earlier fragment of any pipeline wrote.
++        // In a pass whose draws fetch through input attachments a pipeline that fetches orders its
++        // color attachment accesses by rasterization, and a barrier records where an instance's
++        // draws change between that and not (`framebuffer_fetch::InputOrder`), so a fetch reads
++        // what an earlier fragment of any pipeline wrote. A pipeline that does not fetch draws
++        // unordered: the ordering costs every overlapping primitive on some drivers. An indirect
++        // command is ordered regardless (`FixedState::orders_color_access`).
+         if graphics.rasterization_order_attachment_access && !key.pass.fetch_inputs {
+             return Err(internal(
+                 "a pipeline fetching in rasterization order outside a pass that does",
+             ));
+         }
+-        let blend_flags = match key.pass.fetch_inputs {
++        let ordered = key.pass.fetch_inputs
++            && (graphics.rasterization_order_attachment_access || key.fixed.orders_color_access);
++        let blend_flags = match ordered {
+             true => {
+                 vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT
+             }
+@@ -1378,6 +1389,7 @@ mod tests {
+             depth_range: None,
+             masks_color: false,
+             provoking_last: false,
++            orders_color_access: false,
+         }
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index ddb93327bff30de0c0e305bf7ed7659b6cad5a81..6e077b03462f11ba7eada4a2ad49557f979a25b3 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -291,7 +291,7 @@ use super::error::{
+ };
+ use super::execution::{ExecutedPipeline, Execution};
+ use super::fragment_imageblock::PassImageblock;
+-use super::framebuffer_fetch;
++use super::framebuffer_fetch::{self, InputOrder};
+ use super::fresh_unwritten::FreshUnwritten;
+ use super::function_table::VisibleFunctionTable;
+ use super::heap_sets;
+@@ -1074,6 +1074,9 @@ struct Instance {
+     /// after it that samples a color attachment's texture records into a new instance, before
+     /// which the texture's copy is taken (`texture/attached_reads.rs`).
+     barriers: bool,
++    /// How its draws so far order their color attachment accesses, in a pass that fetches through
++    /// input attachments (`framebuffer_fetch::InputOrder`).
++    input_order: InputOrder,
+     /// The layers of the pass its draws render (`render_target::viewed`): views of them, its
+     /// shape's view mask, under multiview.
+     views: ViewSetup,
+@@ -1954,6 +1957,7 @@ impl RenderLowering {
+                 geometry_writes: GeometryWrites::new(),
+                 tile_memory: false,
+                 barriers: false,
++                input_order: InputOrder::Unset,
+                 views: ViewSetup::default(),
+                 pieces: Vec::new(),
+                 shadows: InstanceShadows::default(),
+@@ -6151,6 +6155,7 @@ impl RenderLowering {
+             geometry_writes: GeometryWrites::new(),
+             tile_memory: false,
+             barriers: false,
++            input_order: InputOrder::Unset,
+             views,
+             pieces: Vec::new(),
+             shadows: InstanceShadows::default(),
+@@ -6266,6 +6271,7 @@ impl RenderLowering {
+             geometry_writes: GeometryWrites::new(),
+             tile_memory: false,
+             barriers: false,
++            input_order: InputOrder::Unset,
+             views: self.current.views,
+             pieces: Vec::new(),
+             shadows: InstanceShadows::default(),
+@@ -9296,6 +9302,30 @@ impl RenderLowering {
+                     },
+                 }
+             }
++            // A draw whose color accesses are ordered otherwise than the instance's last draw's
++            // records after a barrier of the subpass's dependency on itself
++            // (`framebuffer_fetch::InputOrder`).
++            let ordered = graphics.rasterization_order_attachment_access;
++            let order_changes = self.layout.fetch_inputs && self.current.input_order.step(ordered);
++            let mut order_barrier = None;
++            if order_changes {
++                let view_mask = self.current.shape.view_mask;
++                // The barrier records in the instance: its draws record again no more.
++                self.current.rerecord = None;
++                match (pending.is_some(), &mut self.current.kept) {
++                    (true, _) => order_barrier = Some(view_mask),
++                    (false, Some(kept)) => kept.barrier(view_mask),
++                    // SAFETY: as for the storage barrier; the subpass depends on itself with this
++                    // barrier's scopes.
++                    (false, None) => unsafe {
++                        render_target::between_draws(
++                            device.shared().vk(),
++                            self.current.draws,
++                            view_mask,
++                        )
++                    },
++                }
++            }
+             // A draw that writes what an earlier draw of the instance read as its indirect
+             // arguments records after an execution dependency from those reads to its writes'
+             // stages (`render_target::after_indirect_reads`), as Metal's draw read them first.
+@@ -9520,6 +9550,7 @@ impl RenderLowering {
+                     variant: variant.key().clone(),
+                     specialization: variant.constants(specialization),
+                     storage_barrier,
++                    order_barrier,
+                     indirect_barrier,
+                     geometry_barrier,
+                     query,
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+index 8dc9a685c2e681f1bef4727daae10cc51a4a89a9..3eceef9b5035ffb2d7c881c170efd38488fdbb3a 100644
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -277,6 +277,7 @@ use super::provoking::ProvokingForms;
+ use super::replay::SharedCheck;
+ use super::shadows::InstanceShadows;
+ use super::tile_memory::TileMemory;
++use super::InputOrder;
+ use super::RenderCall;
+ use super::RenderCommandEncoder;
+ use super::{
+@@ -638,6 +639,19 @@ impl RenderLowering {
+         let before = self.current.draws;
+         self.current.draws = draws;
+         let raw = device.shared().vk();
++        // The commands' pipelines order their color accesses by rasterization, whether they fetch
++        // or not (`FixedState::orders_color_access`): a barrier from the instance's unordered draws
++        // before them (`framebuffer_fetch::InputOrder`).
++        if self.layout.fetch_inputs && self.current.input_order.step(true) {
++            let view_mask = self.current.shape.view_mask;
++            match &mut self.current.kept {
++                Some(kept) => kept.barrier(view_mask),
++                // SAFETY: the secondary command buffer (or the pass's, inline) is recording inside
++                // the compatible pass, which `render_target` made, and only this encoder records
++                // it.
++                None => unsafe { render_target::between_draws(raw, before, view_mask) },
++            }
++        }
+         let lent = queries.map(|queries| self.visibility.lend_to(raw, before, draws, queries));
+         self.current.pieces.push(Piece::Draws(before));
+         self.current
+@@ -1916,6 +1930,8 @@ impl RenderLowering {
+             self.shape_inputs()
+                 .draw_fixed(graphics, failing.as_ref(), (false, false))?;
+         fixed.provoking_last = settings.provoking_last;
++        // No barrier records between the commands of a run (`framebuffer_fetch::InputOrder`).
++        fixed.orders_color_access = self.layout.fetch_inputs;
+         let clamp = (
+             settings.native,
+             settings.written_clamp,
+@@ -2337,6 +2353,7 @@ impl RenderExecution {
+                 tile_memory: snapshot.tile_memory_reached,
+                 // Its commands read an attachment in place (`texture/attached_reads.rs`).
+                 barriers: false,
++                input_order: InputOrder::Ordered,
+                 views: ViewSetup::default(),
+                 pieces: Vec::new(),
+                 shadows,
+diff --git a/crates/metal2vulkan-runtime/src/render/pending.rs b/crates/metal2vulkan-runtime/src/render/pending.rs
+index fb4ecbc7261f1bccc930cfc59770666bf5262cd2..427223107e3ca4eafa47d26288c99d2898e075f2 100644
+--- a/crates/metal2vulkan-runtime/src/render/pending.rs
++++ b/crates/metal2vulkan-runtime/src/render/pending.rs
+@@ -103,6 +103,10 @@ pub(super) struct PendingDraw {
+     /// The view mask of the storage barrier it records first
+     /// (`render_target::between_storage_draws`), where it has one.
+     pub(super) storage_barrier: Option<u32>,
++    /// The view mask of the barrier of the subpass's dependency on itself it records first
++    /// (`render_target::between_draws`), where its color accesses are ordered otherwise than the
++    /// draw's before it (`framebuffer_fetch::InputOrder`).
++    pub(super) order_barrier: Option<u32>,
+     /// The view mask and destination stages of the barrier from its instance's earlier
+     /// indirect argument reads it records first (`render_target::after_indirect_reads`), where it
+     /// has one.
+@@ -200,6 +204,9 @@ impl PendingDraw {
+             if let Some(view_mask) = self.storage_barrier {
+                 render_target::between_storage_draws(raw, cb, view_mask);
+             }
++            if let Some(view_mask) = self.order_barrier {
++                render_target::between_draws(raw, cb, view_mask);
++            }
+             if let Some((view_mask, stages)) = self.indirect_barrier {
+                 render_target::after_indirect_reads(raw, cb, view_mask, stages);
+             }
+diff --git a/crates/metal2vulkan-runtime/src/render_state.rs b/crates/metal2vulkan-runtime/src/render_state.rs
+index a5efa4e40aa8b3f5da0d2fc42191f5ca42df4e15..bf7191cb9c601dd266e4805d915b13d27818f6bf 100644
+--- a/crates/metal2vulkan-runtime/src/render_state.rs
++++ b/crates/metal2vulkan-runtime/src/render_state.rs
+@@ -1123,6 +1123,7 @@ impl EncoderState {
+             depth_range: None,
+             masks_color: false,
+             provoking_last: false,
++            orders_color_access: false,
+         })
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/tests/exit_guard.rs b/crates/metal2vulkan-runtime/src/tests/exit_guard.rs
+index 7eccaafc1a104a2237da28f6348a28ca4019cd46..b4f4451263d2832e501d21135e503d000562993d 100644
+--- a/crates/metal2vulkan-runtime/src/tests/exit_guard.rs
++++ b/crates/metal2vulkan-runtime/src/tests/exit_guard.rs
+@@ -1649,7 +1649,7 @@ fn the_device_s_functions_are_reached_through_checked_accessors() {
+ /// tuple field, a type argument or a by-value parameter) fails
+ /// `only_the_listed_modules_keep_the_device_s_functions`; so does a listed module that keeps none
+ /// any more.
+-const KEEPERS: [(&str, &str); 23] = [
++const KEEPERS: [(&str, &str); 24] = [
+     (
+         "binding.rs",
+         "the push command (vkCmdPushDescriptorSet), a call's parameter (`push_set`) and the \
+@@ -1665,6 +1665,11 @@ const KEEPERS: [(&str, &str); 23] = [
+          hold of the device lets go in its teardown (`unregister`); a making for a device \
+          without a record fails before any driver",
+     ),
++    (
++        "device/create.rs",
++        "Android's loader entry, which the app registers before any device is made and which \
++         stays loaded for the life of the process (`set_android_vulkan_gipa`)",
++    ),
+     ("device/functions.rs", "the device's functions themselves"),
+     (
+         "device/mod.rs",
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 46e4103af18809f5db06bba1b8598bae6b52f606..7f8f305d2fd9ca0c20c5a5edec6f135934ffc1b6 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -1904,7 +1904,7 @@ impl Counters {
+     /// The kernel was asked about `mappings` of the process's mappings, for their write
+     /// permission, before an import of host pages (`host_memory.rs`'s `refuse_unwritable`, which
+     /// asks only on Linux).
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     pub(crate) fn host_mappings_queried(&self, mappings: u64) {
+         if mappings > 0 {
+             self.host_mappings_queried
+diff --git a/crates/metal2vulkan/src/device/gpus.rs b/crates/metal2vulkan/src/device/gpus.rs
+index 1537f8523677ef5759ffffc31a616b275750ef09..cf244f522520b8d6475f405da2a8cd7726236192 100644
+--- a/crates/metal2vulkan/src/device/gpus.rs
++++ b/crates/metal2vulkan/src/device/gpus.rs
+@@ -21,6 +21,56 @@ pub const NVIDIA_AMPERE_GA10X: &[u32] = &[
+     0x25e5, 0x25ec, 0x25ed, 0x25f9, 0x25fa, 0x25fb,
+ ];
+ 
++/// The `vendorID` Turnip reports for Qualcomm's GPUs (`tu_device.cc`).
++const QUALCOMM_VENDOR_ID: u32 = 0x5143;
++
++/// The generation of an Adreno GPU, as Mesa's `freedreno_devices.py` lists it.
++#[non_exhaustive]
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum AdrenoGeneration {
++    /// The A7xx family.
++    A7xx,
++    /// The A8xx family.
++    A8xx,
++}
++
++/// An Adreno GPU the device layer can name: identity alone, no driver fact.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct AdrenoGpu {
++    /// The GPU's name.
++    pub name: &'static str,
++    /// Its generation.
++    pub generation: AdrenoGeneration,
++}
++
++/// The Adreno GPUs named by the `deviceID` Turnip reports for them, its kernel chip id: Mesa's
++/// `freedreno_devices.py` lists the Adreno 750 as `0x43051401` and the two configurations of the
++/// Adreno 840 as `0x44050A31` and `0x44050A21`. The two configurations of the Adreno 840 are kept
++/// as two rows since no measurement holds across them.
++const ADRENO: &[(u32, AdrenoGpu)] = &[
++    (
++        0x43051401,
++        AdrenoGpu {
++            name: "Adreno 750",
++            generation: AdrenoGeneration::A7xx,
++        },
++    ),
++    (
++        0x44050A31,
++        AdrenoGpu {
++            name: "Adreno 840",
++            generation: AdrenoGeneration::A8xx,
++        },
++    ),
++    (
++        0x44050A21,
++        AdrenoGpu {
++            name: "Adreno 840",
++            generation: AdrenoGeneration::A8xx,
++        },
++    ),
++];
++
+ /// Each measured GPU that reports more than one `deviceID`, as its `vendorID` and its IDs, the one
+ /// it was measured under first. A table keyed on a measured GPU names it by that first ID, and a
+ /// device that reports any of them takes its rows at the releases they name: the driver facts,
+@@ -34,6 +84,17 @@ const ONE_GPU: &[(u32, &[u32])] = &[
+ ];
+ 
+ impl DeviceDescription {
++    /// The Adreno GPU this device is, under Turnip (`VK_DRIVER_ID_MESA_TURNIP` on Qualcomm's
++    /// `vendorID`), where its `deviceID` is one the table names; `None` for any other device.
++    /// Identity alone: it selects no deviation, since no driver fact has been measured on Turnip.
++    pub fn adreno(&self) -> Option<AdrenoGpu> {
++        (self.driver_id == Some(crate::vk::DriverId::MESA_TURNIP)
++            && self.vendor_id == QUALCOMM_VENDOR_ID)
++            .then(|| ADRENO.iter().find(|(id, _)| *id == self.device_id))
++            .flatten()
++            .map(|(_, gpu)| *gpu)
++    }
++
+     /// The `deviceID` by which the tables keyed on a measured GPU name this device's GPU: the
+     /// driver facts, deviations and defects, the Function storage a thread holds, and the
+     /// runtime's driver defects. It is the description's own
+@@ -48,3 +109,45 @@ impl DeviceDescription {
+             .map_or(self.device_id, |(_, ids)| ids[0])
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{AdrenoGeneration, DeviceDescription, QUALCOMM_VENDOR_ID};
++    use crate::device::ApiVersion;
++    use crate::vk::DriverId;
++
++    fn turnip(device_id: u32) -> DeviceDescription {
++        let mut description = DeviceDescription::new(ApiVersion::V1_2);
++        description.driver_id = Some(DriverId::MESA_TURNIP);
++        description.vendor_id = QUALCOMM_VENDOR_ID;
++        description.device_id = device_id;
++        description
++    }
++
++    #[test]
++    fn turnip_names_the_adreno_gpus_mesa_lists() {
++        let a750 = turnip(0x43051401).adreno().expect("the Adreno 750");
++        assert_eq!(
++            (a750.name, a750.generation),
++            ("Adreno 750", AdrenoGeneration::A7xx)
++        );
++        for id in [0x44050A31, 0x44050A21] {
++            let a840 = turnip(id).adreno().expect("the Adreno 840");
++            assert_eq!(
++                (a840.name, a840.generation),
++                ("Adreno 840", AdrenoGeneration::A8xx)
++            );
++        }
++        assert_eq!(turnip(0x43050A01).adreno(), None);
++    }
++
++    #[test]
++    fn only_turnip_on_qualcomm_is_named() {
++        let mut other_driver = turnip(0x43051401);
++        other_driver.driver_id = Some(DriverId::QUALCOMM_PROPRIETARY);
++        assert_eq!(other_driver.adreno(), None);
++        let mut other_vendor = turnip(0x43051401);
++        other_vendor.vendor_id = 0x10de;
++        assert_eq!(other_vendor.adreno(), None);
++    }
++}
+diff --git a/crates/metal2vulkan/src/device/mod.rs b/crates/metal2vulkan/src/device/mod.rs
+index 6fc822178f7eeccb36b15a87859b2ff82b1ddfef..19b9c7e0f2a8cd3ae67ddd87f583e2bb095d1975 100644
+--- a/crates/metal2vulkan/src/device/mod.rs
++++ b/crates/metal2vulkan/src/device/mod.rs
+@@ -85,7 +85,7 @@ pub use subgroup::{SimdClass, StageSubgroup, SubgroupModel, SubgroupSizes, Tier}
+ // The driver defect a refusal names (`Needs::DriverDefect`).
+ pub use profile::DriverWorkaround;
+ // The GPU generation a driver workaround and a runtime driver defect key on.
+-pub use gpus::NVIDIA_AMPERE_GA10X;
++pub use gpus::{AdrenoGeneration, AdrenoGpu, NVIDIA_AMPERE_GA10X};
+ pub use requirements::{
+     ApiVersion, FloatControl, FloatWidth, FormatUsage, Requirements, ResolveMode, SpirvCapability,
+     SpirvExtension, StageCreateFlag, SubgroupOp, VkExtension, VkFeature, VkLimit, VkProperty,
+diff --git a/crates/metal2vulkan/tests/api_signatures.tsv b/crates/metal2vulkan/tests/api_signatures.tsv
+index 3626888016e27ade2f921b8ca3339cb35c6f0e20..e939df9b6ed2099218bea4279df4158082a98b0f 100644
+--- a/crates/metal2vulkan/tests/api_signatures.tsv
++++ b/crates/metal2vulkan/tests/api_signatures.tsv
+@@ -1371,6 +1371,7 @@ enum	metal2vulkan::bind::indirect_commands::RecordError	#[derive(Clone, Copy, De
+ enum	metal2vulkan::bind::indirect_commands::RecordField	#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum RecordField
+ enum	metal2vulkan::bind::indirect_commands::StateSource	#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum StateSource
+ enum	metal2vulkan::cache::ArtifactError	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum ArtifactError
++enum	metal2vulkan::device::AdrenoGeneration	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum AdrenoGeneration
+ enum	metal2vulkan::device::BatchOrderPolicy	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum BatchOrderPolicy
+ enum	metal2vulkan::device::CompletionPolicy	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum CompletionPolicy
+ enum	metal2vulkan::device::Containment	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum Containment
+@@ -3626,6 +3627,8 @@ field	metal2vulkan::cache::VariantKey.window_depth_varying	pub window_depth_vary
+ field	metal2vulkan::cache::VariantKey.ycbcr_in_place	pub ycbcr_in_place: BTreeSet<SlotRef>
+ field	metal2vulkan::cache::VariantKey.ycbcr_planes_sampled	pub ycbcr_planes_sampled: BTreeMap<SlotRef, crate::bind::YCbCrPlanesSampler>
+ field	metal2vulkan::cache::VariantKey.zeroed_colors	pub zeroed_colors: BTreeMap<u32, crate::metal::PixelFormat>
++field	metal2vulkan::device::AdrenoGpu.generation	pub generation: AdrenoGeneration
++field	metal2vulkan::device::AdrenoGpu.name	pub name: &'static str
+ field	metal2vulkan::device::AllocationLimits.max_buffer_size	pub max_buffer_size: u64
+ field	metal2vulkan::device::AllocationLimits.max_memory_allocation_size	pub max_memory_allocation_size: u64
+ field	metal2vulkan::device::ApiVersion.major	pub major: u32
+@@ -4519,9 +4522,11 @@ fn	metal2vulkan-air::intrinsics::undecoded_feature	pub fn undecoded_feature(name
+ fn	metal2vulkan-air::specialize	pub fn specialize(d: Decoded, r: &SpecRequest, m: &mut Meter) -> Result<Entry, Error>
+ fn	metal2vulkan-air::specialize_dynamic	pub fn specialize_dynamic(d: Decoded, r: &SpecRequest, (linked, dynamic): (&[LinkedModule], &DynamicLinks), m: &mut Meter) -> Result<Entry, Error>
+ fn	metal2vulkan-air::specialize_linked	pub fn specialize_linked(d: Decoded, r: &SpecRequest, linked: &[LinkedModule], m: &mut Meter) -> Result<Entry, Error>
++fn	metal2vulkan-runtime::android_entry	#[cfg(target_os = "android")] pub fn android_entry() -> Option<ash::Entry>
+ fn	metal2vulkan-runtime::host_time	pub fn host_time() -> f64
+ fn	metal2vulkan-runtime::process_exiting	pub fn process_exiting() -> bool
+ fn	metal2vulkan-runtime::sampler_border_color	pub fn sampler_border_color(raw: u64) -> SamplerBorderColor
++fn	metal2vulkan-runtime::set_android_vulkan_gipa	#[cfg(target_os = "android")] pub unsafe fn set_android_vulkan_gipa(gipa: Option<vk::PFN_vkGetInstanceProcAddr>)
+ fn	metal2vulkan::ash_interop::sampler_create_info	pub fn sampler_create_info<'a>(desc: &vk::SamplerDesc, reduction: &'a mut ash::vk::SamplerReductionModeCreateInfo<'static>, border: &'a mut ash::vk::SamplerBorderColorComponentMappingCreateInfoEXT<'static>) -> ash::vk::SamplerCreateInfo<'a>
+ fn	metal2vulkan::bind::astc_decode_module	pub fn astc_decode_module(device: &Device, decode: AstcDecode, texels: AstcTexels) -> Result<BlockDecodeModule, Error>
+ fn	metal2vulkan::bind::chroma_decode_module	pub fn chroma_decode_module(device: &Device, decode: ChromaDecode) -> Result<BlockDecodeModule, Error>
+@@ -8698,6 +8703,7 @@ method	metal2vulkan::device::Device::render_pipeline_key	pub fn render_pipeline_
+ method	metal2vulkan::device::Device::render_variant_key	pub fn render_variant_key(&self, d: &RenderPipelineDescriptor, v: &VariantKey, b: &Budget, entries: &StageEntries) -> Result<RenderPipelineKeys, Error>
+ method	metal2vulkan::device::Device::required_enables	pub fn required_enables(&self) -> EnableSet
+ method	metal2vulkan::device::Device::tile_pipeline_key	pub fn tile_pipeline_key(&self, d: &TileRenderPipelineDescriptor) -> crate::cache::PipelineKey
++method	metal2vulkan::device::DeviceDescription::adreno	pub fn adreno(&self) -> Option<AdrenoGpu>
+ method	metal2vulkan::device::DeviceDescription::blendless_color_formats	pub fn blendless_color_formats(&self) -> Vec<Format>
+ method	metal2vulkan::device::DeviceDescription::canonical_device_id	pub fn canonical_device_id(&self) -> u32
+ method	metal2vulkan::device::DeviceDescription::driver_facts	pub fn driver_facts(&self) -> BTreeSet<DriverFact>
+@@ -9557,6 +9563,7 @@ struct	metal2vulkan::bind::indirect_commands::ResolvedBuffer	#[non_exhaustive] p
+ struct	metal2vulkan::cache::PipelineKey	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)] #[non_exhaustive] pub struct PipelineKey(pub Hash256)
+ struct	metal2vulkan::cache::SpecializationKey	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)] #[non_exhaustive] pub struct SpecializationKey
+ struct	metal2vulkan::cache::VariantKey	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)] #[non_exhaustive] pub struct VariantKey
++struct	metal2vulkan::device::AdrenoGpu	#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub struct AdrenoGpu
+ struct	metal2vulkan::device::AllocationLimits	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)] #[non_exhaustive] pub struct AllocationLimits
+ struct	metal2vulkan::device::ApiVersion	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct ApiVersion
+ struct	metal2vulkan::device::DescriptorCaps	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)] #[non_exhaustive] pub struct DescriptorCaps
+@@ -12328,6 +12335,8 @@ variant	metal2vulkan::bind::indirect_commands::StateSource::Parent	Parent
+ variant	metal2vulkan::cache::ArtifactError::Corrupt	Corrupt
+ variant	metal2vulkan::cache::ArtifactError::Stale	Stale
+ variant	metal2vulkan::cache::ArtifactError::WrongDevice	WrongDevice
++variant	metal2vulkan::device::AdrenoGeneration::A7xx	A7xx
++variant	metal2vulkan::device::AdrenoGeneration::A8xx	A8xx
+ variant	metal2vulkan::device::BatchOrderPolicy::Ends	Ends
+ variant	metal2vulkan::device::BatchOrderPolicy::Exact	Exact
+ variant	metal2vulkan::device::CompletionPolicy::Exact	Exact
+diff --git a/crates/metal2vulkan/tests/api_surface.rs b/crates/metal2vulkan/tests/api_surface.rs
+index abc07f2e2e97612adb04ecc981fdf40c68256def..7138a8a9bb80124ce35df9e466fc01041be14fa5 100644
+--- a/crates/metal2vulkan/tests/api_surface.rs
++++ b/crates/metal2vulkan/tests/api_surface.rs
+@@ -241,6 +241,8 @@ surface! {
+         enum DriverWorkaround N;
+         enum DriverFact N;
+         struct DriverDiagnostic N;
++        enum AdrenoGeneration N;
++        struct AdrenoGpu E;
+         const NVIDIA_AMPERE_GA10X;
+         enum GuestIsolation N;
+         enum HandleDomain N;
