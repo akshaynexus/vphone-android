@@ -38,6 +38,13 @@ pub fn sent_mib(line: &str) -> Option<u64> {
     line.strip_prefix("vusbd: sent ")?.split(' ').next()?.parse().ok()
 }
 
+/// Whether a line of QEMU's log is its per-event trace of the secure processor: hundreds of lines a
+/// second on a healthy restore, which would push everything else out of the log.
+pub fn is_qemu_noise(line: &str) -> bool {
+    const TRACE: [&str; 6] = ["sep-exc:", "sep-tlb:", "sep-gicd:", "sprr:", "vpiop: ap->sep queued", "vpiop: sep irq_en"];
+    TRACE.iter().any(|t| line.starts_with(t))
+}
+
 /// A long stage of the restore that only the guest's own log shows, and what to say during it.
 pub fn guest_stage(line: &str) -> Option<&'static str> {
     line.contains("executing /usr/sbin/mtree")
@@ -202,6 +209,15 @@ mod tests {
         let seen: Vec<u64> = REAL.lines().filter_map(|l| m.advance(l).map(|s| s.0)).collect();
         assert_eq!(seen, (1..=STAGE_COUNT).collect::<Vec<_>>());
         assert_eq!(m.advance("Sending iBSS (380445 bytes)..."), None, "it never goes back");
+    }
+
+    #[test]
+    fn qemu_trace_is_told_from_what_matters() {
+        assert!(is_qemu_noise("sep-exc: excp=2 pc=000000067eace8f4"));
+        assert!(is_qemu_noise("vpiop: ap->sep queued (count 1)"));
+        assert!(!is_qemu_noise("vpiop: sep outbox overflow"));
+        assert!(!is_qemu_noise("vusb: host message dropped"));
+        assert!(!is_qemu_noise("Guest crash loaded"));
     }
 
     #[test]

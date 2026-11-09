@@ -282,6 +282,17 @@ impl Engine {
         ];
     }
 
+    /// The end of QEMU's log of this boot, without its per-event trace.
+    fn qemu_log_tail(&self) -> String {
+        const KEEP: usize = 1500;
+        let log = crate::runtime::log_tail(&self.qemu_log().to_string_lossy(), 512 * 1024);
+        let lines: Vec<&str> = log.lines().filter(|l| !mirror::is_qemu_noise(l)).collect();
+        let text = lines.join("\n");
+        let start = text.len().saturating_sub(KEEP);
+        let start = (start..=text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(start);
+        text[start..].trim().to_string()
+    }
+
     /// QEMU's own log of this boot, beside its serial log.
     fn qemu_log(&self) -> PathBuf {
         self.sup.serial_log().with_file_name(QEMU_LOG)
@@ -291,6 +302,9 @@ impl Engine {
         let mut guard = self.mirror.lock().unwrap();
         for followed in guard.iter_mut() {
             for line in followed.mirror.drain() {
+                if followed.prefix == "[qemu] " && mirror::is_qemu_noise(&line) {
+                    continue;
+                }
                 if followed.prefix.is_empty() {
                     if let Some((stage, text)) = followed.mirror.advance(&line) {
                         self.status(true, |s| {
@@ -859,7 +873,7 @@ impl Host for Engine {
             if self.sup.alive() { "it is still running".to_string() } else { self.sup.exit_detail() },
             tail(self.sup.threads_log()),
             tail(self.sup.serial_log()),
-            tail(self.qemu_log()),
+            self.qemu_log_tail(),
             tail(logs.join("usb-broker.log")),
             tail(logs.join(MUX_LOG))
         )
