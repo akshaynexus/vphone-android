@@ -136,16 +136,6 @@ mod stack {
     use super::*;
     use std::os::raw::{c_int, c_void};
 
-    #[repr(C)]
-    struct Unwinder {
-        _private: [u8; 0],
-    }
-    type Trace = extern "C" fn(*mut Unwinder, *mut c_void) -> c_int;
-    extern "C" {
-        fn _Unwind_Backtrace(trace: Trace, arg: *mut c_void) -> c_int;
-        fn _Unwind_GetIP(context: *mut Unwinder) -> usize;
-    }
-
     fn push(pc: usize) -> bool {
         let n = STACK_LEN.load(Ordering::Relaxed);
         if n >= FRAMES {
@@ -155,11 +145,6 @@ mod stack {
         unsafe { *std::ptr::addr_of_mut!(STACK[n]) = pc };
         STACK_LEN.store(n + 1, Ordering::Relaxed);
         true
-    }
-
-    extern "C" fn trace(context: *mut Unwinder, _: *mut c_void) -> c_int {
-        // SAFETY: context is the unwinder's, valid during this call.
-        if push(unsafe { _Unwind_GetIP(context) }) { 0 } else { 5 }
     }
 
     /// Whether a crash has got as far as its stack walk: a fault during it ends the process.
@@ -189,10 +174,10 @@ mod stack {
             // SAFETY: gettid has no preconditions.
             if unsafe { libc::gettid() } == STACK_TID.load(Ordering::SeqCst) {
                 STACK_LEN.store(0, Ordering::SeqCst);
+                // Only the registers. libunwind authenticates the return addresses it reads, and
+                // one that fails on a live thread is a SIGILL that ends the VM.
                 push(r.pc as usize);
-                push(r.lr as usize);
-                // SAFETY: trace only writes to static memory.
-                unsafe { _Unwind_Backtrace(trace, std::ptr::null_mut()) };
+                push(strip_pac(r.lr) as usize);
                 STACK_DONE.store(true, Ordering::SeqCst);
             }
             return;
@@ -236,23 +221,12 @@ mod stack {
             // SAFETY: not safe, and meant not to be: a second fault.
             unsafe { std::ptr::write_volatile(0x20 as *mut u8, 1) };
         }
-        // Before the unwinder, which can fault too: it authenticates return addresses.
         let maps = read_maps();
         let text = format!(
             "  pc {}\n  lr {}\n",
             symbol(&maps, r.pc as usize),
             symbol(&maps, strip_pac(r.lr) as usize),
         );
-        // SAFETY: writes bytes this function owns.
-        unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
-        STACK_LEN.store(0, Ordering::SeqCst);
-        // SAFETY: trace only writes to static memory.
-        unsafe { _Unwind_Backtrace(trace, std::ptr::null_mut()) };
-        let frames: Vec<String> = (0..STACK_LEN.load(Ordering::SeqCst).min(FRAMES))
-            // SAFETY: filled just above, by this thread alone.
-            .map(|i| symbol(&maps, unsafe { *std::ptr::addr_of!(STACK[i]) }))
-            .collect();
-        let text = format!("  stack: {}\n", frames.join(" < "));
         // SAFETY: writes bytes this function owns.
         unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
     }
@@ -540,7 +514,7 @@ mod tests {
             let (signal, text) = crash("once", false);
             assert_eq!(signal, Some(libc::SIGSEGV), "{text}");
             assert_header(&text);
-            assert!(text.contains("\n  stack: "), "the stack follows: {text}");
+            assert!(!text.contains("stack: "), "a live stack is never unwound: {text}");
         }
 
         #[test]
