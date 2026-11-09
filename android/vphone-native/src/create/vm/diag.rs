@@ -236,22 +236,30 @@ mod stack {
             // SAFETY: not safe, and meant not to be: a second fault.
             unsafe { std::ptr::write_volatile(0x20 as *mut u8, 1) };
         }
+        // Before the unwinder, which can fault too: it authenticates return addresses.
+        let maps = read_maps();
+        let text = format!(
+            "  pc {}\n  lr {}\n",
+            symbol(&maps, r.pc as usize),
+            symbol(&maps, strip_pac(r.lr) as usize),
+        );
+        // SAFETY: writes bytes this function owns.
+        unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
         STACK_LEN.store(0, Ordering::SeqCst);
         // SAFETY: trace only writes to static memory.
         unsafe { _Unwind_Backtrace(trace, std::ptr::null_mut()) };
-        let maps = read_maps();
         let frames: Vec<String> = (0..STACK_LEN.load(Ordering::SeqCst).min(FRAMES))
             // SAFETY: filled just above, by this thread alone.
             .map(|i| symbol(&maps, unsafe { *std::ptr::addr_of!(STACK[i]) }))
             .collect();
-        let text = format!(
-            "  pc {}\n  lr {}\n  stack: {}\n",
-            symbol(&maps, r.pc as usize),
-            symbol(&maps, r.lr as usize),
-            frames.join(" < "),
-        );
+        let text = format!("  stack: {}\n", frames.join(" < "));
         // SAFETY: writes bytes this function owns.
         unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
+    }
+
+    /// A return address without its pointer authentication code: user addresses have 39 bits.
+    fn strip_pac(address: u64) -> u64 {
+        address & ((1 << 39) - 1)
     }
 
     fn signal_name(signal: c_int) -> &'static str {
