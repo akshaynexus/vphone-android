@@ -4,7 +4,7 @@
 use super::vm::VmProcess;
 use crate::paths::Paths;
 use jni::objects::{GlobalRef, JClass, JObject, JString};
-use jni::sys::{jboolean, jint, jstring, JNI_TRUE};
+use jni::sys::{jboolean, jint, jlong, jstring, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, OnceLock};
@@ -223,3 +223,129 @@ pub extern "system" fn Java_com_vphone_android_Native_createDelete(
     })
 }
 
+// ------------------------------------------------------------------ the log screen
+
+/// The progress screen's panels; reads the step's log, so called off the main thread.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLive(
+    mut env: JNIEnv,
+    _this: JObject,
+    name: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let name = text(env, &name);
+        super::live_json(Paths::get(), &name)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogOpen(
+    mut env: JNIEnv,
+    _this: JObject,
+    path: JString,
+) -> jlong {
+    let path = text(&mut env, &path);
+    catch_unwind(AssertUnwindSafe(|| super::logview::open_view(&path))).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogClose(_env: JNIEnv, _this: JObject, view: jlong) {
+    quiet(|| super::logview::close_view(view));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogSync(
+    mut env: JNIEnv,
+    _this: JObject,
+    view: jlong,
+    run_state: JString,
+    paused: jboolean,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let run_state = text(env, &run_state);
+        super::logview::sync_view(view, &run_state, paused == JNI_TRUE)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogRows(
+    mut env: JNIEnv,
+    _this: JObject,
+    view: jlong,
+    first: jint,
+    count: jint,
+) -> jstring {
+    guarded(&mut env, |_| {
+        super::logview::with_view(view, |v| v.rows_json(first.max(0) as u32, count.max(0) as u32))
+            .unwrap_or_else(|| "[]".to_string())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogFilter(
+    mut env: JNIEnv,
+    _this: JObject,
+    view: jlong,
+    filter: jint,
+    search: JString,
+) {
+    let search = text(&mut env, &search);
+    quiet(|| {
+        super::logview::with_view(view, |v| v.set_filter(filter, &search));
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogToggle(
+    _env: JNIEnv,
+    _this: JObject,
+    view: jlong,
+    stage: jint,
+) {
+    quiet(|| {
+        super::logview::with_view(view, |v| v.toggle(stage.max(0) as u32));
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogOpenAll(
+    _env: JNIEnv,
+    _this: JObject,
+    view: jlong,
+    open: jboolean,
+) {
+    quiet(|| {
+        super::logview::with_view(view, |v| v.open_all(open == JNI_TRUE));
+    });
+}
+
+/// A stage's lines, or the whole view for a stage of -1.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogCopy(
+    mut env: JNIEnv,
+    _this: JObject,
+    view: jlong,
+    stage: jint,
+) -> jstring {
+    guarded(&mut env, |_| {
+        super::logview::with_view(view, |v| v.copy_text(stage)).unwrap_or_default()
+    })
+}
+
+/// Writes the current view to a file for sharing: a one-line summary, or "error: ...".
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_createLogExport(
+    mut env: JNIEnv,
+    _this: JObject,
+    view: jlong,
+    dest: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let dest = text(env, &dest);
+        super::logview::with_view(view, |v| match v.export(std::path::Path::new(&dest)) {
+            Ok(summary) => summary,
+            Err(e) => format!("error: {e}"),
+        })
+        .unwrap_or_else(|| "error: the log is closed".to_string())
+    })
+}

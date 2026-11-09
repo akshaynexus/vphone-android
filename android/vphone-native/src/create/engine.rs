@@ -6,7 +6,7 @@ use super::exec::{Background, Exec};
 use super::mirror::{self, Mirror};
 use super::state::{self, Spec, Status, StepStatus};
 use super::steps::STEPS;
-use super::vm::{Supervisor, VmKind, VmProcess};
+use super::vm::{display, vitals, Supervisor, VmKind, VmProcess};
 use crate::paths::Paths;
 use crate::platform::log;
 use crate::vphoned::Client;
@@ -59,6 +59,10 @@ pub struct Engine {
     pause: Mutex<bool>,
     paused_in_step: AtomicBool,
     mirror: Mutex<Vec<Followed>>,
+    /// The logs [`Engine::mirror_log`] follows, for the watchdog's "any output yet?".
+    followed_paths: Mutex<Vec<PathBuf>>,
+    /// The VM is held (pause, thermal, storage): nothing it does counts against a time limit.
+    vm_held: Arc<AtomicBool>,
 }
 
 /// A log being followed into the step's log, with what marks its lines there.
@@ -73,7 +77,11 @@ impl Engine {
         let spec = state::read_spec(&vm).ok_or_else(|| format!("{name} has no plan to resume"))?;
         let cancel_vm = vm.clone();
         let cancelled = Arc::new(move || super::ctl::cancelled() || cancel_vm.join(CANCEL_FILE).exists());
-        let sup = Supervisor::new(paths.clone(), process, cancelled);
+        let pause_vm = vm.clone();
+        let vm_held = Arc::new(AtomicBool::new(false));
+        let held = vm_held.clone();
+        let paused = Arc::new(move || held.load(Ordering::SeqCst) || pause_vm.join(PAUSE_FILE).exists());
+        let sup = Supervisor::new(paths.clone(), process, cancelled, paused);
         let times = fs::read(vm.join(".create-times.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -112,6 +120,8 @@ impl Engine {
             pause: Mutex::new(false),
             paused_in_step: AtomicBool::new(false),
             mirror: Mutex::new(Vec::new()),
+            followed_paths: Mutex::new(Vec::new()),
+            vm_held,
         });
         Ok(e)
     }
@@ -250,10 +260,13 @@ impl Engine {
     /// it: a restore's stages show as the step's progress, and a guest that panics shows why.
     pub fn mirror_log(&self, path: &Path) {
         let follow = |path: &Path, prefix| Followed { mirror: Mirror::new(path), prefix };
+        let usb = self.vm.join(state::LOG_DIR).join("usb-broker.log");
+        let serial = self.sup.serial_log();
+        *self.followed_paths.lock().unwrap() = vec![path.to_path_buf(), serial.clone(), usb.clone()];
         *self.mirror.lock().unwrap() = vec![
             follow(path, ""),
-            follow(&self.sup.serial_log(), "[guest] "),
-            follow(&self.vm.join(state::LOG_DIR).join("usb-broker.log"), "[usb] "),
+            follow(&serial, "[guest] "),
+            follow(&usb, "[usb] "),
         ];
     }
 
@@ -308,6 +321,8 @@ impl Engine {
                 "USBMUXD_SOCKET_ADDRESS".into(),
                 format!("UNIX:{}", cv.join("usbmuxd.sock").display()),
             ),
+            // XNU's own output on the serial line, which the step's log follows as [guest].
+            ("VPHONE_RESTORE_BOOT_ARGS_EXTRA".into(), "serial=3".into()),
         ]
     }
 
@@ -441,6 +456,7 @@ impl Engine {
     /// The person's pause stops the guest and every helper. While a VM runs, a critically hot
     /// phone or a nearly full disk does the same until it clears.
     pub fn spawn_pause_watch(self: &Arc<Self>) {
+        self.spawn_vitals();
         let me = self.clone();
         let _ = std::thread::Builder::new().name("create-pause".into()).spawn(move || {
             loop {
@@ -465,6 +481,7 @@ impl Engine {
                     }
                     super::exec::freeze(true);
                     *paused = true;
+                    me.vm_held.store(true, Ordering::SeqCst);
                     me.paused_in_step.store(true, Ordering::SeqCst);
                     let (hold, message) = if by_person {
                         ("", "Paused".to_string())
@@ -484,6 +501,7 @@ impl Engine {
                     }
                     super::exec::freeze(false);
                     *paused = false;
+                    me.vm_held.store(false, Ordering::SeqCst);
                     me.append_log("[pause] resumed");
                     me.status(true, |s| {
                         s.hold.clear();
@@ -492,6 +510,36 @@ impl Engine {
                 }
             }
         });
+    }
+
+    /// The vitals thread: `<cv>/vm-stats.json` once a second, and the stall watchdog.
+    fn spawn_vitals(self: &Arc<Self>) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("create-vitals".into()).spawn(move || {
+            let mut sampler = Sampler::new();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if matches!(me.snapshot().state.as_str(), "done" | "failed" | "cancelled") {
+                    sampler.finish(&me);
+                    return;
+                }
+                sampler.tick(&me);
+            }
+        });
+    }
+
+    /// Fails the running boot when nothing at all has happened for too long.
+    fn stop_stalled(&self, facts: String) {
+        self.append_log("[vm] the VM has stalled:");
+        self.append_log(&facts);
+        self.sup.stop_stalled(facts);
+    }
+
+    /// A boot with the display failed; later boots of this VM go without one, and why.
+    pub fn display_failed(&self, why: &str) {
+        self.append_log(&format!("[display] the boot with the display failed: {why}"));
+        self.append_log("[display] redoing this step without the display, and keeping it off for this VM");
+        display::turn_off_after_failure(&self.vm, why);
     }
 
     pub fn fetch_firmware(&self, fw: &Firmware) -> Result<(), String> {
@@ -602,6 +650,115 @@ impl Progress for Engine {
     }
 }
 
+/// One second's worth of the VM's condition, from the logs, the process's own counters and QMP.
+struct Sampler {
+    ticks: u32,
+    watch: vitals::Watch,
+    last_proc: Option<vitals::ProcStats>,
+    was_alive: bool,
+    /// Ticks per second of `/proc/*/stat`'s CPU times.
+    hz: u64,
+    vcpus: u32,
+}
+
+impl Sampler {
+    fn new() -> Sampler {
+        // SAFETY: sysconf only reads a system constant.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        Sampler {
+            ticks: 0,
+            watch: vitals::Watch::new(Instant::now()),
+            last_proc: None,
+            was_alive: false,
+            hz,
+            vcpus: super::vm::create_config().vcpus,
+        }
+    }
+
+    fn base(&self, e: &Engine) -> vitals::Vitals {
+        let (display, display_note) = e.sup.display_status();
+        vitals::Vitals { display, display_note, updated_ms: state::now_ms(), ..Default::default() }
+    }
+
+    fn finish(&mut self, e: &Engine) {
+        if self.was_alive {
+            vitals::write(&vitals::stats_path(&e.paths), &self.base(e));
+        }
+    }
+
+    fn output_signature(e: &Engine) -> u64 {
+        let logs = e.vm.join(state::LOG_DIR);
+        let mut files = e.followed_paths.lock().unwrap().clone();
+        files.push(e.sup.serial_log());
+        files.push(logs.join("usbmuxd.log"));
+        files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum()
+    }
+
+    fn tick(&mut self, e: &Engine) {
+        let alive = e.sup.alive();
+        if !alive {
+            self.finish(e);
+            self.was_alive = false;
+            self.last_proc = None;
+            return;
+        }
+        let now = Instant::now();
+        self.watch.set_now(now);
+        self.watch.boot(e.sup.pid());
+        self.was_alive = true;
+        let mut out = self.base(e);
+        out.alive = true;
+
+        if let Ok(bytes) = fs::read(vitals::proc_path(&e.paths)) {
+            if let Ok(stats) = serde_json::from_slice::<vitals::ProcStats>(&bytes) {
+                if let Some(old) = &self.last_proc {
+                    out.cpu_percent = vitals::cpu_percent(old, &stats, self.hz);
+                }
+                out.rss_mb = stats.rss_kb / 1024;
+                out.disk_written_mb = if stats.has_io {
+                    stats.write_bytes >> 20
+                } else {
+                    use std::os::unix::fs::MetadataExt;
+                    // Without /proc/self/io: how much of the disk has been written at all.
+                    fs::metadata(e.vm.join("Disk.img")).map_or(0, |m| (m.blocks() * 512) >> 20)
+                };
+                self.last_proc = Some(stats);
+            }
+        }
+
+        let broker = e.vm.join(state::LOG_DIR).join("usb-broker.log");
+        out.usb_stage = vitals::usb_stage(&crate::runtime::log_tail(&broker.to_string_lossy(), 8192));
+
+        out.paused = e.vm_held.load(Ordering::SeqCst) || e.pause_requested();
+        if out.paused {
+            self.watch.paused();
+        } else {
+            self.watch.observe_output(Self::output_signature(e));
+            self.ticks += 1;
+            if self.ticks.is_multiple_of(vitals::PC_SAMPLE_TICKS) {
+                if let Ok(vcpus) = crate::qmp::sample_vcpus(&e.paths.qmp_socket(), self.vcpus) {
+                    match self.watch.observe_pcs(vcpus) {
+                        Some(vitals::Event::StoppedMoving) => e.append_log(&format!(
+                            "[vm] the guest has stopped moving: {}",
+                            self.watch.vcpus().iter().map(|c| format!("{}:EL{}:{:#x}", c.index, c.el, c.pc)).collect::<Vec<_>>().join(" ")
+                        )),
+                        Some(vitals::Event::MovingAgain) => e.append_log("[vm] the guest is moving again"),
+                        None => {}
+                    }
+                }
+            }
+            if let Some(still) = self.watch.stalled_for(vitals::STALL_LIMIT) {
+                let last = crate::runtime::log_tail(&e.sup.serial_log().to_string_lossy(), 1500);
+                let facts = self.watch.describe_stall(still, &out.usb_stage, &last);
+                e.stop_stalled(facts);
+                return;
+            }
+        }
+        vitals::fill_guest(&mut out, self.watch.vcpus(), self.watch.moving());
+        vitals::write(&vitals::stats_path(&e.paths), &out);
+    }
+}
+
 struct Bg(Background);
 
 impl BackgroundHelper for Bg {
@@ -618,7 +775,7 @@ impl Host for Engine {
         if matches!(kind, VmKind::Dfu | VmKind::Ramdisk) {
             self.usb_up()?;
         }
-        self.sup.start(kind, vm, run, &self.vusb_socket())
+        self.sup.start(kind, vm, run, &self.vusb_socket(), display::setting(&self.vm))
     }
     fn stop_vm(&self, _vm: &Path) -> Result<(), String> {
         self.sup.stop()
@@ -630,6 +787,9 @@ impl Host for Engine {
         self.sup.serial_log()
     }
     fn diagnostics(&self) -> String {
+        if let Some(facts) = self.sup.stall_facts() {
+            return facts;
+        }
         let tail = |path: PathBuf| crate::runtime::log_tail(&path.to_string_lossy(), 1500).trim().to_string();
         let logs = self.vm.join(state::LOG_DIR);
         format!(

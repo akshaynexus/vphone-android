@@ -46,4 +46,16 @@ object Native {
     external fun createNetwork(connected: Boolean, unmetered: Boolean)
     external fun createThermal(status: Int)
     external fun createDelete(name: String, alsoFirmware: Boolean): String
+
+    // The log screen: a view is a handle; rows, summaries and exports are JSON or text.
+    external fun createLive(name: String): String
+    external fun createLogOpen(path: String): Long
+    external fun createLogClose(view: Long)
+    external fun createLogSync(view: Long, runState: String, paused: Boolean): String
+    external fun createLogRows(view: Long, first: Int, count: Int): String
+    external fun createLogFilter(view: Long, filter: Int, search: String)
+    external fun createLogToggle(view: Long, stage: Int)
+    external fun createLogOpenAll(view: Long, open: Boolean)
+    external fun createLogCopy(view: Long, stage: Int): String
+    external fun createLogExport(view: Long, dest: String): String
 }

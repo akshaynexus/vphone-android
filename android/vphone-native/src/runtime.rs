@@ -618,6 +618,16 @@ pub fn swap_window(window: usize) -> usize {
     old
 }
 
+/// Hands the window a Surface already gave [`swap_window`] to QEMU's library, once it is loaded:
+/// the Surface can arrive first (the view is open when a creation boot starts).
+pub(crate) fn reapply_window() {
+    let window = *WINDOW.lock().unwrap();
+    if let (Some(q), true) = (QEMU.get(), window != 0) {
+        // SAFETY: the window stays acquired until it is replaced by swap_window.
+        unsafe { (q.set_window)(window as *mut c_void) };
+    }
+}
+
 /// The guest's screen fitted inside `(w, h)`: `(left, top, width, height)`, centred.
 pub fn fit(w: i32, h: i32, guest_w: u32, guest_h: u32) -> [i32; 4] {
     let (gw, gh) = (i64::from(guest_w.max(1)), i64::from(guest_h.max(1)));

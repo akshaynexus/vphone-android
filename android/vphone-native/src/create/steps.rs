@@ -101,6 +101,16 @@ fn run_steps(e: &Arc<Engine>, steps: &'static [StepDef]) -> Result<(), String> {
                     e.usb_down();
                     continue;
                 }
+                if !cancelled {
+                    // A display must never cost a creation: this boot runs again without one.
+                    if let Some(why) = e.sup.take_display_failure() {
+                        e.display_failed(&why);
+                        e.end_step(def.key, "pending", started.elapsed());
+                        let _ = e.sup.stop();
+                        e.usb_down();
+                        continue;
+                    }
+                }
                 e.append_log(&format!("step {} {}", def.key, if cancelled { "cancelled" } else { "failed" }));
                 if !cancelled {
                     e.append_log(m);

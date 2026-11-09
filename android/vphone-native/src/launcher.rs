@@ -27,7 +27,7 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     if let Some(serial) = &b.serial {
         machine += &format!(",serial={serial}");
     }
-    machine += &format!(",gfx-device=apple-gfx-mmio,memory-backend=ram0,gfx-modes={res}@60");
+    machine += &gfx_machine(&res);
 
     let mut args: Vec<String> = vec!["qemu-system-aarch64".into(), "-M".into(), machine];
     let mut push = |parts: &[&str]| args.extend(parts.iter().map(|s| s.to_string()));
@@ -66,12 +66,8 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
             &format!("file={sep},if=none,id=sep-storage,format=raw,file.locking=off"),
         ]);
     }
-    push(&[
-        "-object",
-        &format!("memory-backend-memfd,id=ram0,size={mem},share=on"),
-    ]);
-    push(&["-global", &format!("apple-gfx-mmio.resolution={res}")]);
-    push(&["-global", "apple-gfx-mmio.process-isolation=on"]);
+    let gfx = gfx_args(&res, &mem);
+    push(&gfx.iter().map(String::as_str).collect::<Vec<_>>());
     // The virtual network card's boot ROM is not in the app, and iOS does not use it.
     push(&["-global", "virtio-net-pci.romfile="]);
     push(&["-display", "none"]);
@@ -86,24 +82,49 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     push(&["-name", "vphone,debug-threads=on"]);
 
     let dir = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
-    let env = vec![
+    let mut env = vec![
         ("VPHONE_TARGET_PAGE_BITS", "14".to_string()),
         ("VPHONE_TLB_RANGE_PAGES", "1".to_string()),
         ("VPHONE_XPAGE_LINKS", "1".to_string()),
         ("VPHONE_RET_PREFETCH", "2".to_string()),
         ("QEMU_TLB_UNSYNCED", "2".to_string()),
         ("VPHONE_XHCI_NONREMOVABLE", "0x1fe".to_string()),
-        ("REIMS_VGPU_WINDOW", "1".to_string()),
-        ("REIMS_VGPU_WINDOW_TITLE", "vphone-linux".to_string()),
-        (
-            "REIMS_VGPU_CENSUS_DIR",
-            dir(paths.files.join("runs/census")),
-        ),
+    ];
+    env.extend(gfx_env(paths));
+    env.extend([
         ("TMPDIR", dir(paths.cache.join("tmp"))),
         ("HOME", dir(paths.files.join("home"))),
-        ("XDG_CACHE_HOME", dir(paths.cache.clone())),
-    ];
+    ]);
     Launch { args, env }
+}
+
+/// run-vphone.sh's GFX=1 part of `-M`, for a screen of `res` (`1290x2796`).
+pub fn gfx_machine(res: &str) -> String {
+    format!(",gfx-device=apple-gfx-mmio,memory-backend=ram0,gfx-modes={res}@60")
+}
+
+/// run-vphone.sh's GFX=1 arguments: the paravirtual GPU needs guest RAM as a shared mapping.
+pub fn gfx_args(res: &str, mem: &str) -> Vec<String> {
+    [
+        "-object".to_string(),
+        format!("memory-backend-memfd,id=ram0,size={mem},share=on"),
+        "-global".to_string(),
+        format!("apple-gfx-mmio.resolution={res}"),
+        "-global".to_string(),
+        "apple-gfx-mmio.process-isolation=on".to_string(),
+    ]
+    .to_vec()
+}
+
+/// GPU environment of run-vphone.sh's GFX=1 WINDOW=1.
+pub fn gfx_env(paths: &Paths) -> Vec<(&'static str, String)> {
+    let dir = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+    vec![
+        ("REIMS_VGPU_WINDOW", "1".to_string()),
+        ("REIMS_VGPU_WINDOW_TITLE", "vphone-linux".to_string()),
+        ("REIMS_VGPU_CENSUS_DIR", dir(paths.files.join("runs/census"))),
+        ("XDG_CACHE_HOME", dir(paths.cache.clone())),
+    ]
 }
 
 /// The directories the environment above names, and the vsock socket's.

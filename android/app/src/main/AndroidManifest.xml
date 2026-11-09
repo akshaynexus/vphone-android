@@ -47,6 +47,28 @@
             android:screenOrientation="portrait"
             android:theme="@style/Theme.Vphone.Create" />
 
+        <!-- The VM's screen during creation; follows rotation, its Surface crosses to :createvm. -->
+        <activity
+            android:name=".CreateVmScreen"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"
+            android:exported="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+
+        <activity
+            android:name=".CreateLogActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Vphone.Create" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.logs"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/log_paths" />
+        </provider>
+
         <!-- Runs the creation; QEMU boots start in the bound process below. -->
         <service
             android:name=".CreateService"

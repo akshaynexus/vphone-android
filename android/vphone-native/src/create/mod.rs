@@ -8,6 +8,7 @@ pub mod ctl;
 pub mod download;
 pub mod engine;
 pub mod exec;
+pub mod logview;
 mod mirror;
 pub mod state;
 pub mod steps;
@@ -194,7 +195,7 @@ pub fn pending(paths: &Paths) -> Option<String> {
 }
 
 /// The status the UI shows: a "running" one with no process behind it is "interrupted".
-pub fn status_json(paths: &Paths, name: &str) -> String {
+fn ui_status(paths: &Paths, name: &str) -> Status {
     let vm = vm_path(paths, name);
     let mut status = state::read_status(&vm).unwrap_or_default();
     status.paused = vm.join(engine::PAUSE_FILE).exists();
@@ -202,7 +203,17 @@ pub fn status_json(paths: &Paths, name: &str) -> String {
         status.state = "interrupted".into();
         status.message = "It stopped while the app or the phone restarted; tap Resume.".into();
     }
-    serde_json::to_string(&status).unwrap_or_default()
+    logview::apply_step_times(&vm, &mut status);
+    status
+}
+
+pub fn status_json(paths: &Paths, name: &str) -> String {
+    serde_json::to_string(&ui_status(paths, name)).unwrap_or_default()
+}
+
+/// The facts for the progress screen's panels; reads the step's log, so not for the main thread.
+pub fn live_json(paths: &Paths, name: &str) -> String {
+    logview::live_json(paths, &ui_status(paths, name))
 }
 
 pub fn request_cancel(paths: &Paths, name: &str) {
@@ -280,6 +291,8 @@ pub fn run(paths: &Paths, name: &str, process: Arc<dyn vm::VmProcess>) -> Result
         return Ok(());
     };
     let e = engine::Engine::new(paths.clone(), name, process)?;
+    // Log files hold no times of their own; this notes when each one grew.
+    let _stamper = logview::Stamper::spawn(e.vm.join(state::LOG_DIR));
     let _ = fs::remove_file(e.vm.join(engine::CANCEL_FILE));
     let _ = fs::remove_file(e.vm.join(engine::PAUSE_FILE));
     ctl::clear_cancel();

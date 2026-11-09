@@ -16,10 +16,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub use vphone_create_steps::host::VmKind;
+
+pub mod display;
+pub mod vitals;
 
 const TAG: &str = "vphone-create";
 const QEMU_STACK: usize = 64 << 20;
@@ -38,6 +42,8 @@ pub struct RunSpec {
     pub pid_file: String,
     pub exit_file: String,
     pub gfx: bool,
+    /// Written, with the reason, when this boot's display could not start.
+    pub display_failed: String,
 }
 
 fn spec_path(paths: &Paths) -> PathBuf {
@@ -64,13 +70,25 @@ pub fn create_config() -> VmConfig {
     cfg
 }
 
-/// Ports `tools/dfu-up.sh`: the normal arguments with no GPU, the virtual USB chardev, and logs.
-pub fn dfu_spec(b: &Bundle, cfg: &VmConfig, paths: &Paths, run: &Path, vusb: &Path) -> RunSpec {
+/// Ports `tools/dfu-up.sh`: the normal arguments, the virtual USB chardev and logs. With `display`
+/// the guest's GPU is attached, as `GFX=1 WINDOW=1` does: guest RAM becomes shared memfd.
+pub fn dfu_spec(
+    b: &Bundle,
+    cfg: &VmConfig,
+    paths: &Paths,
+    run: &Path,
+    vusb: &Path,
+    display: bool,
+) -> RunSpec {
     let mem = cfg.ram_arg();
     let file = |name: &str| opt(&b.path(name));
     let mut machine = format!("vresearch101,ecid={},sep-rom={}", b.ecid, file(&b.seprom));
     if let Some(serial) = &b.serial {
         machine += &format!(",serial={serial}");
+    }
+    let res = format!("{}x{}", b.res.0, b.res.1);
+    if display {
+        machine += &launcher::gfx_machine(&res);
     }
     let (nvram, disk) = (file("nvram.bin"), file("Disk.img"));
     let mut args: Vec<String> = ["qemu-system-aarch64", "-M", &machine, "-accel"]
@@ -105,6 +123,10 @@ pub fn dfu_spec(b: &Bundle, cfg: &VmConfig, paths: &Paths, run: &Path, vusb: &Pa
     }
     // The virtual network card's boot ROM is not in the app, and iOS does not use it.
     push(&["-global", "virtio-net-pci.romfile="]);
+    if display {
+        let gfx = launcher::gfx_args(&res, &mem);
+        push(&gfx.iter().map(String::as_str).collect::<Vec<_>>());
+    }
     push(&["-display", "none"]);
     let qmp = opt(&paths.qmp_socket().to_string_lossy());
     push(&["-qmp", &format!("unix:{qmp},server=on,wait=off")]);
@@ -118,7 +140,7 @@ pub fn dfu_spec(b: &Bundle, cfg: &VmConfig, paths: &Paths, run: &Path, vusb: &Pa
     push(&["-D", &log, "-d", "guest_errors"]);
 
     let dir = |p: PathBuf| p.to_string_lossy().into_owned();
-    let env = vec![
+    let mut env = vec![
         ("VPHONE_TARGET_PAGE_BITS".to_string(), "14".to_string()),
         ("VPHONE_TLB_RANGE_PAGES".to_string(), "1".to_string()),
         ("VPHONE_XPAGE_LINKS".to_string(), "1".to_string()),
@@ -128,17 +150,27 @@ pub fn dfu_spec(b: &Bundle, cfg: &VmConfig, paths: &Paths, run: &Path, vusb: &Pa
         ("TMPDIR".to_string(), dir(paths.cache.join("tmp"))),
         ("HOME".to_string(), dir(paths.files.join("home"))),
     ];
-    finish_spec(args, env, run, paths, false)
+    if display {
+        env.extend(launcher::gfx_env(paths).into_iter().map(|(k, v)| (k.to_string(), v)));
+    }
+    finish_spec(args, env, run, paths, display)
 }
 
-/// The first boot: the normal launcher's arguments, headless (QEMU's `REIMS_VGPU_WINDOW=0`).
-pub fn first_boot_spec(b: &Bundle, cfg: &VmConfig, paths: &Paths, run: &Path) -> RunSpec {
+/// The first boot: the normal launcher's arguments. The GPU stays attached either way; without
+/// `display` it draws nowhere (QEMU's `REIMS_VGPU_WINDOW=0`).
+pub fn first_boot_spec(
+    b: &Bundle,
+    cfg: &VmConfig,
+    paths: &Paths,
+    run: &Path,
+    display: bool,
+) -> RunSpec {
     let launch = launcher::build(b, cfg, paths);
     let env: Vec<(String, String)> = launch
         .env
         .into_iter()
         .map(|(k, v)| {
-            let v = if k == "REIMS_VGPU_WINDOW" { "0".to_string() } else { v };
+            let v = if k == "REIMS_VGPU_WINDOW" && !display { "0".to_string() } else { v };
             (k.to_string(), v)
         })
         .collect();
@@ -161,6 +193,7 @@ fn finish_spec(
         pid_file: pid_path(paths).to_string_lossy().into_owned(),
         exit_file: at("qemu.exit"),
         gfx,
+        display_failed: at("display-failed"),
     }
 }
 
@@ -181,10 +214,16 @@ pub fn run_from_spec(paths: &Paths) -> Result<(), String> {
     };
     let qemu = runtime::load_qemu(paths).inspect_err(|e| write_err(e))?;
     if spec.gfx {
-        let gipa = runtime::load_vulkan(paths).inspect_err(|e| write_err(e))?;
-        // SAFETY: gipa is vkGetInstanceProcAddr of the loader just opened; no window is given.
+        let gipa = runtime::load_vulkan(paths).inspect_err(|e| {
+            write_err(e);
+            let _ = fs::write(&spec.display_failed, e);
+        })?;
+        // SAFETY: gipa is vkGetInstanceProcAddr of the loader just opened.
         unsafe { (qemu.set_gipa)(gipa) };
+        // A view that was already open gave its Surface before QEMU's library was loaded.
+        runtime::reapply_window();
     }
+    vitals::spawn_self_stats(vitals::proc_path(paths));
 
     let open = |p: &str| fs::File::create(p).map_err(|e| format!("cannot create {p}: {e}"));
     let (out, err) = (open(&spec.stdout)?, open(&spec.stderr)?);
@@ -231,7 +270,19 @@ pub struct Supervisor {
     paths: Paths,
     process: Arc<dyn VmProcess>,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The person's pause: a wait inside a boot does not time out while it holds.
+    paused: Arc<dyn Fn() -> bool + Send + Sync>,
     current: Mutex<Option<Current>>,
+    /// The current boot has a display attached.
+    display_attached: AtomicBool,
+    /// `stop` is ending the VM, so its going away is not a death.
+    stopping: AtomicBool,
+    /// Why the current boot failed, for [`Supervisor::take_display_failure`].
+    boot_failure: Mutex<Option<String>>,
+    /// The watchdog's facts, when it is what stopped the VM.
+    stall: Mutex<Option<String>>,
+    /// What the vitals file says of the display.
+    display_status: Mutex<(String, String)>,
 }
 
 fn alive(pid: i32) -> bool {
@@ -271,17 +322,69 @@ impl Supervisor {
         paths: Paths,
         process: Arc<dyn VmProcess>,
         cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        paused: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
         Supervisor {
             paths,
             process,
             cancelled,
+            paused,
             current: Mutex::new(None),
+            display_attached: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            boot_failure: Mutex::new(None),
+            stall: Mutex::new(None),
+            display_status: Mutex::new(("no-gpu".into(), String::new())),
         }
     }
 
     pub fn alive(&self) -> bool {
-        self.pid().is_some_and(alive)
+        let Some(pid) = self.pid() else {
+            return false;
+        };
+        let up = alive(pid);
+        if !up {
+            self.note_death();
+        }
+        up
+    }
+
+    /// A boot we did not stop has ended.
+    fn note_death(&self) {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let run = self.current.lock().unwrap().as_ref().map(|c| c.run.clone());
+        if let Some(run) = run {
+            let detail = self.died(&run);
+            self.boot_failure.lock().unwrap().get_or_insert(detail);
+        }
+    }
+
+    /// Why the current boot failed, once, if it had the display attached: the caller redoes the
+    /// boot headless. Clears the record either way.
+    pub fn take_display_failure(&self) -> Option<String> {
+        let reason = self.boot_failure.lock().unwrap().take();
+        if self.display_attached.swap(false, Ordering::SeqCst) {
+            reason
+        } else {
+            None
+        }
+    }
+
+    pub fn display_status(&self) -> (String, String) {
+        self.display_status.lock().unwrap().clone()
+    }
+
+    /// The watchdog's last resort: stops the VM and makes these facts its failure.
+    pub fn stop_stalled(&self, facts: String) {
+        *self.stall.lock().unwrap() = Some(facts.clone());
+        self.boot_failure.lock().unwrap().get_or_insert(facts);
+        let _ = self.stop();
+    }
+
+    pub fn stall_facts(&self) -> Option<String> {
+        self.stall.lock().unwrap().clone()
     }
 
     pub fn pid(&self) -> Option<i32> {
@@ -303,6 +406,13 @@ impl Supervisor {
 
     /// `tools/dfu-stop.sh`: this creation's VM only, over QMP, then signals.
     pub fn stop(&self) -> Result<(), String> {
+        self.stopping.store(true, Ordering::SeqCst);
+        let result = self.stop_inner();
+        self.stopping.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn stop_inner(&self) -> Result<(), String> {
         let Some(pid) = self.pid().filter(|p| alive(*p)) else {
             let _ = fs::remove_file(pid_path(&self.paths));
             self.process.release();
@@ -333,7 +443,8 @@ impl Supervisor {
     }
 
     fn wait(&self, what: &str, limit: Duration, ready: impl Fn() -> bool) -> Result<(), String> {
-        let end = Instant::now() + limit;
+        const TICK: Duration = Duration::from_millis(500);
+        let mut end = Instant::now() + limit;
         while Instant::now() < end {
             if (self.cancelled)() {
                 return Err("cancelled".into());
@@ -341,12 +452,19 @@ impl Supervisor {
             if ready() {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(500));
+            // A paused VM makes no progress: the time does not count.
+            if (self.paused)() {
+                end += TICK;
+            }
+            std::thread::sleep(TICK);
         }
         Err(format!("timed out waiting for {what}"))
     }
 
     fn died(&self, run: &Path) -> String {
+        if let Some(facts) = self.stall.lock().unwrap().as_ref() {
+            return facts.clone();
+        }
         let tail = crate::runtime::log_tail(&run.join("stderr.log").to_string_lossy(), 2048);
         let tail = tail.trim();
         let reason = self.process.exit_reason();
@@ -361,8 +479,21 @@ impl Supervisor {
         )
     }
 
+    /// This boot failed: the reason is kept for [`Supervisor::take_display_failure`].
+    fn fail_boot(&self, detail: String) -> String {
+        self.boot_failure.lock().unwrap().get_or_insert_with(|| detail.clone());
+        detail
+    }
+
     /// `tools/dfu-up.sh` / the first boot's start: blocks until the VM's device is up.
-    pub fn start(&self, kind: VmKind, vm: &Path, run: &Path, vusb: &Path) -> Result<(), String> {
+    pub fn start(
+        &self,
+        kind: VmKind,
+        vm: &Path,
+        run: &Path,
+        vusb: &Path,
+        setting: display::Setting,
+    ) -> Result<(), String> {
         fs::create_dir_all(run).map_err(|e| e.to_string())?;
         fs::create_dir_all(self.paths.create_sockets()).map_err(|e| e.to_string())?;
         self.stop()?;
@@ -370,11 +501,26 @@ impl Supervisor {
             let _ = fs::remove_file(p);
         }
         let _ = fs::remove_file(run.join("qemu.exit"));
+        let display_failed = run.join("display-failed");
+        let _ = fs::remove_file(&display_failed);
+        let _ = fs::remove_file(vitals::proc_path(&self.paths));
         let bundle = Bundle::open(vm).map_err(|p| p.join("; "))?;
         let cfg = create_config();
+        let show = setting == display::Setting::On;
+        self.display_attached.store(show, Ordering::SeqCst);
+        *self.boot_failure.lock().unwrap() = None;
+        *self.stall.lock().unwrap() = None;
+        let note = match &setting {
+            display::Setting::Headless(why) => why.clone(),
+            display::Setting::Off => "The screen is switched off for this VM.".to_string(),
+            display::Setting::On => String::new(),
+        };
+        *self.display_status.lock().unwrap() = (setting.name().to_string(), note);
         let spec = match kind {
-            VmKind::Dfu | VmKind::Ramdisk => dfu_spec(&bundle, &cfg, &self.paths, run, vusb),
-            VmKind::FirstBoot { gfx: true } => first_boot_spec(&bundle, &cfg, &self.paths, run),
+            VmKind::Dfu | VmKind::Ramdisk => dfu_spec(&bundle, &cfg, &self.paths, run, vusb, show),
+            VmKind::FirstBoot { gfx: true } => {
+                first_boot_spec(&bundle, &cfg, &self.paths, run, show)
+            }
             VmKind::FirstBoot { gfx: false } => {
                 return Err("a first boot needs the GPU".into());
             }
@@ -384,12 +530,18 @@ impl Supervisor {
         self.process.start()?;
 
         // The pid is written just before QEMU starts, so one that is already gone died at startup.
-        self.wait("the VM process", Duration::from_secs(90), || read_pid(&self.paths).is_some())
-            .map_err(|e| format!("{e}: {}", self.died(run)))?;
+        self.wait("the VM process", Duration::from_secs(90), || {
+            read_pid(&self.paths).is_some() || display_failed.exists()
+        })
+        .map_err(|e| self.fail_boot(format!("{e}: {}", self.died(run))))?;
+        if display_failed.exists() {
+            let why = fs::read_to_string(&display_failed).unwrap_or_default();
+            return Err(self.fail_boot(format!("The display could not start: {}", why.trim())));
+        }
         let pid = read_pid(&self.paths).unwrap_or(0);
         std::thread::sleep(Duration::from_millis(500));
         if !alive(pid) {
-            return Err(self.died(run));
+            return Err(self.fail_boot(self.died(run)));
         }
         *self.current.lock().unwrap() = Some(Current {
             pid,
@@ -401,7 +553,7 @@ impl Supervisor {
                 vusb.exists() || !alive(pid)
             })?;
             if !alive(pid) {
-                return Err(self.died(run));
+                return Err(self.fail_boot(self.died(run)));
             }
             // AVPBooter reaches DFU (dfu-up.sh's sleep).
             let end = Instant::now() + DFU_SETTLE;
@@ -438,9 +590,10 @@ impl Supervisor {
     }
 
     pub fn exit_detail(&self) -> String {
-        match self.current.lock().unwrap().as_ref() {
-            Some(c) => self.died(&c.run),
-            None => "the VM is not running".into(),
+        let current = self.current.lock().unwrap().as_ref().map(|c| c.run.clone());
+        match current {
+            Some(run) => self.died(&run),
+            None => self.stall_facts().unwrap_or_else(|| "the VM is not running".into()),
         }
     }
 }
@@ -474,7 +627,7 @@ mod tests {
         fs::write(dir.join("SEPStorage"), b"x").unwrap();
         let b = Bundle::open(&dir).unwrap();
         let run = dir.join(".runs-dfu");
-        let spec = dfu_spec(&b, &cfg(), &paths(), &run, Path::new("/data/files/cv/vusb.sock"));
+        let spec = dfu_spec(&b, &cfg(), &paths(), &run, Path::new("/data/files/cv/vusb.sock"), false);
         let line = spec.args.join(" ");
         let v = dir.to_string_lossy();
         assert!(line.contains(&format!("-M vresearch101,ecid=deadbeef,sep-rom={v}/AVPSEPBooter.vresearch1.bin")));
@@ -488,10 +641,31 @@ mod tests {
     }
 
     #[test]
+    fn a_creation_boot_with_a_display_attaches_the_gpu_as_gfx_1_window_1() {
+        let dir = fixture("dfu-gfx");
+        fs::write(dir.join("gfx-res"), "860x1864\n").unwrap();
+        let b = Bundle::open(&dir).unwrap();
+        let spec = dfu_spec(&b, &cfg(), &paths(), &dir.join("r"), Path::new("/cv/vusb.sock"), true);
+        let line = spec.args.join(" ");
+        assert!(line.contains("gfx-device=apple-gfx-mmio,memory-backend=ram0,gfx-modes=860x1864@60"), "{line}");
+        assert!(line.contains("-object memory-backend-memfd,id=ram0,size=6G,share=on"), "{line}");
+        assert!(line.contains("-global apple-gfx-mmio.resolution=860x1864"), "{line}");
+        assert!(line.contains("vresearch-vusb.chardev=vusb"), "still the DFU machine: {line}");
+        assert!(spec.gfx, "it loads Vulkan");
+        assert_eq!(
+            spec.env.iter().find(|(k, _)| k == "REIMS_VGPU_WINDOW").map(|(_, v)| v.as_str()),
+            Some("1")
+        );
+        let headless = dfu_spec(&b, &cfg(), &paths(), &dir.join("r"), Path::new("/cv/vusb.sock"), false);
+        assert!(!headless.args.join(" ").contains("memory-backend"), "no shared RAM without a display");
+        assert!(!headless.gfx);
+    }
+
+    #[test]
     fn first_boot_is_headless_with_gpu() {
         let dir = fixture("fb-args");
         let b = Bundle::open(&dir).unwrap();
-        let spec = first_boot_spec(&b, &cfg(), &paths(), &dir.join(".runs-boot"));
+        let spec = first_boot_spec(&b, &cfg(), &paths(), &dir.join(".runs-boot"), false);
         assert!(spec.gfx);
         assert!(spec.args.join(" ").contains("apple-gfx-mmio"));
         assert_eq!(
