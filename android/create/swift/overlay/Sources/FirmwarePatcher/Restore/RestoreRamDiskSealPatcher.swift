@@ -129,6 +129,7 @@ final class RestoreRamDiskSealPatcher: BufferedPatcher {
             )
         }
         print("  [seal] replaced")
+        try Self.enableFastMtree(in: image, staging: temporary)
         print("  [seal] re-reading patched image")
         resultData = try Data(contentsOf: image)
         context.originalCDHash = originalCDHash
@@ -159,6 +160,40 @@ final class RestoreRamDiskSealPatcher: BufferedPatcher {
 
     var patchedData: Data {
         resultData ?? originalData
+    }
+
+    // MARK: Restore Options
+
+    static let restoreOptionsPath = "/usr/local/share/restore/options.plist"
+
+    /// restored_external can seal the system volume from the manifest it was sent, or by running
+    /// `mtree` to hash every system file on one CPU first: on a phone, tens of minutes. It takes
+    /// SealedVolumeUseFastMtree only from this file, as the options a host sends are filtered.
+    static func enableFastMtree(in image: URL, staging: URL) throws {
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+        \t<key>SealedVolumeUseFastMtree</key>
+        \t<true/>
+        </dict>
+        </plist>
+
+        """
+        let staged = staging.appendingPathComponent("options.plist")
+        do {
+            try Data(plist.utf8).write(to: staged)
+            let directory = (restoreOptionsPath as NSString).deletingLastPathComponent
+            _ = try run(apfsToolPath(), ["mkdir", image.path, directory, "-p", "--mode", "755", "--vol", "0"])
+            _ = try run(apfsToolPath(), [
+                "write", image.path, restoreOptionsPath, staged.path,
+                "--mode", "0644", "--uid", "0", "--gid", "0", "--vol", "0",
+            ])
+        } catch {
+            throw PatcherError.patchVerificationFailed("adding \(restoreOptionsPath) to the restore ramdisk failed: \(error)")
+        }
+        print("  [seal] restore options: fast mtree on")
     }
 
     // MARK: Mach-O Discovery
