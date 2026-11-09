@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,6 +63,7 @@ pub struct Engine {
     pause: Mutex<bool>,
     paused_in_step: AtomicBool,
     mirror: Mutex<Vec<Followed>>,
+    restore_rate: Mutex<mirror::RestoreRate>,
     /// The logs [`Engine::mirror_log`] follows, for the watchdog's "any output yet?".
     followed_paths: Mutex<Vec<PathBuf>>,
     /// The VM is held (pause, thermal, storage): nothing it does counts against a time limit.
@@ -123,6 +125,7 @@ impl Engine {
             pause: Mutex::new(false),
             paused_in_step: AtomicBool::new(false),
             mirror: Mutex::new(Vec::new()),
+            restore_rate: Mutex::new(mirror::RestoreRate::new()),
             followed_paths: Mutex::new(Vec::new()),
             vm_held,
         });
@@ -300,8 +303,35 @@ impl Engine {
                 } else if let Some(sent) = mirror::sent_mib(&line) {
                     self.status(true, |s| s.message = format!("Sent {sent} MB to the VM"));
                 }
+                if let Some(percent) = mirror::asr_percent(&line) {
+                    self.show_restore_progress(percent);
+                }
                 self.append_log(&format!("{}{line}", followed.prefix));
             }
+        }
+    }
+
+    /// The bar, speed and time left of the image restore. The speed is what the VM's disk image
+    /// actually grew by; the time left is the recent rate carried forward.
+    fn show_restore_progress(&self, percent: u64) {
+        let disk = self
+            .sup
+            .serial_log()
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|vm| fs::metadata(vm.join("Disk.img")).ok())
+            .map(|m| m.blocks() * 512);
+        let mut rate = self.restore_rate.lock().unwrap();
+        if self.pause_requested() {
+            rate.clear();
+        }
+        if let Some(message) = rate.update(percent, disk) {
+            self.status(true, |s| {
+                s.done_bytes = percent;
+                s.total_bytes = 100;
+                s.bytes_per_sec = 0;
+                s.message = message;
+            });
         }
     }
 

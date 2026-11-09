@@ -1,9 +1,11 @@
 //! A helper's own log, followed into its step's log: the restore writes to a file of its own, and
 //! its lines are the only sign of how far it has got.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// The stages of a restore, in order: a line containing the text starts that stage.
 const STAGES: [(&str, &str); 12] = [
@@ -34,6 +36,89 @@ pub fn stage_of(line: &str) -> Option<(u64, &'static str)> {
 /// The MiB the USB link reports having sent: `vusbd: sent 16 MiB in 3.2 s`.
 pub fn sent_mib(line: &str) -> Option<u64> {
     line.strip_prefix("vusbd: sent ")?.split(' ').next()?.parse().ok()
+}
+
+/// How far the guest's image restore has got: `ASR RESTORE PROGRESS: 40%`, anywhere in a line.
+pub fn asr_percent(line: &str) -> Option<u64> {
+    let (_, rest) = line.split_once("ASR RESTORE PROGRESS:")?;
+    let rest = rest.trim_start();
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    if !rest[end..].starts_with('%') {
+        return None;
+    }
+    rest[..end].parse().ok().filter(|percent| *percent <= 100)
+}
+
+/// The window the speed and the time left are measured over: long enough to span several percent.
+const RATE_WINDOW_SECS: f64 = 120.0;
+/// Less than this says nothing about the rate.
+const RATE_MIN_SECS: f64 = 20.0;
+
+/// What the image restore's percentages say about its speed.
+pub struct RestoreRate {
+    start: Instant,
+    /// Seconds since `start`, percent, bytes the disk image holds.
+    samples: VecDeque<(f64, u64, Option<u64>)>,
+}
+
+impl RestoreRate {
+    pub fn new() -> RestoreRate {
+        RestoreRate { start: Instant::now(), samples: VecDeque::new() }
+    }
+
+    /// Time spent paused is not restore time.
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    /// The line to show for a percentage, if it is a new one.
+    pub fn update(&mut self, percent: u64, disk: Option<u64>) -> Option<String> {
+        self.update_at(self.start.elapsed().as_secs_f64(), percent, disk)
+    }
+
+    fn update_at(&mut self, at: f64, percent: u64, disk: Option<u64>) -> Option<String> {
+        match self.samples.back() {
+            Some(last) if last.1 == percent => return None,
+            Some(last) if last.1 > percent => self.samples.clear(),
+            _ => {}
+        }
+        self.samples.push_back((at, percent, disk));
+        while self.samples.len() > 2 && self.samples[0].0 < at - RATE_WINDOW_SECS {
+            self.samples.pop_front();
+        }
+        let &(first_at, first_percent, first_disk) = self.samples.front()?;
+        let span = at - first_at;
+        let gained = percent - first_percent;
+        let mut text = format!("Writing iOS to the disk: {percent}%");
+        if span < RATE_MIN_SECS || gained == 0 {
+            text += " \u{b7} measuring speed";
+            return Some(text);
+        }
+        if let (Some(first), Some(now)) = (first_disk, disk) {
+            if now > first {
+                let per_sec = (now - first) as f64 / span / 1_000_000.0;
+                text += &if per_sec < 10.0 {
+                    format!(" \u{b7} {per_sec:.1} MB/s")
+                } else {
+                    format!(" \u{b7} {per_sec:.0} MB/s")
+                };
+            }
+        }
+        if percent < 100 {
+            let left = (100 - percent) as f64 * span / gained as f64;
+            text += &format!(" \u{b7} about {} left", duration(left));
+        }
+        Some(text)
+    }
+}
+
+fn duration(secs: f64) -> String {
+    let minutes = (secs / 60.0).ceil() as u64;
+    match minutes {
+        0..=1 => "1 min".to_string(),
+        2..=59 => format!("{minutes} min"),
+        _ => format!("{} h {} min", minutes / 60, minutes % 60),
+    }
 }
 
 pub struct Mirror {
@@ -111,6 +196,45 @@ mod tests {
         let seen: Vec<u64> = REAL.lines().filter_map(|l| m.advance(l).map(|s| s.0)).collect();
         assert_eq!(seen, (1..=STAGE_COUNT).collect::<Vec<_>>());
         assert_eq!(m.advance("Sending iBSS (380445 bytes)..."), None, "it never goes back");
+    }
+
+    #[test]
+    fn reads_the_image_restore_s_percentage() {
+        assert_eq!(asr_percent("ASR RESTORE PROGRESS: 40%"), Some(40));
+        assert_eq!(asr_percent("[guest] ASR RESTORE PROGRESS: 100%"), Some(100));
+        assert_eq!(asr_percent("ASR RESTORE PROGRESS: 101%"), None);
+        assert_eq!(asr_percent("ASR RESTORE PROGRESS: soon"), None);
+        assert_eq!(asr_percent("Restoring image (13)"), None);
+    }
+
+    #[test]
+    fn the_rate_is_measured_and_a_repeat_or_a_restart_is_handled() {
+        const GB: u64 = 1_000_000_000;
+        let mut r = RestoreRate::new();
+        assert!(r.update_at(0.0, 10, Some(GB)).unwrap().ends_with("10% \u{b7} measuring speed"));
+        assert_eq!(r.update_at(5.0, 10, Some(GB)), None, "the same percentage again");
+        assert!(r.update_at(10.0, 11, Some(GB)).unwrap().contains("measuring"), "too soon to say");
+        // 10 points in 60 s, and 600 MB written: 10 MB/s, and 80 points left at 6 s each.
+        assert_eq!(
+            r.update_at(60.0, 20, Some(GB + 600_000_000)).unwrap(),
+            "Writing iOS to the disk: 20% \u{b7} 10 MB/s \u{b7} about 8 min left"
+        );
+        assert_eq!(
+            r.update_at(600.0, 100, Some(2 * GB)).unwrap(),
+            "Writing iOS to the disk: 100% \u{b7} 0.7 MB/s"
+        );
+        let text = r.update_at(700.0, 5, None).unwrap();
+        assert!(text.ends_with("5% \u{b7} measuring speed"), "a new image starts over: {text}");
+    }
+
+    #[test]
+    fn only_a_recent_window_sets_the_rate() {
+        let mut r = RestoreRate::new();
+        r.update_at(0.0, 1, None);
+        r.update_at(1000.0, 2, None);
+        // 1 point a minute lately, despite the slow start.
+        let text = r.update_at(1060.0, 3, None).unwrap();
+        assert!(text.ends_with("about 1 h 37 min left"), "{text}");
     }
 
     #[test]
