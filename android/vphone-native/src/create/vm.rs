@@ -177,6 +177,16 @@ pub fn first_boot_spec(
     finish_spec(launch.args, env, run, paths, true)
 }
 
+/// Each switch turns off one fast path built and tuned on x86 hosts. Later values win.
+const SAFE_EMULATION: [(&str, &str); 6] = [
+    ("QEMU_TLB_UNSYNCED", "0"),
+    ("VPHONE_NATIVE_FP", "0"),
+    ("VPHONE_FAST_F32", "0"),
+    ("VPHONE_INLINE_LOOKUP", "0"),
+    ("VPHONE_XPAGE_LINKS", "0"),
+    ("VPHONE_RET_PREFETCH", "0"),
+];
+
 fn finish_spec(
     args: Vec<String>,
     env: Vec<(String, String)>,
@@ -267,6 +277,7 @@ struct Current {
 }
 
 pub struct Supervisor {
+    safe_emulation: std::sync::atomic::AtomicBool,
     paths: Paths,
     process: Arc<dyn VmProcess>,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -330,6 +341,7 @@ impl Supervisor {
             cancelled,
             paused,
             current: Mutex::new(None),
+            safe_emulation: std::sync::atomic::AtomicBool::new(false),
             display_attached: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             boot_failure: Mutex::new(None),
@@ -363,6 +375,12 @@ impl Supervisor {
 
     /// Why the current boot failed, once, if it had the display attached: the caller redoes the
     /// boot headless. Clears the record either way.
+    /// Boots after this leave out the fast paths written for x86 hosts: slower, but it rules
+    /// them out where a boot has wedged.
+    pub fn use_safe_emulation(&self) {
+        self.safe_emulation.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn take_display_failure(&self) -> Option<String> {
         let reason = self.boot_failure.lock().unwrap().take();
         if self.display_attached.swap(false, Ordering::SeqCst) {
@@ -465,7 +483,10 @@ impl Supervisor {
         if let Some(facts) = self.stall.lock().unwrap().as_ref() {
             return facts.clone();
         }
-        let tail = crate::runtime::log_tail(&run.join("stderr.log").to_string_lossy(), 2048);
+        // A GPU boot's stderr is mostly the translator's notes about how each shader differs.
+        let tail = crate::runtime::log_tail(&run.join("stderr.log").to_string_lossy(), 16384);
+        let tail: Vec<&str> = tail.lines().filter(|l| !l.contains("[metal2vulkan-")).collect();
+        let tail = tail[tail.len().saturating_sub(20)..].join("\n");
         let tail = tail.trim();
         let reason = self.process.exit_reason();
         format!(
@@ -525,6 +546,10 @@ impl Supervisor {
                 return Err("a first boot needs the GPU".into());
             }
         };
+        let mut spec = spec;
+        if self.safe_emulation.load(std::sync::atomic::Ordering::SeqCst) {
+            spec.env.extend(SAFE_EMULATION.map(|(k, v)| (k.to_string(), v.to_string())));
+        }
         let json = serde_json::to_vec_pretty(&spec).map_err(|e| e.to_string())?;
         fs::write(spec_path(&self.paths), json).map_err(|e| e.to_string())?;
         self.process.start()?;

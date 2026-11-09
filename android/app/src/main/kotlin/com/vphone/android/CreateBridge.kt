@@ -35,6 +35,19 @@ object CreateBridge {
         runCatching { context?.unbindService(conn) }
     }
 
+    /** The readable parts of Android's native crash record: the signal, abort text and stack. */
+    private fun crashDetails(info: ApplicationExitInfo): String {
+        val bytes = runCatching { info.traceInputStream?.use { it.readBytes() } }.getOrNull() ?: return ""
+        val lines = Regex("[\\x20-\\x7e]{6,}")
+            .findAll(String(bytes, Charsets.ISO_8859_1))
+            .map { it.value }
+            .filter { it.contains(".so") || it.contains("SIG") || it.contains("panic") || it.contains("abort", true) }
+            .distinct()
+            .take(30)
+            .joinToString("\n")
+        return if (lines.isEmpty()) "" else "\nCrash record:\n$lines"
+    }
+
     @JvmStatic
     fun vmExitReason(): String {
         val ctx = context ?: return ""
@@ -49,6 +62,7 @@ object CreateBridge {
             ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "Android stopped the VM for excessive resource use."
             else -> "Android ended the VM process (reason ${info.reason})."
         }
-        return if (info.description.isNullOrEmpty()) why else "$why (${info.description})"
+        val base = if (info.description.isNullOrEmpty()) why else "$why (${info.description})"
+        return if (info.reason == ApplicationExitInfo.REASON_CRASH_NATIVE) base + crashDetails(info) else base
     }
 }

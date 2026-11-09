@@ -138,6 +138,7 @@ class CreateVmScreen : Activity() {
         note = TextView(this).apply {
             setTextColor(0xFFCCCCCC.toInt())
             textSize = 12f
+            maxLines = 8
         }
         switch = Switch(this).apply {
             text = "Show the VM's screen during setup"
@@ -265,7 +266,7 @@ class CreateVmScreen : Activity() {
         note.text = when {
             setting == "off" -> "Off for this VM. Takes effect from the next boot."
             setting.startsWith("headless:") ->
-                "Turned off after a boot with the display failed:\n${setting.removePrefix("headless:")}\nTurn it on again to retry from the next boot."
+                "Turned off after a boot with the display failed:\n${setting.removePrefix("headless:").substringBefore("\nIts last output:").take(600)}\nTurn it on again to retry from the next boot."
             else -> "On. If a boot with the display fails, the step is redone without it automatically."
         }
     }
@@ -278,7 +279,12 @@ class CreateVmScreen : Activity() {
             "No VM is running at the moment."
         } else {
             buildString {
-                append(if (v.optBoolean("paused")) "Paused" else if (v.optBoolean("guestMoving")) "Guest is running" else "Guest is NOT moving")
+                append(when {
+                    v.optBoolean("paused") -> "Paused"
+                    (v.optJSONArray("pcs")?.length() ?: 0) == 0 -> "Guest CPU: can't be read (QEMU's monitor isn't answering)"
+                    v.optBoolean("guestMoving") -> "Guest is running"
+                    else -> "Guest is NOT moving"
+                })
                 val pc = v.optString("guestPc")
                 if (pc.isNotEmpty()) append("  ${v.optString("guestEl")} $pc")
                 append(String.format(Locale.US, "\nCPU %.0f%%  RAM %d MB  written %d MB", v.optDouble("cpuPercent", 0.0), v.optLong("rssMb"), v.optLong("diskWrittenMb")))
@@ -290,7 +296,7 @@ class CreateVmScreen : Activity() {
         val message = when {
             !alive -> "No picture: no VM is running right now. The next boot will show here."
             display == "off" -> "No picture: the screen is switched off for this VM."
-            display == "headless" -> "No picture: this boot runs without a display.\n${v.optString("displayNote")}"
+            display == "headless" -> "No picture: this boot runs without a display."
             display != "on" -> "No picture: this boot has no display."
             currentSurface == null -> ""
             !picture -> "No picture: the guest has not drawn anything yet.\n\nEarly boot and much of a restore show nothing even when all is well. The line above shows whether the guest is running."

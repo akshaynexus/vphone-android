@@ -261,25 +261,35 @@ pub fn gpu_driver(params: &GpuParams) -> Result<GpuDriver> {
     admit_temporary_vm(&tree.join("BuildManifest.plist"))?;
     let run = vm.join(".runs-dfu");
     fs::create_dir_all(&run).map_err(|e| Error::path(&run, e))?;
-    host.log("=== DFU");
-    host.start_vm(VmKind::Dfu, &vm, &run).map_err(Error::msg)?;
-    host.log("=== waiting for the VM's DFU mode");
-    let mut in_dfu = false;
-    // A phone's guest answers slowly: the tool's default of 2 seconds is too short here.
+    // Some boots never reach DFU, with the guest and its monitor wedged: boot again rather than
+    // wait on one, and fall back to the slower emulation for the last try.
     let probe = strings(&["recovery-probe", "--timeout", "60"]);
-    for _ in 0..20 {
-        check_cancel(host)?;
-        if !host.vm_alive() {
-            bail!("the temporary VM stopped before reaching DFU\n{}", host.diagnostics());
+    let mut in_dfu = false;
+    'boots: for boot in 1..=3 {
+        if boot == 3 {
+            host.log("[recovery] switching to the slower, safer CPU emulation for this boot");
+            host.use_safe_emulation();
         }
-        if host.run_helper(CLI, &probe, &[], params.log, None).map_err(Error::msg)? == 0 {
-            in_dfu = true;
-            break;
+        host.log(if boot == 1 { "=== DFU" } else { "=== DFU, booting the VM again" });
+        host.start_vm(VmKind::Dfu, &vm, &run).map_err(Error::msg)?;
+        host.log("=== waiting for the VM's DFU mode");
+        for _ in 0..4 {
+            check_cancel(host)?;
+            if !host.vm_alive() {
+                host.log(&format!("[recovery] boot {boot}: the VM stopped\n{}", host.diagnostics()));
+                break;
+            }
+            if host.run_helper(CLI, &probe, &[], params.log, None).map_err(Error::msg)? == 0 {
+                in_dfu = true;
+                break 'boots;
+            }
+            cancellable_sleep(host, Duration::from_secs(3))?;
         }
-        cancellable_sleep(host, Duration::from_secs(3))?;
+        host.log(&format!("[recovery] boot {boot} did not reach DFU\n{}", host.diagnostics()));
+        host.stop_vm(&vm).map_err(Error::msg)?;
     }
     if !in_dfu {
-        bail!("the temporary VM did not reach DFU within 20 minutes\n{}", host.diagnostics());
+        bail!("the temporary VM did not reach DFU in 3 boots\n{}", host.diagnostics());
     }
     let log = run.join("restore.log");
     host.log("=== restoring the stock cloudOS");

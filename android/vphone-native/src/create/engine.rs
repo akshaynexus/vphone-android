@@ -775,7 +775,13 @@ impl Host for Engine {
         if matches!(kind, VmKind::Dfu | VmKind::Ramdisk) {
             self.usb_up()?;
         }
-        self.sup.start(kind, vm, run, &self.vusb_socket(), display::setting(&self.vm))
+        let usb_log = self.vm.join(state::LOG_DIR).join("usb-broker.log");
+        let usb = Followed { mirror: Mirror::new(&usb_log), prefix: "[usb] " };
+        self.sup.start(kind, vm, run, &self.vusb_socket(), display::setting(&self.vm))?;
+        // From here the step's log shows the guest and the USB link, before any tool runs.
+        let guest = Followed { mirror: Mirror::from_start(&self.sup.serial_log()), prefix: "[guest] " };
+        *self.mirror.lock().unwrap() = vec![guest, usb];
+        Ok(())
     }
     fn stop_vm(&self, _vm: &Path) -> Result<(), String> {
         self.sup.stop()
@@ -785,6 +791,9 @@ impl Host for Engine {
     }
     fn serial_log(&self) -> PathBuf {
         self.sup.serial_log()
+    }
+    fn use_safe_emulation(&self) {
+        self.sup.use_safe_emulation();
     }
     fn diagnostics(&self) -> String {
         if let Some(facts) = self.sup.stall_facts() {

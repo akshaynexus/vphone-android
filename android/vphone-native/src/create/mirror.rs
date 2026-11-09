@@ -57,6 +57,11 @@ impl Mirror {
         }
     }
 
+    /// Follows `path` from its beginning: a VM's serial log, fresh with each boot.
+    pub fn from_start(path: &Path) -> Mirror {
+        Mirror { offset: 0, ..Mirror::new(path) }
+    }
+
     /// The complete lines written since the last call.
     pub fn drain(&mut self) -> Vec<String> {
         if self.file.is_none() {

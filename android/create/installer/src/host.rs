@@ -31,6 +31,8 @@ pub trait Host: Progress {
     fn stop_vm(&self, vm: &Path) -> Result<(), String>;
     fn vm_alive(&self) -> bool;
     fn serial_log(&self) -> PathBuf;
+    /// Turns on the slower, safer CPU emulation for the boots after this.
+    fn use_safe_emulation(&self) {}
     /// What the VM and its USB link last said, for an error message.
     fn diagnostics(&self) -> String {
         String::new()
