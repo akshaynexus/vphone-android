@@ -12,6 +12,7 @@ pub mod logview;
 mod mirror;
 pub mod state;
 pub mod steps;
+pub mod storage;
 pub mod vm;
 
 #[cfg(target_os = "android")]
@@ -146,6 +147,7 @@ pub fn preflight_json(paths: &Paths, spec_json: &str) -> String {
 
 /// Records the wizard's choice; the creation itself runs in the service.
 pub fn begin(paths: &Paths, spec_json: &str) -> Result<(), String> {
+    let _cleanup = storage::hold_off_cleanup(paths)?;
     let mut spec: Spec = serde_json::from_str(spec_json).map_err(|e| e.to_string())?;
     valid_name(&spec.name)?;
     if let Some(other) = pending(paths) {
@@ -291,6 +293,8 @@ pub fn run(paths: &Paths, name: &str, process: Arc<dyn vm::VmProcess>) -> Result
     let Some(_lock) = state::acquire_lock(&vm_path(paths, name)) else {
         return Ok(());
     };
+    // After the run's lock: a cleanup either sees this run, or finishes before it goes on.
+    storage::wait_for_cleanup(paths);
     let e = engine::Engine::new(paths.clone(), name, process)?;
     // Log files hold no times of their own; this notes when each one grew.
     let _stamper = logview::Stamper::spawn(e.vm.join(state::LOG_DIR));

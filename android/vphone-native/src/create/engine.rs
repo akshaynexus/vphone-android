@@ -26,6 +26,9 @@ const GIB: u64 = 1 << 30;
 pub const CANCEL_FILE: &str = ".create-cancel";
 pub const PAUSE_FILE: &str = ".create-pause";
 const CELLULAR_FILE: &str = ".create-cellular-ok";
+/// QEMU's `-D` file, written in the boot's run directory.
+const QEMU_LOG: &str = "qemu.log";
+const MUX_LOG: &str = "usbmuxd.log";
 /// How little free space a step may start with: 25 GiB for the restore (it writes the disk),
 /// a few GiB elsewhere. Below these the creation waits for space, it does not fail.
 pub const RESTORE_FREE_FLOOR: u64 = 25 * GIB;
@@ -259,8 +262,11 @@ impl Engine {
     /// Follows a helper's own log into the step's, with what the VM and the USB link say beside
     /// it: a restore's stages show as the step's progress, and a guest that panics shows why.
     pub fn mirror_log(&self, path: &Path) {
+        // What was followed until now has its last lines delivered before it is replaced.
+        self.pump_mirror();
         let follow = |path: &Path, prefix| Followed { mirror: Mirror::new(path), prefix };
-        let usb = self.vm.join(state::LOG_DIR).join("usb-broker.log");
+        let logs = self.vm.join(state::LOG_DIR);
+        let usb = logs.join("usb-broker.log");
         let serial = self.sup.serial_log();
         *self.followed_paths.lock().unwrap() = vec![path.to_path_buf(), serial.clone(), usb.clone()];
         *self.mirror.lock().unwrap() = vec![
@@ -268,7 +274,14 @@ impl Engine {
             follow(&serial, "[guest] "),
             follow(&usb, "[usb] "),
             follow(&self.sup.threads_log(), "[vm] "),
+            follow(&self.qemu_log(), "[qemu] "),
+            follow(&logs.join(MUX_LOG), "[mux] "),
         ];
+    }
+
+    /// QEMU's own log of this boot, beside its serial log.
+    fn qemu_log(&self) -> PathBuf {
+        self.sup.serial_log().with_file_name(QEMU_LOG)
     }
 
     fn pump_mirror(&self) {
@@ -397,7 +410,7 @@ impl Engine {
                 "-C".into(),
                 s(self.paths.files.join("lockdown")),
                 "-l".into(),
-                s(logdir.join("usbmuxd.log")),
+                s(logdir.join(MUX_LOG)),
             ],
             vec![],
             &logdir.join("usbmuxd-out.log"),
@@ -691,7 +704,7 @@ impl Sampler {
         let logs = e.vm.join(state::LOG_DIR);
         let mut files = e.followed_paths.lock().unwrap().clone();
         files.push(e.sup.serial_log());
-        files.push(logs.join("usbmuxd.log"));
+        files.push(logs.join(MUX_LOG));
         files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum()
     }
 
@@ -776,13 +789,16 @@ impl Host for Engine {
         if matches!(kind, VmKind::Dfu | VmKind::Ramdisk) {
             self.usb_up()?;
         }
-        let usb_log = self.vm.join(state::LOG_DIR).join("usb-broker.log");
-        let usb = Followed { mirror: Mirror::new(&usb_log), prefix: "[usb] " };
+        let logs = self.vm.join(state::LOG_DIR);
+        let usb = Followed { mirror: Mirror::new(&logs.join("usb-broker.log")), prefix: "[usb] " };
+        let mux = Followed { mirror: Mirror::new(&logs.join(MUX_LOG)), prefix: "[mux] " };
         self.sup.start(kind, vm, run, &self.vusb_socket(), display::setting(&self.vm))?;
         // From here the step's log shows the guest and the USB link, before any tool runs.
         let guest = Followed { mirror: Mirror::from_start(&self.sup.serial_log()), prefix: "[guest] " };
         let threads = Followed { mirror: Mirror::from_start(&run.join(super::vm::THREADS_LOG)), prefix: "[vm] " };
-        *self.mirror.lock().unwrap() = vec![guest, usb, threads];
+        // Started over by each boot's QEMU, which has it open by now.
+        let qemu = Followed { mirror: Mirror::from_start(&run.join(QEMU_LOG)), prefix: "[qemu] " };
+        *self.mirror.lock().unwrap() = vec![guest, usb, threads, qemu, mux];
         Ok(())
     }
     fn stop_vm(&self, _vm: &Path) -> Result<(), String> {
@@ -801,11 +817,13 @@ impl Host for Engine {
         let tail = |path: PathBuf| crate::runtime::log_tail(&path.to_string_lossy(), 1500).trim().to_string();
         let logs = self.vm.join(state::LOG_DIR);
         format!(
-            "How the VM ended: {}\n\nThread log:\n{}\n\nVM output:\n{}\n\nUSB link:\n{}",
+            "How the VM ended: {}\n\nThread log:\n{}\n\nVM output:\n{}\n\nQEMU log:\n{}\n\nUSB link:\n{}\n\nusbmuxd:\n{}",
             if self.sup.alive() { "it is still running".to_string() } else { self.sup.exit_detail() },
             tail(self.sup.threads_log()),
             tail(self.sup.serial_log()),
-            tail(logs.join("usb-broker.log"))
+            tail(self.qemu_log()),
+            tail(logs.join("usb-broker.log")),
+            tail(logs.join(MUX_LOG))
         )
     }
     fn vphoned_rpc(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
@@ -840,3 +858,52 @@ impl Host for Engine {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoVm;
+    impl VmProcess for NoVm {
+        fn start(&self, _: &Path, _: &Path) -> Result<(), String> { Ok(()) }
+        fn release(&self) {}
+        fn exit_reason(&self) -> String { String::new() }
+    }
+
+    fn engine(name: &str) -> Arc<Engine> {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/test-fixtures/create-engine").join(name);
+        let _ = fs::remove_dir_all(&d);
+        let paths = Paths { files: d.join("f"), cache: d.join("c"), external: d.join("e"), native_lib: d.join("l") };
+        let vm = paths.vms_internal().join("vm");
+        fs::create_dir_all(vm.join(state::LOG_DIR)).unwrap();
+        fs::create_dir_all(paths.create_sockets()).unwrap();
+        state::write_spec(&vm, &Spec { name: "vm".into(), ..Default::default() }).unwrap();
+        Engine::new(paths, "vm", Arc::new(NoVm)).unwrap()
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn qemu_and_usbmuxd_logs_reach_the_step_log_and_the_diagnostics() {
+        let e = engine("follow");
+        e.begin_step("restore");
+        let tool = e.vm.join("tool.log");
+        let qemu = e.qemu_log();
+        let mux = e.vm.join(state::LOG_DIR).join(MUX_LOG);
+        append(&qemu, "earlier boot\n");
+        append(&mux, "earlier line\n");
+        e.mirror_log(&tool);
+        append(&qemu, "Invalid read at addr 0x10\n");
+        append(&mux, "Connected to v2.0 client\n");
+        e.pump_mirror();
+        let log = fs::read_to_string(state::step_log(&e.vm, "restore")).unwrap();
+        assert!(log.contains("[qemu] Invalid read at addr 0x10"), "{log}");
+        assert!(log.contains("[mux] Connected to v2.0 client"), "{log}");
+        assert!(!log.contains("earlier"), "{log}");
+        let facts = e.diagnostics();
+        assert!(facts.contains("QEMU log:\nearlier boot\nInvalid read at addr 0x10"), "{facts}");
+        assert!(facts.contains("usbmuxd:\nearlier line\nConnected to v2.0 client"), "{facts}");
+    }
+}

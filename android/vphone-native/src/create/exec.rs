@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -45,7 +45,8 @@ pub struct Exec {
     pub log: PathBuf,
     pub timeout: Option<Duration>,
     /// restore-wait.sh: once the output contains any of these, the program has this long to exit
-    /// by itself; then it is stopped and the run counts as a success.
+    /// by itself; then it is stopped and the run counts as a success. [`Exec::run_until`] can end
+    /// that time early.
     pub done_when: Option<(Vec<String>, Duration)>,
 }
 
@@ -88,6 +89,12 @@ impl Exec {
 
     /// Runs to the end; the exit code, or an error for a cancel or a time-out.
     pub fn run(&self, cancelled: &dyn Fn() -> bool) -> Result<i32, String> {
+        self.run_until(cancelled, &|| false)
+    }
+
+    /// As [`Exec::run`]. Once `done_when`'s text has appeared, `over` saying nothing more can come
+    /// from the device stops the program at once, without using the rest of its time.
+    pub fn run_until(&self, cancelled: &dyn Fn() -> bool, over: &dyn Fn() -> bool) -> Result<i32, String> {
         let mut scan_from = fs::metadata(&self.log).map_or(0, |m| m.len());
         let mut child = self.start()?;
         let mut started = Instant::now();
@@ -99,9 +106,18 @@ impl Exec {
                 started += TICK;
             }
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                return Ok(status
-                    .code()
-                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
+                return Ok(exit_code(status));
+            }
+            // Ahead of `cancelled`, which may be watching the VM: a VM that goes away after the
+            // restore finished has not failed it.
+            if let Some((needles, grace)) = &self.done_when {
+                if finished_at.is_none() && scan(&self.log, &mut scan_from, needles) {
+                    finished_at = Some(Instant::now());
+                }
+                if finished_at.is_some_and(|t| t.elapsed() >= *grace || over()) {
+                    stop_group(&mut child);
+                    return Ok(0);
+                }
             }
             if cancelled() {
                 stop_group(&mut child);
@@ -114,15 +130,6 @@ impl Exec {
                     self.program.file_name().unwrap_or_default().to_string_lossy(),
                     self.timeout.unwrap_or_default().as_secs() / 60
                 ));
-            }
-            if let Some((needles, grace)) = &self.done_when {
-                if finished_at.is_none() && scan(&self.log, &mut scan_from, needles) {
-                    finished_at = Some(Instant::now());
-                }
-                if finished_at.is_some_and(|t| t.elapsed() >= *grace) {
-                    stop_group(&mut child);
-                    return Ok(0);
-                }
             }
             std::thread::sleep(TICK);
         }
@@ -141,7 +148,7 @@ pub struct Background {
 impl Background {
     pub fn exited(&mut self) -> Option<i32> {
         match self.child.try_wait() {
-            Ok(Some(s)) => Some(s.code().unwrap_or(1)),
+            Ok(Some(s)) => Some(exit_code(s)),
             _ => None,
         }
     }
@@ -151,6 +158,11 @@ impl Drop for Background {
     fn drop(&mut self) {
         stop_group(&mut self.child);
     }
+}
+
+/// A program's status, with a signal as a shell reports it: 128 + its number.
+fn exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 fn stop_group(child: &mut Child) {
@@ -285,5 +297,52 @@ mod tests {
         let start = Instant::now();
         assert_eq!(e.run(&|| false), Ok(0));
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_finished_restore_ends_as_soon_as_the_device_has_gone() {
+        let p = log("done-over");
+        let mut e = exec(&["echo 'Status: Restore Finished'; sleep 30"], p);
+        e.done_when = Some((vec!["restore finished".into()], Duration::from_secs(60)));
+        let start = Instant::now();
+        assert_eq!(e.run_until(&|| false, &|| true), Ok(0));
+        assert!(start.elapsed() < Duration::from_secs(20), "the grace was not waited out");
+    }
+
+    #[test]
+    fn the_device_going_away_means_nothing_before_the_restore_finished() {
+        let p = log("done-not-yet");
+        let mut e = exec(&["sleep 30"], p);
+        e.done_when = Some((vec!["restore finished".into()], Duration::from_secs(60)));
+        let start = Instant::now();
+        let err = e.run_until(&move || start.elapsed() > Duration::from_millis(800), &|| true);
+        assert_eq!(err.unwrap_err(), "cancelled");
+    }
+
+    #[test]
+    fn a_finished_restore_is_seen_before_the_vm_watch_cancels() {
+        let p = log("done-before-cancel");
+        let mut e = exec(&["echo 'restore finished'; sleep 30"], p);
+        e.done_when = Some((vec!["restore finished".into()], Duration::from_secs(60)));
+        std::thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        // The VM watch only says "gone" once the output has had time to arrive.
+        let gone = move || start.elapsed() > Duration::from_millis(700);
+        assert_eq!(e.run_until(&gone, &gone), Ok(0));
+    }
+
+    #[test]
+    fn a_helper_killed_by_a_signal_reports_128_plus_it() {
+        assert_eq!(exec(&["kill -9 $$"], log("kill-run")).run(&|| false), Ok(137));
+        let mut running = exec(&["kill -9 $$"], log("kill-bg")).spawn().unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        let code = loop {
+            if let Some(code) = running.exited() {
+                break code;
+            }
+            assert!(Instant::now() < end, "it never ended");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(code, 137);
     }
 }

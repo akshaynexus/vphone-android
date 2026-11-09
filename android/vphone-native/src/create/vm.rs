@@ -33,8 +33,6 @@ pub const THREADS_LOG: &str = "threads.log";
 /// The latest per-thread list, for the VM activity screen.
 pub const THREADS_NOW: &str = "vm-threads.txt";
 const EXECUTABLE: &str = "libvphone_vm.so";
-/// dfu-up.sh's sleep: AVPBooter reaches DFU. A phone needs no less.
-const DFU_SETTLE: Duration = Duration::from_secs(20);
 /// The restore runs a full iOS restoreOS; 4 GiB (a 12 GB phone's normal default) is not enough.
 const MIN_CREATE_RAM_MIB: u32 = 6144;
 
@@ -53,6 +51,8 @@ pub struct RunSpec {
     pub paths: [String; 4],
     /// Written, with the reason, when this boot's display could not start.
     pub display_failed: String,
+    /// The images whose guest flushes QEMU ignores in this boot: synced once it has ended.
+    pub sync_on_exit: Vec<String>,
 }
 
 fn spec_path(paths: &Paths) -> PathBuf {
@@ -186,6 +186,61 @@ pub fn first_boot_spec(
     finish_spec(launch.args, env, run, paths, true)
 }
 
+/// The file a `-drive` value opens, undoing [`opt`]'s comma doubling.
+fn drive_file(drive: &str) -> Option<String> {
+    let mut rest = drive.strip_prefix("file=")?.chars().peekable();
+    let mut file = String::new();
+    while let Some(c) = rest.next() {
+        if c == ',' && rest.next_if_eq(&',').is_none() {
+            break;
+        }
+        file.push(c);
+    }
+    Some(file)
+}
+
+/// The restore's DFU boot, with its drives `cache=unsafe`: each flush costs the guest a host fsync,
+/// and the step is recorded only after QEMU exits and [`sync_images`] ran, so it can be redone.
+/// The ramdisk and first boots keep the guest's flushes, as their steps record progress mid-boot.
+fn with_unsafe_cache(mut spec: RunSpec) -> RunSpec {
+    spec.sync_on_exit = use_unsafe_cache(&mut spec.args);
+    spec
+}
+
+/// Appends `cache=unsafe` to each `-drive`. Returns their files.
+fn use_unsafe_cache(args: &mut [String]) -> Vec<String> {
+    let mut files = Vec::new();
+    for at in 1..args.len() {
+        if args[at - 1] != "-drive" {
+            continue;
+        }
+        args[at].push_str(",cache=unsafe");
+        if let Some(file) = drive_file(&args[at]) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    files
+}
+
+/// `cache=unsafe` left these only in the page cache: a phone restart would lose them, after the
+/// step that wrote them was recorded. Gone files have nothing left to keep.
+fn sync_images(files: &[PathBuf]) -> Result<(), String> {
+    for file in files {
+        let image = match fs::OpenOptions::new().write(true).open(file) {
+            Ok(image) => image,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot open {} to sync it: {e}", file.display())),
+        };
+        let started = Instant::now();
+        image.sync_all().map_err(|e| format!("cannot sync {}: {e}", file.display()))?;
+        log(TAG, &format!("synced {} in {:?}", file.display(), started.elapsed()));
+    }
+    Ok(())
+}
+
+/// Every caller is a setup boot: normal boots go through `launcher::build` alone.
 fn finish_spec(
     args: Vec<String>,
     env: Vec<(String, String)>,
@@ -206,6 +261,7 @@ fn finish_spec(
         paths: [&paths.files, &paths.cache, &paths.external, &paths.native_lib]
             .map(|p| p.to_string_lossy().into_owned()),
         display_failed: at("display-failed"),
+        sync_on_exit: Vec::new(),
     }
 }
 
@@ -257,7 +313,12 @@ pub fn run_spec_file(file: &Path) -> Result<(), String> {
         .spawn(move || {
             let code = runtime::run_qemu(qemu, spec.args);
             let _ = fs::write(&spec.exit_file, code.to_string());
-            std::process::exit(code);
+            // QEMU's threads are still alive: exit()'s atexit handlers would run under them.
+            // SAFETY: fflush(NULL) writes out every C stream, and _exit does not return.
+            unsafe {
+                libc::fflush(std::ptr::null_mut());
+                libc::_exit(code)
+            }
         })
         .map_err(|e| e.to_string())?;
     let _ = qemu_thread.join();
@@ -292,6 +353,8 @@ pub trait VmProcess: Send + Sync {
 struct Current {
     pid: i32,
     run: PathBuf,
+    /// [`RunSpec::sync_on_exit`] of this boot.
+    sync: Vec<PathBuf>,
 }
 
 pub struct Supervisor {
@@ -526,12 +589,20 @@ impl Supervisor {
         result
     }
 
+    /// The VM process has ended, by its own exit or ours. The record of the boot is cleared
+    /// after the sync, so a second `stop` meanwhile waits for the images too.
+    fn ended(&self) -> Result<(), String> {
+        let sync = self.current.lock().unwrap().as_ref().map(|c| c.sync.clone()).unwrap_or_default();
+        let synced = sync_images(&sync);
+        self.process.release();
+        let _ = fs::remove_file(pid_path(&self.paths));
+        *self.current.lock().unwrap() = None;
+        synced
+    }
+
     fn stop_inner(&self) -> Result<(), String> {
         let Some(pid) = self.pid().filter(|p| alive(*p)) else {
-            let _ = fs::remove_file(pid_path(&self.paths));
-            self.process.release();
-            *self.current.lock().unwrap() = None;
-            return Ok(());
+            return self.ended();
         };
         let _ = qmp::quit(&self.paths.qmp_socket());
         for (signal, wait) in [(0, 10), (libc::SIGTERM, 10), (libc::SIGKILL, 5)] {
@@ -550,10 +621,7 @@ impl Supervisor {
         if alive(pid) {
             return Err(format!("the VM process {pid} did not stop"));
         }
-        self.process.release();
-        let _ = fs::remove_file(pid_path(&self.paths));
-        *self.current.lock().unwrap() = None;
-        Ok(())
+        self.ended()
     }
 
     fn wait(&self, what: &str, limit: Duration, ready: impl Fn() -> bool) -> Result<(), String> {
@@ -637,7 +705,8 @@ impl Supervisor {
         };
         *self.display_status.lock().unwrap() = (setting.name().to_string(), note);
         let spec = match kind {
-            VmKind::Dfu | VmKind::Ramdisk => dfu_spec(&bundle, &cfg, &self.paths, run, vusb, show),
+            VmKind::Dfu => with_unsafe_cache(dfu_spec(&bundle, &cfg, &self.paths, run, vusb, show)),
+            VmKind::Ramdisk => dfu_spec(&bundle, &cfg, &self.paths, run, vusb, show),
             VmKind::FirstBoot { gfx: true } => {
                 first_boot_spec(&bundle, &cfg, &self.paths, run, show)
             }
@@ -666,6 +735,7 @@ impl Supervisor {
         *self.current.lock().unwrap() = Some(Current {
             pid,
             run: run.to_path_buf(),
+            sync: spec.sync_on_exit.iter().map(PathBuf::from).collect(),
         });
 
         if matches!(kind, VmKind::Dfu | VmKind::Ramdisk) {
@@ -675,14 +745,7 @@ impl Supervisor {
             if !alive(pid) {
                 return Err(self.fail_boot(self.died(run)));
             }
-            // AVPBooter reaches DFU (dfu-up.sh's sleep).
-            let end = Instant::now() + DFU_SETTLE;
-            while Instant::now() < end {
-                if (self.cancelled)() {
-                    return Err("cancelled".into());
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
+            // The probe that follows waits for DFU; the broker keeps reconnecting to this socket.
         }
         Ok(())
     }
@@ -698,9 +761,15 @@ impl Supervisor {
     pub fn adopt(&self, run: &Path) -> bool {
         match read_pid(&self.paths).filter(|p| alive(*p)) {
             Some(pid) => {
+                // The spec on disk is the boot this process was started from.
+                let sync = fs::read(spec_path(&self.paths))
+                    .ok()
+                    .and_then(|json| serde_json::from_slice::<RunSpec>(&json).ok())
+                    .map_or_else(Vec::new, |spec| spec.sync_on_exit);
                 *self.current.lock().unwrap() = Some(Current {
                     pid,
                     run: run.to_path_buf(),
+                    sync: sync.iter().map(PathBuf::from).collect(),
                 });
                 true
             }
@@ -791,6 +860,86 @@ mod tests {
             spec.env.iter().find(|(k, _)| k == "REIMS_VGPU_WINDOW").map(|(_, v)| v.as_str()),
             Some("0")
         );
+    }
+
+    #[test]
+    fn setup_drives_are_unsafe_and_listed_for_sync_and_normal_boots_are_untouched() {
+        let dir = fixture("drive-cache");
+        fs::write(dir.join("SEPStorage"), b"x").unwrap();
+        let b = Bundle::open(&dir).unwrap();
+        let v = dir.to_string_lossy();
+        let drives = |args: &[String]| -> Vec<String> {
+            args.windows(2).filter(|w| w[0] == "-drive").map(|w| w[1].clone()).collect()
+        };
+        let want: Vec<String> = ["nvram.bin", "Disk.img", "SEPStorage"].iter().map(|f| format!("{v}/{f}")).collect();
+        let boot = dfu_spec(&b, &cfg(), &paths(), &dir.join("r"), Path::new("/cv/vusb.sock"), false);
+        let restore = with_unsafe_cache(boot.clone());
+        let restore_drives = drives(&restore.args);
+        assert_eq!(restore_drives.len(), 5, "{restore_drives:?}");
+        assert!(restore_drives.iter().all(|d| d.ends_with(",cache=unsafe")), "{restore_drives:?}");
+        assert_eq!(restore.sync_on_exit, want);
+        for spec in [boot, first_boot_spec(&b, &cfg(), &paths(), &dir.join("r"), false)] {
+            let drives = drives(&spec.args);
+            assert_eq!(drives.len(), 5, "{drives:?}");
+            assert!(drives.iter().all(|d| !d.contains("cache=")), "{drives:?}");
+            assert!(spec.sync_on_exit.is_empty());
+        }
+        let normal = launcher::build(&b, &cfg(), &paths());
+        let drives = drives(&normal.args);
+        assert_eq!(drives.len(), 5, "{drives:?}");
+        assert!(drives.iter().all(|d| !d.contains("cache=")), "{drives:?}");
+    }
+
+    #[test]
+    fn a_drive_files_commas_are_undoubled() {
+        assert_eq!(drive_file("file=/a,,b/Disk.img,if=none,format=raw").as_deref(), Some("/a,b/Disk.img"));
+        assert_eq!(drive_file("file=/a/Disk.img").as_deref(), Some("/a/Disk.img"));
+        assert_eq!(drive_file("if=none,file=/a"), None);
+    }
+
+    struct NoProcess;
+    impl VmProcess for NoProcess {
+        fn start(&self, _: &Path, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn release(&self) {}
+        fn exit_reason(&self) -> String {
+            String::new()
+        }
+    }
+
+    fn supervisor(name: &str) -> (Supervisor, PathBuf) {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/test-fixtures").join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let p = Paths {
+            files: d.clone(),
+            cache: d.join("c"),
+            external: d.join("e"),
+            native_lib: "/nonexistent".into(),
+        };
+        (Supervisor::new(p, Arc::new(NoProcess), Arc::new(|| false), Arc::new(|| false)), d)
+    }
+
+    #[test]
+    fn stopping_an_ended_setup_boot_syncs_its_images() {
+        let (sup, d) = supervisor("vm-sync-ok");
+        let image = d.join("Disk.img");
+        fs::write(&image, b"disk").unwrap();
+        let gone = d.join("gone.img");
+        *sup.current.lock().unwrap() = Some(Current { pid: 0, run: d.clone(), sync: vec![image, gone] });
+        assert_eq!(sup.stop(), Ok(()));
+        assert!(sup.current.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_synced_fails_the_stop() {
+        let (sup, d) = supervisor("vm-sync-bad");
+        // A directory cannot be opened for writing, which reaches the sync's error path.
+        *sup.current.lock().unwrap() = Some(Current { pid: 0, run: d.clone(), sync: vec![d.clone()] });
+        let error = sup.stop().unwrap_err();
+        assert!(error.contains("cannot open"), "{error}");
+        assert!(sup.current.lock().unwrap().is_none(), "the boot is over either way");
     }
 
     #[test]

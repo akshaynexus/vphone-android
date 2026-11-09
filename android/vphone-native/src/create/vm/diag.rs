@@ -54,7 +54,84 @@ fn threads() -> Vec<Thread> {
         .collect()
 }
 
-#[cfg(target_arch = "aarch64")]
+/// Text built in a fixed buffer: all a crash handler can rely on in a process that has faulted.
+struct Line {
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl Line {
+    fn new() -> Line {
+        Line { buf: [0; 512], len: 0 }
+    }
+
+    fn add(&mut self, bytes: &[u8]) -> &mut Line {
+        let n = bytes.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        self
+    }
+
+    fn text(&mut self, text: &str) -> &mut Line {
+        self.add(text.as_bytes())
+    }
+
+    fn dec(&mut self, value: i64) -> &mut Line {
+        if value < 0 {
+            self.add(b"-");
+        }
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        let mut rest = value.unsigned_abs();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        self.add(&digits[i..])
+    }
+
+    fn hex(&mut self, value: u64) -> &mut Line {
+        let mut digits = [0u8; 16];
+        let mut i = digits.len();
+        let mut rest = value;
+        loop {
+            i -= 1;
+            digits[i] = b"0123456789abcdef"[(rest & 15) as usize];
+            rest >>= 4;
+            if rest == 0 {
+                break;
+            }
+        }
+        self.add(b"0x").add(&digits[i..])
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// A crashed thread's registers, as they were at the fault.
+struct Registers {
+    pc: u64,
+    lr: u64,
+    x8: u64,
+    x: [u64; 4],
+}
+
+/// The first thing a crash writes, needing nothing but the buffer.
+fn crash_header(out: &mut Line, signal: &str, code: i32, thread: &[u8], tid: i32, fault: u64, r: &Registers) {
+    out.text("CRASH ").text(signal).text(" code ").dec(code.into());
+    out.text(" in thread ").add(thread).text(" (tid ").dec(tid.into()).text(") at fault address ").hex(fault);
+    out.text("\n  pc ").hex(r.pc).text(" lr ").hex(r.lr).text(" x8 ").hex(r.x8);
+    out.text("\n  x0 ").hex(r.x[0]).text(" x1 ").hex(r.x[1]).text(" x2 ").hex(r.x[2]).text(" x3 ").hex(r.x[3]).text("\n");
+}
+
+// On a PC only for the tests, which fault for real in a child process.
+#[cfg(any(target_arch = "aarch64", all(test, target_arch = "x86_64")))]
 mod stack {
     use super::*;
     use std::os::raw::{c_int, c_void};
@@ -85,36 +162,80 @@ mod stack {
         if push(unsafe { _Unwind_GetIP(context) }) { 0 } else { 5 }
     }
 
+    /// Whether a crash has got as far as its stack walk: a fault during it ends the process.
+    static CRASHED: AtomicBool = AtomicBool::new(false);
+    #[cfg(test)]
+    pub static FAULT_IN_WALK: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn registers(context: *const libc::ucontext_t) -> Registers {
+        let m = &(*context).uc_mcontext;
+        Registers { pc: m.pc, lr: m.regs[30], x8: m.regs[8], x: [m.regs[0], m.regs[1], m.regs[2], m.regs[3]] }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn registers(context: *const libc::ucontext_t) -> Registers {
+        let g = &(*context).uc_mcontext.gregs;
+        let at = |i: i32| g[i as usize] as u64;
+        Registers { pc: at(libc::REG_RIP), lr: 0, x8: at(libc::REG_R8), x: [at(libc::REG_RDI), at(libc::REG_RSI), at(libc::REG_RDX), at(libc::REG_RCX)] }
+    }
+
     /// SIGSYS sent by this monitor (`tgkill`) asks for a stack: QEMU's threads block every signal
     /// but the fatal ones, so it is one of the few that reach them. Any other arrival is a crash.
     extern "C" fn handler(signal: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
         // SAFETY: the kernel passes valid siginfo and ucontext for an SA_SIGINFO handler.
-        let (pc, lr, regs, code) = unsafe {
-            let m = &(*(context as *const libc::ucontext_t)).uc_mcontext;
-            (m.pc as usize, m.regs[30] as usize, [m.regs[0], m.regs[1], m.regs[2], m.regs[3]], (*info).si_code)
-        };
+        let (r, code) = unsafe { (registers(context as *const libc::ucontext_t), (*info).si_code) };
         if signal == libc::SIGSYS && code == libc::SI_TKILL {
             // SAFETY: gettid has no preconditions.
             if unsafe { libc::gettid() } == STACK_TID.load(Ordering::SeqCst) {
                 STACK_LEN.store(0, Ordering::SeqCst);
-                push(pc);
-                push(lr);
+                push(r.pc as usize);
+                push(r.lr as usize);
                 // SAFETY: trace only writes to static memory.
                 unsafe { _Unwind_Backtrace(trace, std::ptr::null_mut()) };
                 STACK_DONE.store(true, Ordering::SeqCst);
             }
             return;
         }
-        crash(signal, code, unsafe { (*info).si_addr() } as usize, pc, lr, regs);
+        crash(signal, code, unsafe { (*info).si_addr() } as u64, &r);
     }
 
-    /// The process is ending, so ordinary allocation is acceptable; the alarm bounds a deadlock.
-    fn crash(signal: c_int, code: c_int, fault: usize, pc: usize, lr: usize, regs: [u64; 4]) {
-        // SAFETY: alarm, gettid and the signal calls have no preconditions.
+    /// The header goes out first and needs nothing but this stack, so a process too damaged for
+    /// what follows still says what happened. The process ends either way, and the signal it ends
+    /// with is this one.
+    fn crash(signal: c_int, code: c_int, fault: u64, r: &Registers) {
+        let mut name = [0u8; 16];
+        // SAFETY: gettid has no preconditions; PR_GET_NAME writes at most 16 bytes to `name`.
         let tid = unsafe {
-            libc::alarm(5);
+            libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr());
             libc::gettid()
         };
+        let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
+        let mut header = Line::new();
+        crash_header(&mut header, signal_name(signal), code, name, tid, fault, r);
+        let fd = CRASH_FD.load(Ordering::SeqCst);
+        // SAFETY: writes bytes this function owns.
+        unsafe { libc::write(fd, header.bytes().as_ptr().cast(), header.bytes().len()) };
+        if !CRASHED.swap(true, Ordering::SeqCst) {
+            walk(fd, r);
+        }
+        // SAFETY: restores the default action and re-raises.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    /// The stack and the names of the libraries, which take allocation and an unwinder working in
+    /// a process that has already faulted; the alarm bounds a deadlock in either.
+    fn walk(fd: c_int, r: &Registers) {
+        // SAFETY: alarm has no preconditions.
+        unsafe { libc::alarm(5) };
+        #[cfg(test)]
+        if FAULT_IN_WALK.load(Ordering::SeqCst) {
+            // SAFETY: not safe, and meant not to be: a second fault.
+            unsafe { std::ptr::write_volatile(0x20 as *mut u8, 1) };
+        }
         STACK_LEN.store(0, Ordering::SeqCst);
         // SAFETY: trace only writes to static memory.
         unsafe { _Unwind_Backtrace(trace, std::ptr::null_mut()) };
@@ -123,23 +244,14 @@ mod stack {
             // SAFETY: filled just above, by this thread alone.
             .map(|i| symbol(&maps, unsafe { *std::ptr::addr_of!(STACK[i]) }))
             .collect();
-        let name = fs::read_to_string(format!("/proc/self/task/{tid}/comm")).unwrap_or_default();
         let text = format!(
-            "CRASH {} code {code} in thread {} (tid {tid}) at fault address 0x{fault:x}\n  pc {}\n  lr {}\n  x0 0x{:x} x1 0x{:x} x2 0x{:x} x3 0x{:x}\n  stack: {}\n",
-            signal_name(signal),
-            name.trim(),
-            symbol(&maps, pc),
-            symbol(&maps, lr),
-            regs[0], regs[1], regs[2], regs[3],
+            "  pc {}\n  lr {}\n  stack: {}\n",
+            symbol(&maps, r.pc as usize),
+            symbol(&maps, r.lr as usize),
             frames.join(" < "),
         );
-        let fd = CRASH_FD.load(Ordering::SeqCst);
-        // SAFETY: writes bytes this function owns, then restores the default action and re-raises.
-        unsafe {
-            libc::write(fd, text.as_ptr().cast(), text.len());
-            libc::signal(signal, libc::SIG_DFL);
-            libc::raise(signal);
-        }
+        // SAFETY: writes bytes this function owns.
+        unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
     }
 
     fn signal_name(signal: c_int) -> &'static str {
@@ -196,11 +308,23 @@ fn resources(files: &std::path::Path) -> String {
             .unwrap_or(0)
     };
     let free = crate::create::engine::free_bytes(files) >> 30;
+    // A process near its limit of mappings fails its next mmap, which QEMU treats as fatal.
+    let maps = fs::read("/proc/self/maps").map_or(0, |b| b.iter().filter(|c| **c == b'\n').count());
     format!(
-        "rss {}M avail {}M disk {}G",
+        "rss {}M avail {}M disk {}G maps {maps}",
         kb(&status, "VmRSS:") / 1024,
         kb(&meminfo, "MemAvailable:") / 1024,
         free
+    )
+}
+
+/// What Android has this process confined to, for telling a kill from a crash.
+fn startup_line(status: &str, cgroup: &str, oom_score_adj: &str) -> String {
+    let cpus = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:")).map_or("?", str::trim);
+    format!(
+        "startup cpus {cpus} cgroup {} oom_score_adj {}",
+        cgroup.trim().replace('\n', "; "),
+        oom_score_adj.trim()
     )
 }
 
@@ -259,6 +383,8 @@ pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
         return;
     };
     CRASH_FD.store(out.as_raw_fd(), Ordering::SeqCst);
+    let read = |path: &str| fs::read_to_string(path).unwrap_or_default();
+    let _ = writeln!(out, "{}", startup_line(&read("/proc/self/status"), &read("/proc/self/cgroup"), &read("/proc/self/oom_score_adj")));
     #[cfg(target_arch = "aarch64")]
     let signal = stack::install();
     let _ = std::thread::Builder::new().name("vm-monitor".into()).spawn(move || {
@@ -331,5 +457,90 @@ mod tests {
         assert_eq!(symbol(&maps, 0x1010), "libqemu-vphone.so+0x510");
         assert_eq!(symbol(&maps, 0x8010), "jit:0x8010");
         assert_eq!(symbol(&maps, 0x7000), "?:0x7000");
+    }
+
+    #[test]
+    fn a_crash_header_needs_only_its_buffer_and_keeps_the_format_shown() {
+        let mut out = Line::new();
+        let r = Registers { pc: 0x1234, lr: 0xabc, x8: 0xdd, x: [0, 1, 2, u64::MAX] };
+        crash_header(&mut out, "SIGSEGV", -6, b"CPU 0/TCG", 77, 0x10, &r);
+        assert_eq!(
+            String::from_utf8_lossy(out.bytes()),
+            "CRASH SIGSEGV code -6 in thread CPU 0/TCG (tid 77) at fault address 0x10\n  pc 0x1234 lr 0xabc x8 0xdd\n  x0 0x0 x1 0x1 x2 0x2 x3 0xffffffffffffffff\n"
+        );
+    }
+
+    #[test]
+    fn a_full_buffer_cuts_the_text_short() {
+        let mut out = Line::new();
+        for _ in 0..40 {
+            out.hex(u64::MAX).dec(i64::MIN);
+        }
+        assert_eq!(out.bytes().len(), 512);
+    }
+
+    #[test]
+    fn startup_says_what_confines_the_process() {
+        let line = startup_line("Name:\tx\nCpus_allowed_list:\t0-7\nVmRSS: 1 kB\n", "0::/uid_10123/pid_456\n1:cpu:/x\n", "905\n");
+        assert_eq!(line, "startup cpus 0-7 cgroup 0::/uid_10123/pid_456; 1:cpu:/x oom_score_adj 905");
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    mod crashes {
+        use super::super::*;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Command;
+
+        /// The body of the child process the tests below start: the handler, then a real fault.
+        #[test]
+        #[ignore = "run by the tests below, in a process of its own"]
+        fn crash_child() {
+            let Ok(log) = std::env::var("VPHONE_CRASH_LOG") else {
+                return;
+            };
+            let out = File::create(log).unwrap();
+            CRASH_FD.store(out.as_raw_fd(), Ordering::SeqCst);
+            std::mem::forget(out);
+            stack::install();
+            stack::FAULT_IN_WALK.store(std::env::var_os("VPHONE_CRASH_TWICE").is_some(), Ordering::SeqCst);
+            // SAFETY: not safe, and meant not to be: this process is here to crash.
+            unsafe { std::ptr::write_volatile(0x10 as *mut u8, 1) };
+        }
+
+        fn crash(name: &str, twice: bool) -> (Option<i32>, String) {
+            let log = std::env::temp_dir().join(format!("vphone-crash-{}-{name}", std::process::id()));
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--ignored", "--exact", "create::vm::diag::tests::crashes::crash_child"]).env("VPHONE_CRASH_LOG", &log);
+            if twice {
+                child.env("VPHONE_CRASH_TWICE", "1");
+            }
+            let status = child.output().unwrap().status;
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            let _ = fs::remove_file(&log);
+            (status.signal(), text)
+        }
+
+        fn assert_header(text: &str) {
+            assert!(text.starts_with("CRASH SIGSEGV code 1 in thread "), "{text}");
+            assert!(text.contains("at fault address 0x10\n  pc 0x"), "{text}");
+            assert!(text.contains(" x8 0x"), "{text}");
+            assert!(text.contains("\n  x0 0x"), "{text}");
+        }
+
+        #[test]
+        fn a_fault_is_recorded_and_ends_the_process_by_its_own_signal() {
+            let (signal, text) = crash("once", false);
+            assert_eq!(signal, Some(libc::SIGSEGV), "{text}");
+            assert_header(&text);
+            assert!(text.contains("\n  stack: "), "the stack follows: {text}");
+        }
+
+        #[test]
+        fn a_second_fault_during_the_walk_still_leaves_the_header() {
+            let (signal, text) = crash("twice", true);
+            assert_eq!(signal, Some(libc::SIGSEGV), "{text}");
+            assert_header(&text);
+            assert!(!text.contains("stack: "), "the walk faulted: {text}");
+        }
     }
 }

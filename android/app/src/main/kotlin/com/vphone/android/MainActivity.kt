@@ -41,6 +41,7 @@ class MainActivity : Activity() {
     private lateinit var list: LinearLayout
     private var importWasActive = false
     private var lastRunLog = ""
+    private var storageGeneration = 0L
 
     private val poll = object : Runnable {
         override fun run() {
@@ -108,6 +109,11 @@ class MainActivity : Activity() {
             addView(resumeCreate)
             addView(createButton)
             addView(importButton)
+            addView(Button(this@MainActivity).apply {
+                text = "Storage"
+                isAllCaps = false
+                setOnClickListener { startActivity(Intent(this@MainActivity, StorageActivity::class.java)) }
+            })
             addView(importRow)
             addView(list)
         }
@@ -188,6 +194,11 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
+        val cleaned = StorageNative.generation()
+        if (cleaned != storageGeneration) {
+            storageGeneration = cleaned
+            showVms()
+        }
         val creating = Native.createPending()
         resumeCreate.visibility = if (creating.isEmpty()) View.GONE else View.VISIBLE
         if (creating.isNotEmpty()) resumeCreate.text = "Creating $creating: continue"

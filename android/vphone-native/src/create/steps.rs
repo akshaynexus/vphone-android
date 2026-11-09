@@ -283,25 +283,35 @@ fn probe(e: &Engine, run: &std::path::Path) -> Result<(), String> {
 }
 
 /// Runs `exec` while the VM must stay up: a dead QEMU would otherwise leave the tool waiting.
+/// Either way it fails, what the VM was doing is read here, before anything stops it: a QEMU that
+/// dies is often only seen as the tool exiting a moment later.
 fn run_with_vm(e: &Arc<Engine>, exec: super::exec::Exec, what: &str) -> Result<(), String> {
     let log = exec.log.to_string_lossy().into_owned();
     let vm_gone = std::cell::Cell::new(false);
-    let code = exec.run(&|| {
-        let alive = e.sup.alive();
-        if !alive {
-            vm_gone.set(true);
-        }
-        e.is_cancelled().is_err() || !alive
-    });
+    let usbmux = e.usbmux_socket();
+    let code = exec.run_until(
+        &|| {
+            let alive = e.sup.alive();
+            if !alive {
+                vm_gone.set(true);
+            }
+            e.is_cancelled().is_err() || !alive
+        },
+        &|| !e.sup.alive() || installer::device_left_usb(&usbmux),
+    );
+    let failure = |headline: String| {
+        format!(
+            "{headline}\nIts last output:\n{}\n\n{}",
+            crate::runtime::log_tail(&log, 3000).trim(),
+            e.diagnostics()
+        )
+    };
     if vm_gone.get() {
-        return Err(format!("the VM stopped during {what}: {}", e.sup.exit_detail()));
+        return Err(failure(format!("the VM stopped during {what}")));
     }
     match code? {
         0 => Ok(()),
-        c => Err(format!(
-            "{what} failed with status {c}\nIts last output:\n{}",
-            crate::runtime::log_tail(&log, 3000).trim()
-        )),
+        c => Err(failure(format!("{what} failed with status {c}"))),
     }
 }
 
@@ -323,6 +333,8 @@ fn restore(e: &Arc<Engine>) -> Result<(), String> {
         Some(Duration::from_secs(8 * 3600)),
     );
     // restore-wait.sh: a device that does not come back after a finished restore is not a failure.
+    // The time is a limit for a tool and a device that both go quiet; `run_with_vm` ends it as soon
+    // as the tool exits, the VM stops or the device leaves USB.
     exec.done_when = Some((vec!["status: restore finished".into(), "restore finished".into()], Duration::from_secs(120)));
     run_with_vm(e, exec, "the restore")?;
     e.sup.stop()
@@ -476,6 +488,71 @@ mod tests {
     }
 
     static CANCELS: [StepDef; 1] = [def!("x", |_| Err("cancelled".to_string()))];
+
+    fn shell(e: &Engine, name: &str, script: &str) -> crate::create::exec::Exec {
+        crate::create::exec::Exec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![],
+            cwd: e.vm.clone(),
+            log: e.vm.join(name),
+            timeout: None,
+            done_when: None,
+        }
+    }
+
+    /// A process standing in for the VM, adopted the way a boot's own is.
+    fn stand_in_vm(e: &Engine) -> std::process::Child {
+        let child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let pid_file = crate::create::vm::pid_path(&e.paths);
+        fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+        fs::write(pid_file, child.id().to_string()).unwrap();
+        assert!(e.sup.adopt(&e.vm.join(".runs-dfu")));
+        child
+    }
+
+    #[test]
+    fn a_tool_that_fails_with_the_vm_up_says_it_is_still_running() {
+        let e = engine("tool-fails");
+        let mut vm = stand_in_vm(&e);
+        let exec = shell(&e, "t.log", "echo the tool said this; exit 3");
+        let err = run_with_vm(&e, exec, "the restore").unwrap_err();
+        let _ = vm.kill();
+        let _ = vm.wait();
+        assert!(err.contains("the restore failed with status 3"), "{err}");
+        assert!(err.contains("the tool said this"), "{err}");
+        assert!(err.contains("How the VM ended: it is still running"), "{err}");
+    }
+
+    #[test]
+    fn a_qemu_death_just_before_the_tool_exits_says_how_qemu_ended() {
+        let e = engine("qemu-then-tool");
+        let mut vm = stand_in_vm(&e);
+        let exec = shell(&e, "t.log", &format!("kill -9 {}; exit 3", vm.id()));
+        let err = run_with_vm(&e, exec, "the restore").unwrap_err();
+        let _ = vm.wait();
+        assert!(err.contains("How the VM ended: QEMU exited."), "{err}");
+        assert!(!err.contains("still running"), "{err}");
+    }
+
+    #[test]
+    fn a_vm_gone_before_the_restore_finished_is_a_failure() {
+        let e = engine("vm-gone");
+        let exec = shell(&e, "t.log", "sleep 30");
+        let err = run_with_vm(&e, exec, "the restore").unwrap_err();
+        assert!(err.starts_with("the VM stopped during the restore"), "{err}");
+        assert!(err.contains("How the VM ended:"), "{err}");
+    }
+
+    #[test]
+    fn a_vm_stopping_after_a_finished_restore_is_not_a_failure() {
+        let e = engine("vm-gone-after");
+        let mut exec = shell(&e, "t.log", "echo 'Status: Restore Finished'; sleep 30");
+        exec.done_when = Some((vec!["restore finished".into()], Duration::from_secs(60)));
+        let start = Instant::now();
+        run_with_vm(&e, exec, "the restore").unwrap();
+        assert!(start.elapsed() < Duration::from_secs(20), "the grace was not waited out");
+    }
 
     #[test]
     fn a_cancelled_step_is_not_recorded_and_the_status_says_pending() {

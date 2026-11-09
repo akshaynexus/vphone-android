@@ -55,9 +55,9 @@ pub const FILTER_ERRORS: i32 = 4;
 
 /// Who wrote a line, and the line without the mark the step log gave it.
 pub fn split_source(line: &str) -> (u8, &str) {
-    if let Some(body) = line.strip_prefix("[guest] ").or_else(|| line.strip_prefix("[vm] ")) {
+    if let Some(body) = ["[guest] ", "[vm] ", "[qemu] "].iter().find_map(|p| line.strip_prefix(p)) {
         (SRC_GUEST, body)
-    } else if let Some(body) = line.strip_prefix("[usb] ") {
+    } else if let Some(body) = ["[usb] ", "[mux] "].iter().find_map(|p| line.strip_prefix(p)) {
         (SRC_USB, body)
     } else {
         (SRC_TOOL, line)
@@ -1410,6 +1410,8 @@ mod tests {
     #[test]
     fn sources_and_errors_are_told_apart() {
         assert_eq!(split_source("[guest] OpenBootROM: x"), (SRC_GUEST, "OpenBootROM: x"));
+        assert_eq!(split_source("[qemu] vusb: host message dropped"), (SRC_GUEST, "vusb: host message dropped"));
+        assert_eq!(split_source("[mux] RX error"), (SRC_USB, "RX error"));
         assert_eq!(split_source("[usb] vusbd: sent 8 MiB in 7.0 s"), (SRC_USB, "vusbd: sent 8 MiB in 7.0 s"));
         assert_eq!(split_source("Waiting for device to enter restore mode...").0, SRC_TOOL);
         for bad in ["ERROR: Unable to connect", "step restore failed", "panic(cpu 0 caller 0x1): x", "the restore timed out"] {

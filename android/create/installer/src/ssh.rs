@@ -6,10 +6,11 @@ use crate::progress::{check_cancel, Progress};
 use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh::client::{self, Handle as ClientHandle};
 use russh::keys::PublicKeyOrCertificate;
-use russh::{ChannelMsg, Disconnect};
+use russh::{cipher, mac, ChannelMsg, Disconnect, Preferred};
+use std::borrow::Cow;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Builder, Runtime};
@@ -24,15 +25,58 @@ pub const SFTP_SERVER: &str = "/usr/libexec/sftp-server";
 /// The guest is emulated: a single request can take far longer than the library's default.
 const SFTP_TIMEOUT_SECS: u64 = 600;
 
-struct AcceptAny;
+struct AcceptAny {
+    negotiated: Arc<Mutex<String>>,
+}
 
 impl client::Handler for AcceptAny {
     type Error = russh::Error;
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        names: &russh::Names,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        *self.negotiated.lock().unwrap() = format!(
+            "cipher={} client_mac={} server_mac={}",
+            names.cipher.as_ref(),
+            names.client_mac.as_ref(),
+            names.server_mac.as_ref()
+        );
+        Ok(())
+    }
 
     async fn check_server_key(&mut self, _key: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         // The tools this replaces use StrictHostKeyChecking=no: the peer is a
         // ramdisk reached over the VM's own virtual USB.
         Ok(true)
+    }
+}
+
+/// The guest computes these in software under TCG, so the cheapest come first. The rest are
+/// russh's defaults, for a server that offers neither: hmac-sha1 is not among those, and is here
+/// for a link that is the VM's own virtual USB.
+const CIPHERS: &[cipher::Name] = &[
+    cipher::AES_128_CTR,
+    cipher::CHACHA20_POLY1305,
+    cipher::AES_256_GCM,
+    cipher::AES_256_CTR,
+    cipher::AES_192_CTR,
+];
+const MACS: &[mac::Name] = &[
+    mac::HMAC_SHA1,
+    mac::HMAC_SHA512_ETM,
+    mac::HMAC_SHA256_ETM,
+    mac::HMAC_SHA512,
+    mac::HMAC_SHA256,
+];
+
+fn preferred_algorithms() -> Preferred {
+    Preferred {
+        cipher: Cow::Borrowed(CIPHERS),
+        mac: Cow::Borrowed(MACS),
+        ..Preferred::DEFAULT
     }
 }
 
@@ -79,6 +123,7 @@ pub struct GuestSsh {
     runtime: Runtime,
     client: ClientHandle<AcceptAny>,
     sftp_program: String,
+    negotiated: Arc<Mutex<String>>,
 }
 
 /// Options for tests and unusual hosts; defaults match the ramdisk.
@@ -114,6 +159,7 @@ impl GuestSsh {
             .map_err(|e| Error::io("tokio", e))?;
         let config = Arc::new(client::Config {
             keepalive_interval: Some(Duration::from_secs(15)),
+            preferred: preferred_algorithms(),
             ..Default::default()
         });
         let timeout = options.connect_timeout;
@@ -125,8 +171,10 @@ impl GuestSsh {
             sftp_program,
             ..
         } = options;
+        let negotiated = Arc::new(Mutex::new(String::new()));
+        let handler_negotiated = negotiated.clone();
         let client = runtime.block_on(async {
-            let handler = AcceptAny;
+            let handler = AcceptAny { negotiated: handler_negotiated };
             let client = tokio::time::timeout(timeout, async {
                 match target {
                     Target::Unix(path) => {
@@ -186,7 +234,13 @@ impl GuestSsh {
             runtime,
             client,
             sftp_program,
+            negotiated,
         })
+    }
+
+    /// The cipher and MACs this session agreed on.
+    pub fn negotiated(&self) -> String {
+        self.negotiated.lock().unwrap().clone()
     }
 
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
@@ -327,5 +381,78 @@ impl GuestSsh {
         self.runtime.block_on(async {
             let _ = client.disconnect(Disconnect::ByApplication, "", "").await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn the_cheap_algorithms_lead_and_the_defaults_remain_as_fallback() {
+        let preferred = preferred_algorithms();
+        assert_eq!(preferred.cipher[0], cipher::AES_128_CTR);
+        assert_eq!(preferred.mac[0], mac::HMAC_SHA1);
+        for name in Preferred::DEFAULT.cipher.iter() {
+            assert!(preferred.cipher.contains(name), "{name:?} dropped");
+        }
+        for name in Preferred::DEFAULT.mac.iter() {
+            assert!(preferred.mac.contains(name), "{name:?} dropped");
+        }
+    }
+
+    /// Against the ramdisk's dropbear: built from source by the setup in
+    /// `android/scripts/build-create-steps.sh`. The login is refused here (no preload shim), which
+    /// is an encrypted round trip after the algorithms were agreed.
+    #[test]
+    fn dropbear_2016_74_agrees_on_aes128_ctr_and_hmac_sha1() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build/create-steps");
+        let base = root.join("dropbear/src");
+        assert!(base.join("dropbear").exists(), "build dropbear 2016.74 first");
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        let dir = tempfile::Builder::new().prefix("neg").tempdir_in(root.join("tmp")).unwrap();
+        let key = dir.path().join("host_key");
+        let generated = Command::new(base.join("dropbearkey"))
+            .args(["-t", "ecdsa", "-f"])
+            .arg(&key)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(generated.success());
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut server = Command::new(base.join("dropbear"))
+            .args(["-F", "-p", &format!("127.0.0.1:{port}"), "-r"])
+            .arg(&key)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let negotiated = Arc::new(Mutex::new(String::new()));
+        let seen = negotiated.clone();
+        let runtime = Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let refused = runtime.block_on(async move {
+            let config = Arc::new(client::Config {
+                preferred: preferred_algorithms(),
+                ..Default::default()
+            });
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let mut client = client::connect_stream(config, stream, AcceptAny { negotiated: seen }).await.unwrap();
+            !client.authenticate_password(USER, "not-the-password").await.unwrap().success()
+        });
+        let _ = server.kill();
+        let _ = server.wait();
+        assert!(refused, "the wrong password must be refused");
+        let negotiated = negotiated.lock().unwrap().clone();
+        println!("negotiated: {negotiated}");
+        assert_eq!(negotiated, "cipher=aes128-ctr client_mac=hmac-sha1 server_mac=hmac-sha1");
     }
 }

@@ -44,6 +44,18 @@ true"#;
 const MOUNT_SH: &str = "/usr/bin/mount_filesystems; /sbin/mount";
 const UNMOUNT_SH: &str = "sync; /sbin/umount /mnt2; /sbin/umount /mnt6; /sbin/umount /mnt1; sync";
 
+/// tools/restore-wait.sh: how long the tool may go on after the device said the restore finished,
+/// when neither it nor the device gives any other sign of being done.
+const RESTORE_EXIT_GRACE: Duration = Duration::from_secs(120);
+const RESTORE_POLL: Duration = Duration::from_secs(1);
+/// How long usbmuxd has to name an attached device, which it does as soon as it is asked.
+const USBMUX_ANSWER: Duration = Duration::from_secs(2);
+/// A ramdisk boots slowly on a phone; this is what the wait came to at its old pace. Time the
+/// person has the creation paused does not count.
+const SSH_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
+/// Between attempts that failed straight away; one still waiting blocks in `connect` instead.
+const SSH_RETRY: Duration = Duration::from_secs(1);
+
 fn cancellable_sleep(host: &dyn Progress, duration: Duration) -> Result<()> {
     let end = Instant::now() + duration;
     while Instant::now() < end {
@@ -286,7 +298,7 @@ pub fn gpu_driver(params: &GpuParams) -> Result<GpuDriver> {
     let args = vec!["restore".to_owned(), "-l".to_owned(), library, name, "-v".to_owned()];
     let env = [("VPHONE_RESTORE_TIMEOUT_SCALE".to_owned(), "10".to_owned())];
     let mut helper = host.spawn_helper(CLI, &args, &env, &log).map_err(Error::msg)?;
-    wait_restore(host, helper.as_mut(), &log)?;
+    wait_restore(host, helper.as_mut(), &log, RESTORE_EXIT_GRACE)?;
     helper.stop();
     let finished = log_contains_finished(&log)?;
     if !finished {
@@ -314,38 +326,71 @@ fn log_contains_finished(log: &Path) -> Result<bool> {
     Ok(text.to_ascii_lowercase().contains("restore finished"))
 }
 
-/// tools/restore-wait.sh: the tool can wait forever after a finished restore, so
-/// once the device said it finished the tool gets 120 s, then it counts as done.
-fn wait_restore(host: &dyn Host, helper: &mut dyn BackgroundHelper, log: &Path) -> Result<()> {
+/// Whether usbmuxd says no device is attached. An error reaching it says nothing either way, so
+/// it counts as still there.
+pub fn device_left_usb(usbmux_socket: &Path) -> bool {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    matches!(
+        vusb_portfwd::wait_for_device(usbmux_socket, USBMUX_ANSWER),
+        Err(e) if matches!(e.kind(), TimedOut | WouldBlock)
+    )
+}
+
+fn tail_of(log: &Path) -> String {
+    let tail = fs::read(log).unwrap_or_default();
+    String::from_utf8_lossy(&tail[tail.len().saturating_sub(3000)..]).trim().to_owned()
+}
+
+/// tools/restore-wait.sh: the tool can wait forever after a finished restore, so once the device
+/// has said it finished, the wait ends when the tool exits, the VM stops or the device leaves USB,
+/// and after `grace` if none of those happens. A VM that stops before then has failed the restore.
+fn wait_restore(host: &dyn Host, helper: &mut dyn BackgroundHelper, log: &Path, grace: Duration) -> Result<()> {
     let mut offset = 0u64;
-    let mut finished_at = None;
+    let mut finished_at: Option<Instant> = None;
     loop {
         if let Some(code) = helper.finished() {
             if code != 0 && finished_at.is_none() {
-                let tail = fs::read(log).unwrap_or_default();
-                let tail = String::from_utf8_lossy(&tail[tail.len().saturating_sub(3000)..]).into_owned();
-                bail!("restore exited with status {code}\nIts last output:\n{}\n\n{}", tail.trim(), host.diagnostics());
+                bail!("restore exited with status {code}\nIts last output:\n{}\n\n{}", tail_of(log), host.diagnostics());
             }
             return Ok(());
         }
         if finished_at.is_none() {
             if let Ok(mut f) = File::open(log) {
-                if f.seek(SeekFrom::Start(offset.saturating_sub(64))).is_ok() {
+                // A little of what was read before, for a line split across two reads.
+                let start = offset.saturating_sub(64);
+                if f.seek(SeekFrom::Start(start)).is_ok() {
                     let mut chunk = Vec::new();
                     let _ = f.read_to_end(&mut chunk);
-                    offset += chunk.len() as u64;
+                    offset = start + chunk.len() as u64;
                     if String::from_utf8_lossy(&chunk).to_ascii_lowercase().contains("restore finished") {
                         finished_at = Some(Instant::now());
-                        host.log("the device reports the restore finished; waiting up to 120 s for the tool");
+                        host.log(&format!("the device reports the restore finished; waiting up to {} s for the tool", grace.as_secs()));
                     }
                 }
             }
         }
-        if finished_at.is_some_and(|t: Instant| t.elapsed() >= Duration::from_secs(120)) {
-            host.log("the tool is still waiting for the device to come back; stopping it (the restore itself finished)");
-            return Ok(());
+        // After the log, so a VM that went away once the restore finished reads as just that.
+        let vm_alive = host.vm_alive();
+        match finished_at {
+            None if !vm_alive => {
+                bail!("the VM stopped during the restore\nIts last output:\n{}\n\n{}", tail_of(log), host.diagnostics());
+            }
+            None => {}
+            Some(_) if !vm_alive => {
+                host.log("the VM stopped after the restore finished; not waiting for the tool");
+                return Ok(());
+            }
+            Some(_) if device_left_usb(&host.usbmux_socket()) => {
+                host.log("the device has left USB after the restore finished; not waiting for the tool");
+                return Ok(());
+            }
+            Some(t) if t.elapsed() >= grace => {
+                host.log("the tool is still waiting for the device to come back; stopping it (the restore itself finished)");
+                return Ok(());
+            }
+            Some(_) => {}
         }
-        cancellable_sleep(host, Duration::from_secs(5))?;
+        cancellable_sleep(host, RESTORE_POLL)?;
     }
 }
 
@@ -362,11 +407,20 @@ pub struct CfwParams<'a> {
     pub log: &'a Path,
 }
 
+/// Until the ramdisk's SSH answers: `connect` blocks until the device's port accepts, so nothing
+/// here sleeps but the short gap after an attempt that failed straight away.
 fn ssh_wait(host: &dyn Host, log: &Path) -> Result<GuestSsh> {
+    const NOTE_EVERY: Duration = Duration::from_secs(5 * 60);
     let socket = host.usbmux_socket();
     let mut last = String::new();
-    for tries in 0..60 {
+    let mut spent = Duration::ZERO;
+    let mut noted = Duration::ZERO;
+    while spent < SSH_WAIT_LIMIT {
         check_cancel(host)?;
+        if !host.vm_alive() {
+            bail!("the VM stopped while waiting for the SSH ramdisk\n{}", host.diagnostics());
+        }
+        let began = Instant::now();
         let attempt = (|| -> Result<GuestSsh> {
             let stream = vusb_portfwd::connect(&socket, 22, Duration::from_secs(30))
                 .map_err(|e| Error::Ssh(format!("usbmux: {e}")))?;
@@ -379,12 +433,15 @@ fn ssh_wait(host: &dyn Host, log: &Path) -> Result<GuestSsh> {
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(e) => last = e.to_string(),
         }
-        if (tries + 1) % 10 == 0 {
+        // Counted before the sleep, which a pause holds.
+        spent += began.elapsed() + SSH_RETRY;
+        if spent >= noted + NOTE_EVERY {
+            noted = spent;
             host.log(&format!("SSH ramdisk not answering yet ({last}); see {}", log.display()));
         }
-        cancellable_sleep(host, Duration::from_secs(30))?;
+        cancellable_sleep(host, SSH_RETRY)?;
     }
-    bail!("the SSH ramdisk did not answer in 30 min: {last}")
+    bail!("the SSH ramdisk did not answer in {} min: {last}", SSH_WAIT_LIMIT.as_secs() / 60)
 }
 
 /// `do_cfw`: build and boot the SSH ramdisk, install the CFW, and leave the
@@ -422,7 +479,7 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         fs::create_dir_all(&run).map_err(|e| Error::path(&run, e))?;
         host.start_vm(VmKind::Ramdisk, &vm, &run).map_err(Error::msg)?;
         let ecid = format!("0x{:016x}", params.ecid);
-        cli_ok(&["recovery-probe".into(), "--ecid".into(), ecid.clone(), "--timeout".into(), "180".into()], &[], None)?;
+        cli_ok(&["recovery-probe".into(), "--ecid".into(), ecid.clone(), "--timeout".into(), "600".into()], &[], None)?;
         // --boot-ramdisk ends by waiting for restore mode, which the SSH ramdisk
         // never enters: it runs in the background until SSH answers.
         let boot_log = run.join("boot-ramdisk.log");
@@ -539,4 +596,203 @@ pub fn first_boot(params: &FirstBoot) -> Result<()> {
         host.log(&format!("wrote {wrote} 1x logo(s); the logo shows from the next boot"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct FakeHost {
+        alive: AtomicBool,
+        lines: Mutex<Vec<String>>,
+        usbmux: PathBuf,
+    }
+
+    impl FakeHost {
+        fn new(alive: bool, usbmux: PathBuf) -> FakeHost {
+            FakeHost { alive: AtomicBool::new(alive), lines: Mutex::default(), usbmux }
+        }
+        fn said(&self, text: &str) -> bool {
+            self.lines.lock().unwrap().iter().any(|l| l.contains(text))
+        }
+    }
+
+    impl Progress for FakeHost {
+        fn log(&self, line: &str) {
+            self.lines.lock().unwrap().push(line.to_owned());
+        }
+        fn progress(&self, _: u64, _: u64, _: &str) {}
+    }
+
+    impl Host for FakeHost {
+        fn start_vm(&self, _: VmKind, _: &Path, _: &Path) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn stop_vm(&self, _: &Path) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn vm_alive(&self) -> bool {
+            self.alive.load(Ordering::SeqCst)
+        }
+        fn serial_log(&self) -> PathBuf {
+            PathBuf::new()
+        }
+        fn diagnostics(&self) -> String {
+            "HOW THE VM ENDED".to_owned()
+        }
+        fn vphoned_rpc(&self, _: &str, _: serde_json::Value, _: Duration) -> std::result::Result<serde_json::Value, String> {
+            Err("no guest".to_owned())
+        }
+        fn run_helper(&self, _: &str, _: &[String], _: &[(String, String)], _: &Path, _: Option<Duration>) -> std::result::Result<i32, String> {
+            Ok(0)
+        }
+        fn spawn_helper(&self, _: &str, _: &[String], _: &[(String, String)], _: &Path) -> std::result::Result<Box<dyn BackgroundHelper>, String> {
+            Err("not used".to_owned())
+        }
+        fn usbmux_socket(&self) -> PathBuf {
+            self.usbmux.clone()
+        }
+    }
+
+    /// A tool that is still running, or has ended with this status.
+    struct Tool(Option<i32>);
+
+    impl BackgroundHelper for Tool {
+        fn finished(&mut self) -> Option<i32> {
+            self.0
+        }
+        fn stop(self: Box<Self>) {}
+    }
+
+    /// usbmuxd's side of LISTEN, naming `device` or nothing, for every client.
+    fn fake_usbmuxd(path: &Path, device: bool) {
+        fn message(kind: u32, body: &[u8]) -> Vec<u8> {
+            let mut m = Vec::new();
+            m.extend_from_slice(&(16 + body.len() as u32).to_le_bytes());
+            m.extend_from_slice(&0u32.to_le_bytes());
+            m.extend_from_slice(&kind.to_le_bytes());
+            m.extend_from_slice(&1u32.to_le_bytes());
+            m.extend_from_slice(body);
+            m
+        }
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for client in listener.incoming() {
+                let mut client = client.unwrap();
+                let mut header = [0u8; 16];
+                client.read_exact(&mut header).unwrap();
+                client.write_all(&message(1, &0u32.to_le_bytes())).unwrap();
+                if device {
+                    client.write_all(&message(4, &[0u8; 268])).unwrap();
+                }
+                held.push(client);
+            }
+        });
+    }
+
+    fn setup(text: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("restore.log");
+        fs::write(&log, text).unwrap();
+        (dir, log)
+    }
+
+    const GRACE: Duration = Duration::from_secs(60);
+    const FINISHED: &str = "Status: Restore Finished\n";
+
+    #[test]
+    fn a_vm_that_dies_during_the_restore_fails_it_at_once() {
+        let (dir, log) = setup("Sending filesystem now...\nthe tools last words\n");
+        let host = FakeHost::new(false, dir.path().join("no-usbmux"));
+        let start = Instant::now();
+        let err = wait_restore(&host, &mut Tool(None), &log, GRACE).unwrap_err().to_string();
+        assert!(start.elapsed() < Duration::from_secs(5), "it did not wait");
+        assert!(err.contains("the VM stopped during the restore"), "{err}");
+        assert!(err.contains("the tools last words"), "{err}");
+        assert!(err.contains("HOW THE VM ENDED"), "{err}");
+    }
+
+    #[test]
+    fn a_vm_stopping_after_restore_finished_is_not_a_failure() {
+        let (dir, log) = setup(FINISHED);
+        let host = FakeHost::new(false, dir.path().join("no-usbmux"));
+        let start = Instant::now();
+        wait_restore(&host, &mut Tool(None), &log, GRACE).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "it did not wait");
+        assert!(host.said("the VM stopped after the restore finished"));
+    }
+
+    #[test]
+    fn a_tool_that_fails_before_the_restore_finished_reports_its_status() {
+        let (dir, log) = setup("half way\n");
+        let host = FakeHost::new(false, dir.path().join("no-usbmux"));
+        let err = wait_restore(&host, &mut Tool(Some(137)), &log, GRACE).unwrap_err().to_string();
+        assert!(err.contains("restore exited with status 137"), "{err}");
+        assert!(err.contains("HOW THE VM ENDED"), "{err}");
+    }
+
+    #[test]
+    fn the_device_leaving_usb_ends_the_wait() {
+        let (dir, log) = setup(FINISHED);
+        let socket = dir.path().join("usbmux");
+        fake_usbmuxd(&socket, false);
+        let host = FakeHost::new(true, socket);
+        let start = Instant::now();
+        wait_restore(&host, &mut Tool(None), &log, GRACE).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10), "the grace was not waited out");
+        assert!(host.said("has left USB"));
+    }
+
+    #[test]
+    fn a_tool_still_waiting_on_an_attached_device_is_stopped_after_the_grace() {
+        let (dir, log) = setup(FINISHED);
+        let socket = dir.path().join("usbmux");
+        fake_usbmuxd(&socket, true);
+        let host = FakeHost::new(true, socket);
+        wait_restore(&host, &mut Tool(None), &log, Duration::from_millis(200)).unwrap();
+        assert!(host.said("still waiting for the device to come back"));
+    }
+
+    #[test]
+    fn a_finished_line_written_during_the_wait_is_seen() {
+        let (dir, log) = setup("");
+        let host = Arc::new(FakeHost::new(true, dir.path().join("no-usbmux")));
+        let (writer, path) = (host.clone(), log.clone());
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            fs::write(&path, FINISHED).unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            writer.alive.store(false, Ordering::SeqCst);
+        });
+        wait_restore(host.as_ref(), &mut Tool(None), &log, GRACE).unwrap();
+        thread.join().unwrap();
+        assert!(host.said("the device reports the restore finished"));
+    }
+
+    #[test]
+    fn device_left_usb_needs_usbmuxd_to_say_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (none, some) = (dir.path().join("none"), dir.path().join("some"));
+        fake_usbmuxd(&none, false);
+        fake_usbmuxd(&some, true);
+        assert!(device_left_usb(&none));
+        assert!(!device_left_usb(&some));
+        assert!(!device_left_usb(&dir.path().join("absent")), "no usbmuxd says nothing about the device");
+    }
+
+    #[test]
+    fn the_ssh_wait_ends_when_the_vm_has_stopped() {
+        let (dir, log) = setup("");
+        let host = FakeHost::new(false, dir.path().join("no-usbmux"));
+        let start = Instant::now();
+        let err = ssh_wait(&host, &log).err().expect("no VM, no SSH").to_string();
+        assert!(start.elapsed() < Duration::from_secs(5), "it did not wait");
+        assert!(err.contains("the VM stopped while waiting for the SSH ramdisk"), "{err}");
+        assert!(err.contains("HOW THE VM ENDED"), "{err}");
+    }
 }

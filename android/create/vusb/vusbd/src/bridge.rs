@@ -13,6 +13,8 @@ use vusb_common::{read_frame, status, write_frame, DeviceBlob, OpCode, C2S, PROT
 
 const REDISCOVER_DELAY: Duration = Duration::from_millis(200);
 const USB_CLASS_VENDOR: u8 = 0xff;
+/// iBSS/iBEC's recovery mode, which posts 1 MiB receive buffers on its bulk OUT endpoint.
+const PID_RECOVERY: u16 = 0x1281;
 const USB_DT_DEVICE: u16 = 0x0100;
 const USB_DT_CONFIG: u16 = 0x0200;
 const LIBUSB_ERROR_IO: i32 = -1;
@@ -37,6 +39,7 @@ fn setup(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> 
 struct Device {
     blob: DeviceBlob,
     pci_stage: bool,
+    recovery_stage: bool,
     endpoint_sizes: HashMap<u8, u16>,
     interfaces: Vec<(u8, u8)>, // (config value, interface number)
     claims: Mutex<HashMap<u8, u64>>,
@@ -144,6 +147,7 @@ pub struct Bridge {
     link: Arc<Link>,
     stage_timeout: Duration,
     out_window: usize,
+    recovery_packet: Option<usize>,
     sent: std::sync::atomic::AtomicU64,
     sent_since: Mutex<Instant>,
     verbose: bool,
@@ -159,12 +163,18 @@ impl Bridge {
         Bridge {
             link,
             stage_timeout,
-            // VUSB_OUT_WINDOW=1 sends one packet per round trip, for comparison.
+            // VUSB_OUT_WINDOW=1 sends one packet per round trip, for comparison. Beyond the
+            // controller's 64-message queue QEMU pauses the chardev, so a window can exceed it.
             out_window: std::env::var("VUSB_OUT_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .filter(|w| (1..=48).contains(w))
+                .filter(|w| (1..=4096).contains(w))
                 .unwrap_or(crate::link::OUT_WINDOW),
+            // VUSB_RECOVERY_PACKET=512 splits recovery uploads like DFU's, for comparison.
+            recovery_packet: std::env::var("VUSB_RECOVERY_PACKET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|p| *p > 0),
             sent: std::sync::atomic::AtomicU64::new(0),
             sent_since: Mutex::new(Instant::now()),
             verbose,
@@ -276,6 +286,7 @@ impl Bridge {
                 configs,
             },
             pci_stage,
+            recovery_stage: pid == PID_RECOVERY,
             endpoint_sizes,
             interfaces,
             claims: Mutex::new(HashMap::new()),
@@ -443,9 +454,15 @@ impl Bridge {
             }
             self.link.transfer_out(urb.address, &urb.payload, cancel)?;
         } else {
-            // DFU/recovery MMIO controller: its receive buffer is small.
+            // The DFU/recovery MMIO controller. Recovery posts 1 MiB receive buffers and takes a
+            // URB as one message, whose whole cost to the guest is per message, not per byte.
             let packet_size = *device.endpoint_sizes.get(&urb.address).unwrap_or(&512) as usize;
             let packet_size = if packet_size == 0 { 512 } else { packet_size };
+            let packet_size = match (device.recovery_stage, self.recovery_packet) {
+                (true, Some(p)) => p,
+                (true, None) => urb.payload.len(),
+                (false, _) => packet_size,
+            };
             self.link
                 .transfer_out_stream(urb.address, &urb.payload, packet_size, self.out_window, cancel)?;
             self.note_sent(urb.payload.len() as u64);

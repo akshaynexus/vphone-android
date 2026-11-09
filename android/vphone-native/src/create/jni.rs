@@ -155,6 +155,56 @@ pub extern "system" fn Java_com_vphone_android_Native_createDelete(
     })
 }
 
+// ------------------------------------------------------------------ the storage screen
+
+/// Measures everything, so called off the main thread.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_StorageNative_scan(mut env: JNIEnv, _this: JObject) -> jstring {
+    guarded(&mut env, |_| super::storage::scan_json(Paths::get()))
+}
+
+/// What a confirmation shows for an action. Measures it, so called off the main thread.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_StorageNative_plan(
+    mut env: JNIEnv,
+    _this: JObject,
+    op: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let op = text(env, &op);
+        super::storage::plan_json(Paths::get(), &op)
+    })
+}
+
+/// Starts an action on its own thread; an error is its text.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_StorageNative_start(
+    mut env: JNIEnv,
+    _this: JObject,
+    op: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let op = text(env, &op);
+        result_text(super::storage::start(Paths::get(), &op))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_StorageNative_progress(mut env: JNIEnv, _this: JObject) -> jstring {
+    guarded(&mut env, |_| super::storage::progress_json())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_StorageNative_takeResult(_env: JNIEnv, _this: JObject) {
+    quiet(super::storage::take_result);
+}
+
+/// Goes up whenever an action ends, so a list on screen knows to read again.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_StorageNative_generation(_env: JNIEnv, _this: JObject) -> jlong {
+    catch_unwind(super::storage::generation).unwrap_or(0) as jlong
+}
+
 // ------------------------------------------------------------------ the log screen
 
 /// The progress screen's panels; reads the step's log, so called off the main thread.

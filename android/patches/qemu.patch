@@ -1116,6 +1116,402 @@ index 0000000000000000000000000000000000000000..2be384995bd9149a1d49fa88b041b587
 +}
 +
 +type_init(vsock_uds_register_types)
+diff --git a/hw/vmapple/vusb.c b/hw/vmapple/vusb.c
+index 9698e3e12e5d58fb7d9a9002c70faf19139f1321..ec8abb813e8c9302040d500c07da194f112cbc85 100644
+--- a/hw/vmapple/vusb.c
++++ b/hw/vmapple/vusb.c
+@@ -57,6 +57,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/log.h"
+ #include "qemu/bswap.h"
++#include "qemu/units.h"
+ #include "hw/irq.h"
+ #include "hw/sysbus.h"
+ #include "hw/qdev-properties.h"
+@@ -79,6 +80,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(VUSBState, VUSB)
+ #define VUSB_MSG_HDR        6
+ #define VUSB_MSG_MAX        0x10000
+ #define VUSB_HOST_FIFO      64
++/* chardev input stays paused from a full FIFO until it has drained this far */
++#define VUSB_HOST_FIFO_LOW  (VUSB_HOST_FIFO / 2)
++/* to-host bytes held while the chardev is full: vusbd reads continuously */
++#define VUSB_TX_BACKLOG_MAX (16 * MiB)
+ #define VUSB_CODE_DRIVER_RESET 6
+ 
+ #define REG_STATUS          0x000
+@@ -125,8 +130,23 @@ struct VUSBState {
+     /* the VirtIO-PCI transport, and whether its driver owns the link */
+     VUSBAltTransport alt;
+     bool alt_active;
+-    /* partial message from the chardev */
++    /* bytes from the chardev not yet framed into host_msgs */
+     GByteArray *rx_buf;
++    /* the FIFO filled: chardev input is paused until it drains */
++    bool rx_stalled;
++    bool rx_pumping;
++    /* largest receive buffer the current stage's driver has posted */
++    uint32_t rx_posted_max;
++
++    /*
++     * Length-prefixed frames the chardev would not take yet, oldest first.
++     * tx_off is how much of the head has already been written: a frame once
++     * started has to be finished or the host loses the stream's framing.
++     */
++    GQueue tx_backlog;
++    uint32_t tx_off;
++    size_t tx_backlog_bytes;
++    guint tx_watch;
+ };
+ 
+ static int vusb_read_chain(VUSBState *s, uint64_t addr, VUSBDesc *descs)
+@@ -150,17 +170,186 @@ static int vusb_read_chain(VUSBState *s, uint64_t addr, VUSBDesc *descs)
+     return n;
+ }
+ 
++/*
++ * Drop the frames waiting for the chardev. A device reset keeps a frame that
++ * has been partly written, since the connection (and its framing) lives on;
++ * a closed connection takes everything with it.
++ */
++static void vusb_tx_clear(VUSBState *s, bool keep_partial)
++{
++    GByteArray *head = NULL;
++    GByteArray *frame;
++
++    if (keep_partial && s->tx_off) {
++        head = g_queue_pop_head(&s->tx_backlog);
++    }
++    while ((frame = g_queue_pop_head(&s->tx_backlog))) {
++        g_byte_array_unref(frame);
++    }
++    s->tx_backlog_bytes = 0;
++    if (head) {
++        g_queue_push_tail(&s->tx_backlog, head);
++        s->tx_backlog_bytes = head->len - s->tx_off;
++    } else {
++        s->tx_off = 0;
++        if (s->tx_watch) {
++            g_source_remove(s->tx_watch);
++            s->tx_watch = 0;
++        }
++    }
++}
++
++static gboolean vusb_tx_writable(void *do_not_use, GIOCondition cond,
++                                 void *opaque);
++
++/*
++ * Write the backlog until the chardev would block, then let its writable
++ * callback continue. Runs from MMIO with the BQL held, so it never waits.
++ */
++static void vusb_tx_drain(VUSBState *s)
++{
++    GByteArray *frame;
++
++    while ((frame = g_queue_peek_head(&s->tx_backlog))) {
++        int n = qemu_chr_fe_write(&s->chr, frame->data + s->tx_off,
++                                  frame->len - s->tx_off);
++
++        /* a write that loses the connection clears the backlog on the way */
++        if (g_queue_peek_head(&s->tx_backlog) != frame) {
++            return;
++        }
++        if (n < 0 && errno != EAGAIN) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb: chardev write failed: %s\n", strerror(errno));
++            vusb_tx_clear(s, false);
++            return;
++        }
++        if (n <= 0) {
++            break;
++        }
++        s->tx_off += n;
++        s->tx_backlog_bytes -= n;
++        if (s->tx_off < frame->len) {
++            break;
++        }
++        g_queue_pop_head(&s->tx_backlog);
++        g_byte_array_unref(frame);
++        s->tx_off = 0;
++    }
++    if (!g_queue_is_empty(&s->tx_backlog) && !s->tx_watch) {
++        s->tx_watch = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
++                                            vusb_tx_writable, s);
++        if (!s->tx_watch) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb: chardev cannot report writability\n");
++            vusb_tx_clear(s, false);
++        }
++    }
++}
++
++static gboolean vusb_tx_writable(void *do_not_use, GIOCondition cond,
++                                 void *opaque)
++{
++    VUSBState *s = opaque;
++
++    s->tx_watch = 0;
++    vusb_tx_drain(s);
++    return G_SOURCE_REMOVE;
++}
++
++/* One allocation and one write per message; frames stay in guest order. */
+ static void vusb_send_to_host(VUSBState *s, const uint8_t *msg, uint32_t len)
+ {
++    GByteArray *frame;
+     uint8_t hdr[4];
+ 
+     trace_vusb_tx(len, len > 0 ? msg[0] : 0, len > 1 ? msg[1] : 0);
+-    if (!qemu_chr_fe_backend_connected(&s->chr)) {
++    if (!qemu_chr_fe_backend_open(&s->chr)) {
++        return;
++    }
++    if (s->tx_backlog_bytes + sizeof(hdr) + len > VUSB_TX_BACKLOG_MAX) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "vusb: host not reading, %u-byte message dropped\n", len);
+         return;
+     }
++    frame = g_byte_array_sized_new(sizeof(hdr) + len);
+     stl_le_p(hdr, len);
+-    qemu_chr_fe_write_all(&s->chr, hdr, sizeof(hdr));
+-    qemu_chr_fe_write_all(&s->chr, msg, len);
++    g_byte_array_append(frame, hdr, sizeof(hdr));
++    g_byte_array_append(frame, msg, len);
++    g_queue_push_tail(&s->tx_backlog, frame);
++    s->tx_backlog_bytes += frame->len;
++    if (!s->tx_watch) {
++        vusb_tx_drain(s);
++    }
++}
++
++static void vusb_queue_host_msg(VUSBState *s, GByteArray *msg);
++
++/* Frame what the chardev delivered into the FIFO, as far as it has room. */
++static void vusb_pump_host_msgs(VUSBState *s)
++{
++    if (s->rx_pumping) {
++        return; /* the FIFO was drained by the loop below: it carries on */
++    }
++    s->rx_pumping = true;
++    while (s->rx_buf->len >= VUSB_MSG_HDR &&
++           g_queue_get_length(&s->host_msgs) < VUSB_HOST_FIFO) {
++        uint32_t total = VUSB_MSG_HDR + ldl_le_p(s->rx_buf->data);
++        GByteArray *msg;
++
++        if (total > VUSB_MSG_MAX) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb: bad host message length, resyncing\n");
++            g_byte_array_set_size(s->rx_buf, 0);
++            break;
++        }
++        if (s->rx_buf->len < total) {
++            break;
++        }
++        msg = g_byte_array_sized_new(total);
++        g_byte_array_append(msg, s->rx_buf->data, total);
++        g_byte_array_remove_range(s->rx_buf, 0, total);
++        vusb_queue_host_msg(s, msg);
++    }
++    s->rx_pumping = false;
++}
++
++/* The FIFO lost entries: refill it and let paused chardev input continue. */
++static void vusb_host_fifo_drained(VUSBState *s)
++{
++    vusb_pump_host_msgs(s);
++    if (s->rx_stalled &&
++        g_queue_get_length(&s->host_msgs) <= VUSB_HOST_FIFO_LOW) {
++        s->rx_stalled = false;
++        qemu_chr_fe_accept_input(&s->chr);
++    }
++}
++
++/*
++ * Forget host messages: those in the FIFO and those the chardev delivered
++ * that have not reached it. An incomplete trailing message stays, because
++ * the rest of it is still on its way.
++ */
++static void vusb_discard_host_msgs(VUSBState *s)
++{
++    GByteArray *msg;
++    uint32_t off = 0;
++
++    while ((msg = g_queue_pop_head(&s->host_msgs))) {
++        g_byte_array_unref(msg);
++    }
++    while (s->rx_buf->len - off >= VUSB_MSG_HDR) {
++        uint32_t total = VUSB_MSG_HDR + ldl_le_p(s->rx_buf->data + off);
++
++        if (total > VUSB_MSG_MAX || s->rx_buf->len - off < total) {
++            break;
++        }
++        off += total;
++    }
++    if (off) {
++        g_byte_array_remove_range(s->rx_buf, 0, off);
++    }
++    vusb_host_fifo_drained(s);
+ }
+ 
+ /*
+@@ -171,11 +360,9 @@ static void vusb_send_to_host(VUSBState *s, const uint8_t *msg, uint32_t len)
+ static void vusb_driver_reset(VUSBState *s)
+ {
+     static const uint8_t detach[2] = { VUSB_CODE_DRIVER_RESET, 0 };
+-    GByteArray *msg;
+ 
+-    while ((msg = g_queue_pop_head(&s->host_msgs))) {
+-        g_byte_array_unref(msg);
+-    }
++    vusb_discard_host_msgs(s);
++    s->rx_posted_max = 0;
+     vusb_send_to_host(s, detach, sizeof(detach));
+ }
+ 
+@@ -233,6 +420,7 @@ static void vusb_do_rx(VUSBState *s)
+     VUSBDesc descs[VUSB_CHAIN_MAX];
+     g_autoptr(GByteArray) msg = NULL;
+     uint32_t off = 0;
++    uint32_t posted = 0;
+     int n;
+ 
+     if (!q->request || g_queue_is_empty(&s->host_msgs)) {
+@@ -240,6 +428,18 @@ static void vusb_do_rx(VUSBState *s)
+     }
+     msg = g_queue_pop_head(&s->host_msgs);
+     n = vusb_read_chain(s, q->request, descs);
++    for (int i = 0; i < n; i++) {
++        if (descs[i].flags & DESC_F_WRITE) {
++            posted += descs[i].len;
++        }
++    }
++    /* the size each boot stage's driver offers, logged when it first grows */
++    if (posted > s->rx_posted_max) {
++        s->rx_posted_max = posted;
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "vusb: stage posts %u-byte receive buffers "
++                      "(%d descriptors)\n", posted, n);
++    }
+     for (int i = 0; i < n && off < msg->len; i++) {
+         uint32_t len = MIN(descs[i].len, msg->len - off);
+ 
+@@ -262,15 +462,11 @@ static void vusb_do_rx(VUSBState *s)
+     }
+     q->request = 0;
+     q->done = true;
++    vusb_host_fifo_drained(s);
+ }
+ 
+ static void vusb_queue_host_msg(VUSBState *s, GByteArray *msg)
+ {
+-    if (g_queue_get_length(&s->host_msgs) >= VUSB_HOST_FIFO) {
+-        qemu_log_mask(LOG_GUEST_ERROR, "vusb: host message dropped\n");
+-        g_byte_array_unref(msg);
+-        return;
+-    }
+     g_queue_push_tail(&s->host_msgs, msg);
+     if (s->alt_active) {
+         if (s->alt.kick) {
+@@ -403,7 +599,12 @@ static const MemoryRegionOps vusb_ops = {
+ 
+ static int vusb_chr_can_receive(void *opaque)
+ {
+-    return VUSB_MSG_MAX;
++    VUSBState *s = opaque;
++
++    if (g_queue_get_length(&s->host_msgs) >= VUSB_HOST_FIFO) {
++        s->rx_stalled = true;
++    }
++    return s->rx_stalled ? 0 : VUSB_MSG_MAX;
+ }
+ 
+ static void vusb_chr_receive(void *opaque, const uint8_t *buf, int size)
+@@ -411,23 +612,18 @@ static void vusb_chr_receive(void *opaque, const uint8_t *buf, int size)
+     VUSBState *s = opaque;
+ 
+     g_byte_array_append(s->rx_buf, buf, size);
+-    while (s->rx_buf->len >= VUSB_MSG_HDR) {
+-        uint32_t total = VUSB_MSG_HDR + ldl_le_p(s->rx_buf->data);
+-        GByteArray *msg;
++    vusb_pump_host_msgs(s);
++}
+ 
+-        if (total > VUSB_MSG_MAX) {
+-            qemu_log_mask(LOG_GUEST_ERROR,
+-                          "vusb: bad host message length, resyncing\n");
+-            g_byte_array_set_size(s->rx_buf, 0);
+-            return;
+-        }
+-        if (s->rx_buf->len < total) {
+-            return;
+-        }
+-        msg = g_byte_array_sized_new(total);
+-        g_byte_array_append(msg, s->rx_buf->data, total);
+-        g_byte_array_remove_range(s->rx_buf, 0, total);
+-        vusb_queue_host_msg(s, msg);
++/* A new connection starts a new byte stream: nothing of the old one applies. */
++static void vusb_chr_event(void *opaque, QEMUChrEvent event)
++{
++    VUSBState *s = opaque;
++
++    if (event == CHR_EVENT_CLOSED) {
++        vusb_tx_clear(s, false);
++        g_byte_array_set_size(s->rx_buf, 0);
++        vusb_discard_host_msgs(s);
+     }
+ }
+ 
+@@ -452,7 +648,11 @@ void vusb_alt_activate(DeviceState *dev, bool active)
+ 
+ GByteArray *vusb_pop_host_msg(DeviceState *dev)
+ {
+-    return g_queue_pop_head(&VUSB(dev)->host_msgs);
++    VUSBState *s = VUSB(dev);
++    GByteArray *msg = g_queue_pop_head(&s->host_msgs);
++
++    vusb_host_fifo_drained(s);
++    return msg;
+ }
+ 
+ void vusb_unpop_host_msg(DeviceState *dev, GByteArray *msg)
+@@ -468,7 +668,6 @@ void vusb_msg_to_host(DeviceState *dev, const uint8_t *msg, uint32_t len)
+ static void vusb_reset(DeviceState *dev)
+ {
+     VUSBState *s = VUSB(dev);
+-    GByteArray *msg;
+ 
+     s->alt_active = false;
+     s->reset = 0;
+@@ -477,9 +676,9 @@ static void vusb_reset(DeviceState *dev)
+     s->test_sent = false;
+     memset(s->queues, 0, sizeof(s->queues));
+     s->queues[VUSB_TX].done = true;
+-    while ((msg = g_queue_pop_head(&s->host_msgs))) {
+-        g_byte_array_unref(msg);
+-    }
++    s->rx_posted_max = 0;
++    vusb_tx_clear(s, true);
++    vusb_discard_host_msgs(s);
+ }
+ 
+ static void vusb_realize(DeviceState *dev, Error **errp)
+@@ -487,7 +686,7 @@ static void vusb_realize(DeviceState *dev, Error **errp)
+     VUSBState *s = VUSB(dev);
+ 
+     qemu_chr_fe_set_handlers(&s->chr, vusb_chr_can_receive, vusb_chr_receive,
+-                             NULL, NULL, s, NULL, true);
++                             vusb_chr_event, NULL, s, NULL, true);
+ }
+ 
+ static void vusb_init(Object *obj)
+@@ -500,6 +699,7 @@ static void vusb_init(Object *obj)
+     sysbus_init_mmio(sbd, &s->iomem);
+     sysbus_init_irq(sbd, &s->irq);
+     g_queue_init(&s->host_msgs);
++    g_queue_init(&s->tx_backlog);
+     s->rx_buf = g_byte_array_new();
+ }
+ 
 diff --git a/include/hw/virtio/virtio-vsock-uds.h b/include/hw/virtio/virtio-vsock-uds.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..ca8c4060eb471ccc627d27b01ae04e16aafd07a8
@@ -1205,7 +1601,7 @@ index 26225f4f1e15b3f4fc5de63108a37e6294c88014..0310d994315a8557877700a02130cca3
   * memory_region_init_ram_from_fd:  Initialize RAM memory region with a
   *                                  mmap-ed backend.
 diff --git a/meson.build b/meson.build
-index 1380d7c4dc98fbccae3d116483eb9f6525226d41..8dc90e0587dfd3bad0b096e0a18a10709b78a9a0 100644
+index 1380d7c4dc98fbccae3d116483eb9f6525226d41..429d5ca9229b83f6d7d1016d4ce7caebdd7d622b 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -64,6 +64,8 @@ sh = find_program('sh')
@@ -1237,7 +1633,17 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..8dc90e0587dfd3bad0b096e0a18a1070
  config_host_data.set('CONFIG_NETTLE', nettle.found())
  config_host_data.set('CONFIG_CRYPTO_SM4', crypto_sm4.found())
  config_host_data.set('CONFIG_CRYPTO_SM3', crypto_sm3.found())
-@@ -3889,6 +3895,20 @@ endif
+@@ -2498,7 +2504,8 @@ config_host_data.set('CONFIG_ALIGNED_MALLOC', cc.has_function('_aligned_malloc')
+ config_host_data.set('CONFIG_VALLOC', cc.has_function('valloc'))
+ config_host_data.set('CONFIG_MEMALIGN', cc.has_function('memalign'))
+ config_host_data.set('CONFIG_PPOLL', cc.has_function('ppoll'))
+-config_host_data.set('CONFIG_PREADV', cc.has_function('preadv', prefix: '#include <sys/uio.h>'))
++# bionic declares preadv() only under _GNU_SOURCE, which osdep_prefix defines if nothing else has.
++config_host_data.set('CONFIG_PREADV', cc.has_function('preadv', prefix: osdep_prefix + '#include <sys/uio.h>\n'))
+ config_host_data.set('CONFIG_PTHREAD_FCHDIR_NP', cc.has_function('pthread_fchdir_np'))
+ config_host_data.set('CONFIG_SENDFILE', cc.has_function('sendfile'))
+ config_host_data.set('CONFIG_SETNS', cc.has_function('setns') and cc.has_function('unshare'))
+@@ -3889,6 +3896,20 @@ endif
  
  traceable = []
  emulators = {}
@@ -1258,7 +1664,7 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..8dc90e0587dfd3bad0b096e0a18a1070
  foreach target : target_dirs
    config_target = config_target_mak[target]
    target_name = config_target['TARGET_NAME']
-@@ -4002,14 +4022,25 @@ foreach target : target_dirs
+@@ -4002,14 +4023,25 @@ foreach target : target_dirs
        exe_name += '-unsigned'
      endif
  

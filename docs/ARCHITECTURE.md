@@ -207,8 +207,9 @@ RestoreOS and the SSH ramdisk). Each stage re-enumerates, so `tools/usbip-autoat
 The RestoreOS's `AppleUSBDeviceMux` is not like usbmuxd's host side: it reads into 32 KiB buffers,
 expects exactly one mux packet per USB transfer and drops shorter transfers without reassembling them.
 So the host needs a usbmuxd built with a 32 KiB MTU (stock: 48 KiB), and the exporter forwards each
-bulk OUT URB whole, together with the zero-length packet that ends it. DFU and recovery keep their
-512-byte split.
+bulk OUT URB whole, together with the zero-length packet that ends it. DFU keeps its 512-byte split.
+On Android, the recovery stage takes each URB as one message of up to 65,530 bytes, as iBoot posts
+1 MiB receive buffers there (`VUSB_RECOVERY_PACKET=512` restores the split).
 
 **Auxiliary storage.** The RestoreOS writes the firmware store and NVRAM through a virtio-blk drive in
 the aux role. That drive starts 16 KiB into `nvram.bin` (`offset=16384`), after Virtualization.framework's
