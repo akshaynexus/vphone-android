@@ -236,7 +236,7 @@ pub fn run_spec_file(file: &Path) -> Result<(), String> {
         unsafe { (qemu.set_gipa)(gipa) };
     }
     vitals::spawn_self_stats(vitals::proc_path(&paths));
-    diag::spawn(spec.threads_log.clone().into(), paths.create_sockets().join(THREADS_NOW));
+    diag::spawn(spec.threads_log.clone().into(), paths.create_sockets().join(THREADS_NOW), paths.files.clone());
 
     let open = |p: &str| fs::File::create(p).map_err(|e| format!("cannot create {p}: {e}"));
     let (out, err) = (open(&spec.stdout)?, open(&spec.stderr)?);

@@ -7,6 +7,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ const BUSY_PERCENT: f64 = 5.0;
 const STACK_THREADS: usize = 6;
 const FRAMES: usize = 20;
 
+/// Where a crash is written: the thread log, already open.
+static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
 static STACK_TID: AtomicI32 = AtomicI32::new(0);
 static STACK_DONE: AtomicBool = AtomicBool::new(false);
 static STACK_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -82,39 +85,90 @@ mod stack {
         if push(unsafe { _Unwind_GetIP(context) }) { 0 } else { 5 }
     }
 
-    /// In the signalled thread: only async-signal-safe work, into static memory.
-    extern "C" fn handler(_: c_int, _: *mut libc::siginfo_t, context: *mut c_void) {
-        // SAFETY: gettid has no preconditions.
-        if unsafe { libc::gettid() } != STACK_TID.load(Ordering::SeqCst) {
+    /// SIGSYS sent by this monitor (`tgkill`) asks for a stack: QEMU's threads block every signal
+    /// but the fatal ones, so it is one of the few that reach them. Any other arrival is a crash.
+    extern "C" fn handler(signal: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
+        // SAFETY: the kernel passes valid siginfo and ucontext for an SA_SIGINFO handler.
+        let (pc, lr, regs, code) = unsafe {
+            let m = &(*(context as *const libc::ucontext_t)).uc_mcontext;
+            (m.pc as usize, m.regs[30] as usize, [m.regs[0], m.regs[1], m.regs[2], m.regs[3]], (*info).si_code)
+        };
+        if signal == libc::SIGSYS && code == libc::SI_TKILL {
+            // SAFETY: gettid has no preconditions.
+            if unsafe { libc::gettid() } == STACK_TID.load(Ordering::SeqCst) {
+                STACK_LEN.store(0, Ordering::SeqCst);
+                push(pc);
+                push(lr);
+                // SAFETY: trace only writes to static memory.
+                unsafe { _Unwind_Backtrace(trace, std::ptr::null_mut()) };
+                STACK_DONE.store(true, Ordering::SeqCst);
+            }
             return;
         }
-        // SAFETY: the kernel passes a valid ucontext_t to an SA_SIGINFO handler.
-        let (pc, lr) = unsafe {
-            let m = &(*(context as *const libc::ucontext_t)).uc_mcontext;
-            (m.pc as usize, m.regs[30] as usize)
+        crash(signal, code, unsafe { (*info).si_addr() } as usize, pc, lr, regs);
+    }
+
+    /// The process is ending, so ordinary allocation is acceptable; the alarm bounds a deadlock.
+    fn crash(signal: c_int, code: c_int, fault: usize, pc: usize, lr: usize, regs: [u64; 4]) {
+        // SAFETY: alarm, gettid and the signal calls have no preconditions.
+        let tid = unsafe {
+            libc::alarm(5);
+            libc::gettid()
         };
-        push(pc);
-        push(lr);
+        STACK_LEN.store(0, Ordering::SeqCst);
         // SAFETY: trace only writes to static memory.
         unsafe { _Unwind_Backtrace(trace, std::ptr::null_mut()) };
-        STACK_DONE.store(true, Ordering::SeqCst);
+        let maps = read_maps();
+        let frames: Vec<String> = (0..STACK_LEN.load(Ordering::SeqCst).min(FRAMES))
+            // SAFETY: filled just above, by this thread alone.
+            .map(|i| symbol(&maps, unsafe { *std::ptr::addr_of!(STACK[i]) }))
+            .collect();
+        let name = fs::read_to_string(format!("/proc/self/task/{tid}/comm")).unwrap_or_default();
+        let text = format!(
+            "CRASH {} code {code} in thread {} (tid {tid}) at fault address 0x{fault:x}\n  pc {}\n  lr {}\n  x0 0x{:x} x1 0x{:x} x2 0x{:x} x3 0x{:x}\n  stack: {}\n",
+            signal_name(signal),
+            name.trim(),
+            symbol(&maps, pc),
+            symbol(&maps, lr),
+            regs[0], regs[1], regs[2], regs[3],
+            frames.join(" < "),
+        );
+        let fd = CRASH_FD.load(Ordering::SeqCst);
+        // SAFETY: writes bytes this function owns, then restores the default action and re-raises.
+        unsafe {
+            libc::write(fd, text.as_ptr().cast(), text.len());
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    fn signal_name(signal: c_int) -> &'static str {
+        match signal {
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGILL => "SIGILL",
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGFPE => "SIGFPE",
+            libc::SIGSYS => "SIGSYS",
+            _ => "signal",
+        }
     }
 
     pub fn install() -> c_int {
         // SAFETY: sigaction with a zeroed, then filled, struct.
         unsafe {
-            let signal = libc::SIGRTMAX();
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = handler as *const () as usize;
             action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(signal, &action, std::ptr::null_mut());
-            signal
+            for signal in [libc::SIGSYS, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGABRT, libc::SIGFPE] {
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+            libc::SIGSYS
         }
     }
 
     pub fn capture(signal: c_int, tid: i32) -> Vec<usize> {
-        STACK_LEN.store(0, Ordering::SeqCst);
         STACK_DONE.store(false, Ordering::SeqCst);
         STACK_TID.store(tid, Ordering::SeqCst);
         // SAFETY: tgkill to a thread of this process.
@@ -130,6 +184,24 @@ mod stack {
         // SAFETY: the handler has finished or will not write again for tid 0.
         (0..n).map(|i| unsafe { *std::ptr::addr_of!(STACK[i]) }).collect()
     }
+}
+
+/// Memory and storage, for telling a crash from Android ending the process.
+fn resources(files: &std::path::Path) -> String {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let kb = |text: &str, key: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.split_ascii_whitespace().next()?.parse().ok())
+            .unwrap_or(0)
+    };
+    let free = crate::create::engine::free_bytes(files) >> 30;
+    format!(
+        "rss {}M avail {}M disk {}G",
+        kb(&status, "VmRSS:") / 1024,
+        kb(&meminfo, "MemAvailable:") / 1024,
+        free
+    )
 }
 
 /// `libname+0xfile_offset`, or a note for memory with no file (QEMU's generated code).
@@ -182,10 +254,11 @@ fn busy_list(rows: &[(Thread, f64)]) -> String {
 }
 
 /// Starts the monitor: `log` keeps the history, `now` the latest list, for the app to read.
-pub fn spawn(log: PathBuf, now: PathBuf) {
+pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
     let Ok(mut out) = File::create(&log) else {
         return;
     };
+    CRASH_FD.store(out.as_raw_fd(), Ordering::SeqCst);
     #[cfg(target_arch = "aarch64")]
     let signal = stack::install();
     let _ = std::thread::Builder::new().name("vm-monitor".into()).spawn(move || {
@@ -209,8 +282,9 @@ pub fn spawn(log: PathBuf, now: PathBuf) {
             rows.sort_by(|a, b| b.1.total_cmp(&a.1));
             let total: f64 = rows.iter().map(|r| r.1).sum();
             let line = format!(
-                "t={}s total {:.0}%: {}",
+                "t={}s {} total {:.0}%: {}",
                 started.elapsed().as_secs(),
+                resources(&files),
                 total,
                 busy_list(&rows)
             );

@@ -801,7 +801,9 @@ impl Host for Engine {
         let tail = |path: PathBuf| crate::runtime::log_tail(&path.to_string_lossy(), 1500).trim().to_string();
         let logs = self.vm.join(state::LOG_DIR);
         format!(
-            "VM output:\n{}\n\nUSB link:\n{}",
+            "How the VM ended: {}\n\nThread log:\n{}\n\nVM output:\n{}\n\nUSB link:\n{}",
+            if self.sup.alive() { "it is still running".to_string() } else { self.sup.exit_detail() },
+            tail(self.sup.threads_log()),
             tail(self.sup.serial_log()),
             tail(logs.join("usb-broker.log"))
         )
