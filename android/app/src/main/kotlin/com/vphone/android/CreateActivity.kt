@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -30,6 +31,8 @@ import java.util.Locale
 class CreateActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var following: String? = null
+    private var lastStatus: JSONObject? = null
+    private var paused = false
     private lateinit var catalog: JSONObject
     private lateinit var pairingsByDevice: Map<String, List<JSONObject>>
     private var pickedDevice = ""
@@ -66,6 +69,7 @@ class CreateActivity : AppCompatActivity() {
     private fun showPicker() {
         following = null
         setContentView(R.layout.create_pick)
+        App.fitSystemBars(findViewById(R.id.pick_scroll))
         catalog = JSONObject(Native.createCatalog())
         val devices = catalog.getJSONArray("devices")
         val all = (0 until devices.length()).map { devices.getJSONObject(it) }
@@ -230,6 +234,11 @@ class CreateActivity : AppCompatActivity() {
         following = name
         rowsFor = ""
         setContentView(R.layout.create_progress)
+        App.fitSystemBars(findViewById(R.id.progress_root))
+        findViewById<Button>(R.id.copy_error).setOnClickListener { copyReport() }
+        findViewById<Button>(R.id.pause).setOnClickListener {
+            Native.createPause(name, !paused)
+        }
         findViewById<Button>(R.id.cancel).setOnClickListener { confirmCancel(name) }
         findViewById<Button>(R.id.delete).setOnClickListener { confirmDelete(name) }
         findViewById<Button>(R.id.retry).setOnClickListener { CreateService.start(this, name) }
@@ -249,8 +258,8 @@ class CreateActivity : AppCompatActivity() {
 
     private fun confirmCancel(name: String) {
         MaterialAlertDialogBuilder(this)
-            .setTitle("Cancel creating this VM?")
-            .setMessage("It stops the current step. You can resume it later from where it stopped, or delete it.")
+            .setTitle("Stop creating this VM?")
+            .setMessage("It ends the current step. You can resume later from the start of that step. To carry on without losing the step, use Pause instead.")
             .setPositiveButton("Stop it") { _, _ -> Native.createCancel(name) }
             .setNegativeButton("Keep going", null)
             .show()
@@ -272,17 +281,41 @@ class CreateActivity : AppCompatActivity() {
             .show()
     }
 
+    /** The error, the phone and the failed step's log, ready to paste into a bug report. */
+    private fun copyReport() {
+        val s = lastStatus ?: return
+        val steps = s.getJSONArray("steps")
+        val failed = (0 until steps.length()).map { steps.getJSONObject(it) }
+            .firstOrNull { it.getString("state") == "failed" }
+        val report = buildString {
+            appendLine("vphone ${BuildConfig.VERSION_NAME}, ${s.optString("device")} iOS ${s.optString("ios")}")
+            appendLine("${Build.MANUFACTURER} ${Build.MODEL}, ${Build.SOC_MODEL}, Android ${Build.VERSION.RELEASE}")
+            failed?.let { appendLine("Failed step: ${it.getString("key")}") }
+            appendLine()
+            appendLine(s.optString("error"))
+            failed?.let {
+                appendLine()
+                appendLine("Log:")
+                append(Native.logTail(it.getString("log"), 16384))
+            }
+        }
+        App.copy(this, report)
+    }
+
     @SuppressLint("SetTextI18n")
     private fun showStatus(s: JSONObject) {
+        lastStatus = s
         val state = s.optString("state")
+        paused = s.optBoolean("paused")
+        val failed = state == "failed"
         findViewById<TextView>(R.id.title).text = "Creating ${s.optString("name")} (${s.optString("device")}, iOS ${s.optString("ios")})"
         val eta = s.optLong("etaSecs")
         findViewById<TextView>(R.id.eta).text = when (state) {
             "done" -> "Finished."
-            "failed" -> "Stopped: ${s.optString("error").ifEmpty { "see the log" }}"
-            "cancelled" -> "Cancelled. Resume it or delete it."
-            "interrupted" -> "Interrupted. Tap Resume to continue."
-            else -> if (eta > 0) "About ${hoursMinutes(eta)} left (estimate; a phone's speed varies)" else "Working"
+            "failed" -> "Stopped with an error."
+            "cancelled" -> "Stopped. Resume it or delete it."
+            "interrupted" -> if (paused) "Paused. Tap Resume to carry on." else "Interrupted. Tap Resume to continue."
+            else -> if (paused) "Paused. Tap Resume to carry on." else if (eta > 0) "About ${hoursMinutes(eta)} left (estimate; a phone's speed varies)" else "Working"
         }
 
         val hold = findViewById<TextView>(R.id.hold)
@@ -310,9 +343,16 @@ class CreateActivity : AppCompatActivity() {
             val speed = s.optLong("bytesPerSec")
             if (speed > 0) "$it (${speed / MIB} MB/s)" else it
         }
+        findViewById<TextView>(R.id.message).visibility = if (failed) View.GONE else View.VISIBLE
+        findViewById<TextView>(R.id.error).apply {
+            visibility = if (failed) View.VISIBLE else View.GONE
+            val error = s.optString("error").ifEmpty { "No details were recorded. See the step's log." }
+            if (text.toString() != error) text = error
+        }
+        findViewById<Button>(R.id.copy_error).visibility = if (failed) View.VISIBLE else View.GONE
         val bar = findViewById<LinearProgressIndicator>(R.id.bar)
         val total = s.optLong("totalBytes")
-        bar.isIndeterminate = state == "running" && total == 0L
+        bar.isIndeterminate = state == "running" && total == 0L && !paused
         if (total > 0) bar.setProgressCompat((1000 * s.optLong("doneBytes") / total).toInt(), true)
         bar.visibility = if (state == "done" || state == "failed" || state == "cancelled") View.GONE else View.VISIBLE
 
@@ -322,6 +362,10 @@ class CreateActivity : AppCompatActivity() {
         findViewById<Button>(R.id.retry).visibility = if (stopped) View.VISIBLE else View.GONE
         findViewById<Button>(R.id.retry).text = if (state == "failed") "Retry from the failed step" else "Resume"
         findViewById<Button>(R.id.cancel).visibility = if (state == "running") View.VISIBLE else View.GONE
+        findViewById<Button>(R.id.pause).apply {
+            visibility = if (state == "running") View.VISIBLE else View.GONE
+            text = if (paused) "Resume" else "Pause"
+        }
     }
 
     private fun renderSteps(s: JSONObject) {

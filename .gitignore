@@ -48,3 +48,4 @@ __pycache__/
 /android/app/.gradle/
 /android/.gradle/
 /android/local.properties
+*.hprof

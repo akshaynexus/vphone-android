@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use vphone_create_steps::host::{BackgroundHelper, Host};
@@ -22,6 +23,7 @@ use vphone_create_steps::progress::Progress;
 const TAG: &str = "vphone-create";
 const GIB: u64 = 1 << 30;
 pub const CANCEL_FILE: &str = ".create-cancel";
+pub const PAUSE_FILE: &str = ".create-pause";
 const CELLULAR_FILE: &str = ".create-cellular-ok";
 /// How little free space a step may start with: 25 GiB for the restore (it writes the disk),
 /// a few GiB elsewhere. Below these the creation waits for space, it does not fail.
@@ -54,6 +56,7 @@ pub struct Engine {
     step_log: Mutex<Option<File>>,
     usb: Mutex<Vec<Background>>,
     pause: Mutex<bool>,
+    paused_in_step: AtomicBool,
 }
 
 impl Engine {
@@ -99,8 +102,28 @@ impl Engine {
             step_log: Mutex::new(None),
             usb: Mutex::new(Vec::new()),
             pause: Mutex::new(false),
+            paused_in_step: AtomicBool::new(false),
         });
         Ok(e)
+    }
+
+    fn pause_requested(&self) -> bool {
+        self.vm.join(PAUSE_FILE).exists()
+    }
+
+    /// Holds a step from starting while the person has it paused.
+    pub fn wait_while_paused(&self) -> Result<(), String> {
+        while self.pause_requested() {
+            self.is_cancelled()?;
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Ok(())
+    }
+
+    /// Whether a pause happened since this was last asked. A long pause can run out a time-out
+    /// inside a step, so a step that fails after one is run again instead of reported.
+    pub fn take_paused_in_step(&self) -> bool {
+        self.paused_in_step.swap(false, Ordering::SeqCst)
     }
 
     fn cancelled_now(&self) -> bool {
@@ -372,49 +395,56 @@ impl Engine {
         GENERAL_FREE_FLOOR
     }
 
-    /// While a VM runs, a critically hot phone or a nearly full disk pauses the guest over QMP
-    /// (a guest writing into a full disk would fail) and resumes it when cleared.
+    /// The person's pause stops the guest and every helper. While a VM runs, a critically hot
+    /// phone or a nearly full disk does the same until it clears.
     pub fn spawn_pause_watch(self: &Arc<Self>) {
         let me = self.clone();
         let _ = std::thread::Builder::new().name("create-pause".into()).spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_secs(5));
-                let alive = me.sup.alive();
+                std::thread::sleep(Duration::from_secs(1));
                 let mut paused = me.pause.lock().unwrap();
-                if !alive {
-                    *paused = false;
-                    if matches!(me.snapshot().state.as_str(), "done" | "failed" | "cancelled") {
-                        return;
+                if matches!(me.snapshot().state.as_str(), "done" | "failed" | "cancelled") {
+                    if *paused {
+                        super::exec::freeze(false);
                     }
-                    continue;
+                    return;
                 }
+                let alive = me.sup.alive();
+                let by_person = me.pause_requested();
                 let free = free_bytes(&me.paths.files);
-                let hot = super::ctl::thermal() >= super::ctl::THERMAL_CRITICAL;
-                let low = free < VM_FREE_FLOOR;
-                let want = hot || low;
+                let hot = alive && super::ctl::thermal() >= super::ctl::THERMAL_CRITICAL;
+                let low = alive && free < VM_FREE_FLOOR;
+                let want = by_person || hot || low;
                 if want && !*paused {
-                    if crate::qmp::command(&me.paths.qmp_socket(), "stop").is_ok() {
-                        *paused = true;
-                        let (hold, message) = if low {
-                            ("storage", format!("Paused: only {} GB free. Free some space to continue.", free / GIB))
-                        } else {
-                            ("thermal", super::ctl::thermal_text(super::ctl::thermal()).to_string())
-                        };
-                        me.append_log(&format!("[pause] {message}"));
-                        me.status(true, |s| {
-                            s.hold = hold.into();
-                            s.message = message.clone();
-                        });
+                    if alive && crate::qmp::command(&me.paths.qmp_socket(), "stop").is_err() {
+                        continue;
                     }
+                    super::exec::freeze(true);
+                    *paused = true;
+                    me.paused_in_step.store(true, Ordering::SeqCst);
+                    let (hold, message) = if by_person {
+                        ("", "Paused".to_string())
+                    } else if low {
+                        ("storage", format!("Paused: only {} GB free. Free some space to continue.", free / GIB))
+                    } else {
+                        ("thermal", super::ctl::thermal_text(super::ctl::thermal()).to_string())
+                    };
+                    me.append_log(&format!("[pause] {message}"));
+                    me.status(true, |s| {
+                        s.hold = hold.into();
+                        s.message = message.clone();
+                    });
                 } else if !want && *paused {
-                    if crate::qmp::command(&me.paths.qmp_socket(), "cont").is_ok() {
-                        *paused = false;
-                        me.append_log("[pause] resumed");
-                        me.status(true, |s| {
-                            s.hold.clear();
-                            s.message.clear();
-                        });
+                    if alive && crate::qmp::command(&me.paths.qmp_socket(), "cont").is_err() {
+                        continue;
                     }
+                    super::exec::freeze(false);
+                    *paused = false;
+                    me.append_log("[pause] resumed");
+                    me.status(true, |s| {
+                        s.hold.clear();
+                        s.message.clear();
+                    });
                 }
             }
         });
@@ -455,6 +485,9 @@ impl Gate for Engine {
         self.cancelled_now()
     }
     fn blocked(&self) -> Option<String> {
+        if self.pause_requested() {
+            return Some("Paused".to_string());
+        }
         super::ctl::set_cellular_ok(self.spec.allow_cellular || self.vm.join(CELLULAR_FILE).exists());
         super::ctl::network_block().map(str::to_string)
     }
@@ -473,7 +506,7 @@ impl Gate for Engine {
         });
     }
     fn hold(&self, message: &str) {
-        let hold = if message.is_empty() {
+        let hold = if message.is_empty() || message == "Paused" {
             ""
         } else if message.contains("Wi-Fi") {
             "wifi"
@@ -506,7 +539,11 @@ impl Progress for Engine {
             s.eta_secs = self.eta(s);
         });
     }
+    /// Every long in-process job asks this often, so a pause stops them here.
     fn cancelled(&self) -> bool {
+        while self.pause_requested() && !self.cancelled_now() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
         self.cancelled_now()
     }
 }

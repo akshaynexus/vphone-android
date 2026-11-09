@@ -72,6 +72,8 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     ]);
     push(&["-global", &format!("apple-gfx-mmio.resolution={res}")]);
     push(&["-global", "apple-gfx-mmio.process-isolation=on"]);
+    // The virtual network card's boot ROM is not in the app, and iOS does not use it.
+    push(&["-global", "virtio-net-pci.romfile="]);
     push(&["-display", "none"]);
     let vsock = opt(&paths.vsock_socket().to_string_lossy());
     push(&[

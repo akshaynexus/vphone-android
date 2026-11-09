@@ -103,6 +103,8 @@ pub fn dfu_spec(b: &Bundle, cfg: &VmConfig, paths: &Paths, run: &Path, vusb: &Pa
             &format!("file={sep},if=none,id=sep-storage,format=raw,file.locking=off"),
         ]);
     }
+    // The virtual network card's boot ROM is not in the app, and iOS does not use it.
+    push(&["-global", "virtio-net-pci.romfile="]);
     push(&["-display", "none"]);
     let qmp = opt(&paths.qmp_socket().to_string_lossy());
     push(&["-qmp", &format!("unix:{qmp},server=on,wait=off")]);
@@ -349,12 +351,8 @@ impl Supervisor {
         let tail = tail.trim();
         let reason = self.process.exit_reason();
         format!(
-            "QEMU exited.{}{}",
-            if reason.is_empty() {
-                String::new()
-            } else {
-                format!(" {reason}")
-            },
+            "{}{}",
+            if reason.is_empty() { "QEMU exited." } else { reason.as_str() },
             if tail.is_empty() {
                 String::new()
             } else {
@@ -385,11 +383,14 @@ impl Supervisor {
         fs::write(spec_path(&self.paths), json).map_err(|e| e.to_string())?;
         self.process.start()?;
 
-        self.wait("the VM process", Duration::from_secs(90), || {
-            read_pid(&self.paths).is_some_and(alive)
-        })
-        .map_err(|e| format!("{e}: {}", self.died(run)))?;
+        // The pid is written just before QEMU starts, so one that is already gone died at startup.
+        self.wait("the VM process", Duration::from_secs(90), || read_pid(&self.paths).is_some())
+            .map_err(|e| format!("{e}: {}", self.died(run)))?;
         let pid = read_pid(&self.paths).unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(500));
+        if !alive(pid) {
+            return Err(self.died(run));
+        }
         *self.current.lock().unwrap() = Some(Current {
             pid,
             run: run.to_path_buf(),

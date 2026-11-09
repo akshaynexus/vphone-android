@@ -42,6 +42,26 @@
         android:layout_marginTop="8dp"
         android:textAppearance="?attr/textAppearanceBodyMedium" />
 
+    <TextView
+        android:id="@+id/error"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:maxLines="10"
+        android:scrollbars="vertical"
+        android:textAppearance="?attr/textAppearanceBodyMedium"
+        android:textColor="?attr/colorError"
+        android:textIsSelectable="true"
+        android:visibility="gone" />
+
+    <Button
+        android:id="@+id/copy_error"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Copy error and log"
+        android:visibility="gone" />
+
     <com.google.android.material.progressindicator.LinearProgressIndicator
         android:id="@+id/bar"
         android:layout_width="match_parent"
@@ -91,12 +111,21 @@
         android:layout_height="wrap_content">
 
         <Button
+            android:id="@+id/pause"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Pause"
+            android:visibility="gone" />
+
+        <Button
             android:id="@+id/cancel"
             style="@style/Widget.Material3.Button.TextButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Cancel" />
+            android:text="Stop" />
 
         <Button
             android:id="@+id/delete"

@@ -7,7 +7,34 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// The process groups of the helpers started so far, and whether they are paused.
+static GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+static FROZEN: AtomicBool = AtomicBool::new(false);
+
+fn signal_group(pid: i32, signal: i32) -> bool {
+    // SAFETY: signals are sent only to a group a helper created with setsid.
+    unsafe { libc::kill(-pid, signal) == 0 }
+}
+
+fn register(pid: i32) {
+    let mut groups = GROUPS.lock().unwrap();
+    groups.push(pid);
+    if FROZEN.load(Ordering::SeqCst) {
+        signal_group(pid, libc::SIGSTOP);
+    }
+}
+
+/// Stops or continues every helper. Groups that have ended are forgotten.
+pub fn freeze(on: bool) {
+    let mut groups = GROUPS.lock().unwrap();
+    FROZEN.store(on, Ordering::SeqCst);
+    let signal = if on { libc::SIGSTOP } else { libc::SIGCONT };
+    groups.retain(|pid| signal_group(*pid, signal));
+}
 
 #[derive(Clone, Debug)]
 pub struct Exec {
@@ -51,18 +78,26 @@ impl Exec {
     }
 
     fn start(&self) -> Result<Child, String> {
-        self.command()?
+        let child = self
+            .command()?
             .spawn()
-            .map_err(|e| format!("cannot start {}: {e}", self.program.display()))
+            .map_err(|e| format!("cannot start {}: {e}", self.program.display()))?;
+        register(child.id() as i32);
+        Ok(child)
     }
 
     /// Runs to the end; the exit code, or an error for a cancel or a time-out.
     pub fn run(&self, cancelled: &dyn Fn() -> bool) -> Result<i32, String> {
         let mut scan_from = fs::metadata(&self.log).map_or(0, |m| m.len());
         let mut child = self.start()?;
-        let started = Instant::now();
+        let mut started = Instant::now();
         let mut finished_at: Option<Instant> = None;
+        const TICK: Duration = Duration::from_millis(500);
         loop {
+            // Time spent paused does not count against the helper's limit.
+            if FROZEN.load(Ordering::SeqCst) {
+                started += TICK;
+            }
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                 return Ok(status
                     .code()
@@ -89,7 +124,7 @@ impl Exec {
                     return Ok(0);
                 }
             }
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(TICK);
         }
     }
 
@@ -121,7 +156,11 @@ impl Drop for Background {
 fn stop_group(child: &mut Child) {
     let pid = child.id() as i32;
     // SAFETY: signals are sent only to the group this child created with setsid.
-    unsafe { libc::kill(-pid, libc::SIGTERM) };
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+        // A paused helper has to run to act on the signal.
+        libc::kill(-pid, libc::SIGCONT);
+    }
     for _ in 0..20 {
         if child.try_wait().ok().flatten().is_some() {
             return;
@@ -193,6 +232,41 @@ mod tests {
         let err = e.run(&move || start.elapsed() > Duration::from_millis(300)).unwrap_err();
         assert_eq!(err, "cancelled");
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Changes process-wide state, so it runs alone: `cargo test -- --ignored freeze`.
+    #[test]
+    #[ignore]
+    fn freeze_stops_helpers_and_continue_resumes_them() {
+        let dir = std::env::temp_dir().join(format!("vphone-freeze-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let ticks = dir.join("ticks");
+        let exec = Exec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                format!("while :; do echo x >> {}; sleep 0.05; done", ticks.display()),
+            ],
+            env: Vec::new(),
+            cwd: dir.clone(),
+            log: dir.join("log"),
+            timeout: None,
+            done_when: None,
+        };
+        let size = || fs::metadata(&ticks).map_or(0, |m| m.len());
+        let running = exec.spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(size() > 0, "the helper is running");
+        freeze(true);
+        std::thread::sleep(Duration::from_millis(300));
+        let frozen = size();
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(size(), frozen, "a frozen helper does nothing");
+        freeze(false);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(size() > frozen, "it carries on after the pause");
+        drop(running);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

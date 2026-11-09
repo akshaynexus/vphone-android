@@ -4,8 +4,9 @@
 
 use super::compat::Firmware;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -123,6 +124,43 @@ pub struct Status {
     pub error: String,
     pub log: String,
     pub updated_ms: u64,
+    /// Whether the person paused it. Read from the pause file when the status is asked for.
+    pub paused: bool,
+}
+
+/// Held by the process running a creation. The kernel drops it when that process ends, however it
+/// ends, so it says whether a run is alive without guessing from how recent its status is.
+pub const LOCK_FILE: &str = ".create-lock";
+
+fn flock(file: &File, operation: i32) -> bool {
+    // SAFETY: the descriptor is valid for the call's duration.
+    unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) == 0 }
+}
+
+/// Takes the run's lock; `None` when another process holds it.
+pub fn acquire_lock(vm: &Path) -> Option<File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(vm.join(LOCK_FILE))
+        .ok()?;
+    // A status check holds a shared lock for an instant; only a real run keeps it.
+    for _ in 0..40 {
+        if flock(&file, libc::LOCK_EX) {
+            return Some(file);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+/// Whether a process is running this creation now.
+pub fn run_is_live(vm: &Path) -> bool {
+    let Ok(file) = File::open(vm.join(LOCK_FILE)) else {
+        return false;
+    };
+    !flock(&file, libc::LOCK_SH)
 }
 
 pub fn read_status(vm: &Path) -> Option<Status> {

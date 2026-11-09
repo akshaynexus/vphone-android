@@ -36,7 +36,6 @@ pub const REQUIRED_LIBS: &[&str] = &[
 ];
 const FIRST_RESTORE_MIN_GB: u64 = 25;
 const COMFORTABLE_GB: u64 = 60;
-const STALE_AFTER_MS: u64 = 60_000;
 const DELETE_MARKER: &str = ".create-delete-after";
 
 fn active_file(paths: &Paths) -> PathBuf {
@@ -193,11 +192,12 @@ pub fn pending(paths: &Paths) -> Option<String> {
     (!name.is_empty() && vm.join(state::SPEC_FILE).is_file()).then_some(name)
 }
 
-/// The status the UI shows: a "running" one that stopped being updated is "interrupted".
+/// The status the UI shows: a "running" one with no process behind it is "interrupted".
 pub fn status_json(paths: &Paths, name: &str) -> String {
     let vm = vm_path(paths, name);
     let mut status = state::read_status(&vm).unwrap_or_default();
-    if status.state == "running" && state::now_ms().saturating_sub(status.updated_ms) > STALE_AFTER_MS {
+    status.paused = vm.join(engine::PAUSE_FILE).exists();
+    if status.state == "running" && !state::run_is_live(&vm) {
         status.state = "interrupted".into();
         status.message = "It stopped while the app or the phone restarted; tap Resume.".into();
     }
@@ -205,7 +205,19 @@ pub fn status_json(paths: &Paths, name: &str) -> String {
 }
 
 pub fn request_cancel(paths: &Paths, name: &str) {
-    let _ = fs::write(vm_path(paths, name).join(engine::CANCEL_FILE), b"");
+    let vm = vm_path(paths, name);
+    let _ = fs::write(vm.join(engine::CANCEL_FILE), b"");
+    let _ = fs::remove_file(vm.join(engine::PAUSE_FILE));
+}
+
+/// Pauses or resumes a running creation; its engine applies this within a second.
+pub fn request_pause(paths: &Paths, name: &str, paused: bool) {
+    let file = vm_path(paths, name).join(engine::PAUSE_FILE);
+    if paused {
+        let _ = fs::write(file, b"");
+    } else {
+        let _ = fs::remove_file(file);
+    }
 }
 
 pub fn set_cellular(paths: &Paths, name: &str, allow: bool) {
@@ -218,9 +230,7 @@ pub fn set_cellular(paths: &Paths, name: &str, allow: bool) {
 }
 
 fn running_now(vm: &std::path::Path) -> bool {
-    state::read_status(vm).is_some_and(|s| {
-        s.state == "running" && state::now_ms().saturating_sub(s.updated_ms) <= STALE_AFTER_MS
-    })
+    state::read_status(vm).is_some_and(|s| s.state == "running") && state::run_is_live(vm)
 }
 
 /// Deletes a VM (and, optionally, its cached firmware). A running creation stops first and the
@@ -264,8 +274,13 @@ fn finish(paths: &Paths, name: &str, keep_active: bool) {
 
 /// Runs the creation to its end (blocking). Any error text is in the status too.
 pub fn run(paths: &Paths, name: &str, process: Arc<dyn vm::VmProcess>) -> Result<(), String> {
+    // Held until this returns: a second start of the same creation stops here.
+    let Some(_lock) = state::acquire_lock(&vm_path(paths, name)) else {
+        return Ok(());
+    };
     let e = engine::Engine::new(paths.clone(), name, process)?;
     let _ = fs::remove_file(e.vm.join(engine::CANCEL_FILE));
+    let _ = fs::remove_file(e.vm.join(engine::PAUSE_FILE));
     ctl::clear_cancel();
     let result = steps::run(&e);
     let state_text = match &result {
@@ -363,6 +378,44 @@ mod tests {
     }
 
     #[test]
+    fn a_running_status_is_live_only_while_its_process_holds_the_lock() {
+        let p = paths("lock");
+        begin_ignoring_storage(&p, "vm1");
+        let vm = vm_path(&p, "vm1");
+        let state_now = |p: &Paths| -> String {
+            let out: serde_json::Value = serde_json::from_str(&status_json(p, "vm1")).unwrap();
+            out["state"].as_str().unwrap().to_string()
+        };
+        let lock = state::acquire_lock(&vm).unwrap();
+        // However old its last status, a run that is alive is not "interrupted".
+        let mut s = state::read_status(&vm).unwrap();
+        s.updated_ms = state::now_ms() - 60 * 60 * 1000;
+        state::write_status(&vm, &s);
+        assert_eq!(state_now(&p), "running");
+        assert!(state::acquire_lock(&vm).is_none(), "a second run must not start");
+        drop(lock);
+        assert_eq!(state_now(&p), "interrupted");
+    }
+
+    #[test]
+    fn pausing_shows_in_the_status_and_a_stop_clears_it() {
+        let p = paths("pause");
+        begin_ignoring_storage(&p, "vm1");
+        let paused = |p: &Paths| -> bool {
+            let out: serde_json::Value = serde_json::from_str(&status_json(p, "vm1")).unwrap();
+            out["paused"].as_bool().unwrap()
+        };
+        assert!(!paused(&p));
+        request_pause(&p, "vm1", true);
+        assert!(paused(&p));
+        request_pause(&p, "vm1", false);
+        assert!(!paused(&p));
+        request_pause(&p, "vm1", true);
+        request_cancel(&p, "vm1");
+        assert!(!paused(&p));
+    }
+
+    #[test]
     fn a_second_creation_is_refused_until_the_first_is_gone() {
         let p = paths("second");
         begin_ignoring_storage(&p, "vm1");
@@ -382,7 +435,9 @@ mod tests {
         let p = paths("defer");
         begin_ignoring_storage(&p, "vm1");
         let vm = vm_path(&p, "vm1");
+        let lock = state::acquire_lock(&vm).unwrap();
         delete(&p, "vm1", true).unwrap();
+        drop(lock);
         assert!(vm.join(DELETE_MARKER).exists() && vm.join(engine::CANCEL_FILE).exists());
         // Once the run has ended and written that it stopped, the marker finishes the removal.
         let mut s = state::read_status(&vm).unwrap();

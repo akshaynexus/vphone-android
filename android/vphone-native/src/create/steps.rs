@@ -57,6 +57,7 @@ fn run_steps(e: &Arc<Engine>, steps: &'static [StepDef]) -> Result<(), String> {
     }
     let total = steps.len();
     let mut i = 0;
+    let mut redone_after_pause: Option<&str> = None;
     while i < total {
         let def = &steps[i];
         if state::done(&e.vm, def.key) {
@@ -75,7 +76,9 @@ fn run_steps(e: &Arc<Engine>, steps: &'static [StepDef]) -> Result<(), String> {
                 continue;
             }
         }
+        e.wait_while_paused()?;
         e.hold_until_clear(def.floor)?;
+        e.take_paused_in_step();
         e.begin_step(def.key);
         e.append_log(&format!("▶ {} ({}/{})", def.key, i + 1, total));
         if def.key == "patch" {
@@ -90,6 +93,14 @@ fn run_steps(e: &Arc<Engine>, steps: &'static [StepDef]) -> Result<(), String> {
             }
             Err(m) => {
                 let cancelled = m == "cancelled";
+                if !cancelled && e.take_paused_in_step() && redone_after_pause != Some(def.key) {
+                    redone_after_pause = Some(def.key);
+                    e.append_log(&format!("step {} stopped after a pause ({m}); running it again", def.key));
+                    e.end_step(def.key, "pending", started.elapsed());
+                    let _ = e.sup.stop();
+                    e.usb_down();
+                    continue;
+                }
                 e.append_log(&format!("step {} {}", def.key, if cancelled { "cancelled" } else { "failed" }));
                 if !cancelled {
                     e.append_log(m);

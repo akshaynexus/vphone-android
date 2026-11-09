@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -28,9 +29,15 @@ class CreateService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val name = intent?.getStringExtra(EXTRA_NAME) ?: Native.createPending()
+        if (intent?.action == ACTION_PAUSE) {
+            Native.createPause(name, intent.getBooleanExtra(EXTRA_PAUSED, true))
+            return START_STICKY
+        }
         // A system restart (no intent) continues a run that was in progress, not one the
         // person stopped or that failed.
-        val resumable = intent != null || JSONObject(Native.createStatus(name)).optString("state") in RESUMABLE
+        val resumable = intent != null || JSONObject(Native.createStatus(name)).let {
+            it.optString("state") in RESUMABLE && !it.optBoolean("paused")
+        }
         if (name.isEmpty() || !resumable) {
             stopSelf()
             return START_NOT_STICKY
@@ -114,6 +121,13 @@ class CreateService : Service() {
         var last = ""
         while (running) {
             val status = runCatching { JSONObject(Native.createStatus(name)) }.getOrNull()
+            // A paused creation does no work, so it does not keep the phone awake.
+            if (status?.optBoolean("paused") == true) {
+                wakeLock?.let { if (it.isHeld) it.release() }
+                wakeLock = null
+            } else {
+                acquireWakeLock()
+            }
             val notification = progressNotification(name, status)
             val key = status?.toString().orEmpty()
             if (key != last) {
@@ -131,7 +145,8 @@ class CreateService : Service() {
     )
 
     private fun progressNotification(name: String, status: JSONObject?): Notification {
-        val text = status?.optString("message").orEmpty().ifEmpty { "Starting" }
+        val paused = status?.optBoolean("paused") == true
+        val text = if (paused) "Paused" else status?.optString("message").orEmpty().ifEmpty { "Starting" }
         val total = status?.optLong("totalBytes") ?: 0
         val done = status?.optLong("doneBytes") ?: 0
         val builder = Notification.Builder(this, App.CHANNEL_CREATE)
@@ -140,7 +155,20 @@ class CreateService : Service() {
             .setContentText(text)
             .setContentIntent(openActivity(0))
             .setOngoing(true)
-        if (total > 0) builder.setProgress(1000, (1000 * done / total).toInt(), false)
+            .addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, R.drawable.ic_phone),
+                    if (paused) "Resume" else "Pause",
+                    PendingIntent.getService(
+                        this, 2,
+                        Intent(this, CreateService::class.java).setAction(ACTION_PAUSE)
+                            .putExtra(EXTRA_NAME, name).putExtra(EXTRA_PAUSED, !paused),
+                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                    ),
+                ).build(),
+            )
+        if (paused) builder.setProgress(0, 0, false)
+        else if (total > 0) builder.setProgress(1000, (1000 * done / total).toInt(), false)
         else builder.setProgress(0, 0, true)
         return builder.build()
     }
@@ -149,7 +177,7 @@ class CreateService : Service() {
         val state = status?.optString("state").orEmpty()
         val (title, body) = when (state) {
             "done" -> "$name is ready" to "The VM is created. Open the app to launch it."
-            "failed" -> "Creating $name stopped" to (status?.optString("error")?.take(120) ?: "See the log")
+            "failed" -> "Creating $name stopped" to (status?.optString("error")?.ifEmpty { null } ?: "See the log")
             "cancelled" -> "Creating $name cancelled" to "Open the app to resume or delete it."
             else -> return
         }
@@ -159,6 +187,7 @@ class CreateService : Service() {
                 .setSmallIcon(R.drawable.ic_phone)
                 .setContentTitle(title)
                 .setContentText(body)
+                .setStyle(Notification.BigTextStyle().bigText(body))
                 .setContentIntent(openActivity(1))
                 .setAutoCancel(true)
                 .build(),
@@ -186,6 +215,8 @@ class CreateService : Service() {
     companion object {
         private const val NOTIFICATION = 2
         private const val EXTRA_NAME = "name"
+        private const val EXTRA_PAUSED = "paused"
+        private const val ACTION_PAUSE = "com.vphone.android.PAUSE"
         private val RESUMABLE = setOf("running", "interrupted")
 
         fun start(context: Context, name: String) {

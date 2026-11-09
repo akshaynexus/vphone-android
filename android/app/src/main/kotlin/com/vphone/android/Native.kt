@@ -41,6 +41,7 @@ object Native {
     external fun createRun(name: String): String
     external fun createVmRun(): String
     external fun createCancel(name: String)
+    external fun createPause(name: String, paused: Boolean)
     external fun createAllowCellular(name: String, allow: Boolean)
     external fun createNetwork(connected: Boolean, unmetered: Boolean)
     external fun createThermal(status: Int)

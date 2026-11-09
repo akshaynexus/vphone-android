@@ -10,7 +10,9 @@ class CreateBootReceiver : BroadcastReceiver() {
         val name = Native.createPending()
         if (name.isEmpty()) return
         // A creation the person cancelled or that failed waits for them to resume it.
-        val state = org.json.JSONObject(Native.createStatus(name)).optString("state")
-        if (state == "running" || state == "interrupted") CreateService.resumeAfterBoot(context, name)
+        val status = org.json.JSONObject(Native.createStatus(name))
+        val state = status.optString("state")
+        val running = state == "running" || state == "interrupted"
+        if (running && !status.optBoolean("paused")) CreateService.resumeAfterBoot(context, name)
     }
 }
