@@ -273,6 +273,7 @@ fn probe(e: &Engine, run: &std::path::Path) -> Result<(), String> {
 
 /// Runs `exec` while the VM must stay up: a dead QEMU would otherwise leave the tool waiting.
 fn run_with_vm(e: &Arc<Engine>, exec: super::exec::Exec, what: &str) -> Result<(), String> {
+    let log = exec.log.to_string_lossy().into_owned();
     let vm_gone = std::cell::Cell::new(false);
     let code = exec.run(&|| {
         let alive = e.sup.alive();
@@ -286,7 +287,10 @@ fn run_with_vm(e: &Arc<Engine>, exec: super::exec::Exec, what: &str) -> Result<(
     }
     match code? {
         0 => Ok(()),
-        c => Err(format!("{what} failed with status {c}; see its log")),
+        c => Err(format!(
+            "{what} failed with status {c}\nIts last output:\n{}",
+            crate::runtime::log_tail(&log, 3000).trim()
+        )),
     }
 }
 

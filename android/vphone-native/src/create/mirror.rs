@@ -33,6 +33,8 @@ pub fn stage_of(line: &str) -> Option<(u64, &'static str)> {
 
 pub struct Mirror {
     path: PathBuf,
+    /// Kept open once found: the file's VM can be deleted before its last lines have been read.
+    file: Option<File>,
     offset: u64,
     partial: Vec<u8>,
     stage: u64,
@@ -43,6 +45,7 @@ impl Mirror {
     pub fn new(path: &Path) -> Mirror {
         Mirror {
             path: path.to_path_buf(),
+            file: File::open(path).ok(),
             offset: std::fs::metadata(path).map_or(0, |m| m.len()),
             partial: Vec::new(),
             stage: 0,
@@ -51,7 +54,10 @@ impl Mirror {
 
     /// The complete lines written since the last call.
     pub fn drain(&mut self) -> Vec<String> {
-        let Ok(mut file) = File::open(&self.path) else {
+        if self.file.is_none() {
+            self.file = File::open(&self.path).ok();
+        }
+        let Some(file) = self.file.as_mut() else {
             return Vec::new();
         };
         let mut new = Vec::new();
@@ -91,7 +97,7 @@ mod tests {
 
     #[test]
     fn a_real_restore_moves_forward_through_every_stage() {
-        let mut m = Mirror { path: PathBuf::new(), offset: 0, partial: Vec::new(), stage: 0 };
+        let mut m = Mirror { path: PathBuf::new(), file: None, offset: 0, partial: Vec::new(), stage: 0 };
         let seen: Vec<u64> = REAL.lines().filter_map(|l| m.advance(l).map(|s| s.0)).collect();
         assert_eq!(seen, (1..=STAGE_COUNT).collect::<Vec<_>>());
         assert_eq!(m.advance("Sending iBSS (380445 bytes)..."), None, "it never goes back");
@@ -112,6 +118,10 @@ mod tests {
         writeln!(f, "ne").unwrap();
         f.flush().unwrap();
         assert_eq!(m.drain(), vec!["half a line"]);
+        writeln!(f, "the error").unwrap();
+        f.flush().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(m.drain(), vec!["the error"], "a deleted file's last lines are still read");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
