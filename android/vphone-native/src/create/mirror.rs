@@ -38,6 +38,12 @@ pub fn sent_mib(line: &str) -> Option<u64> {
     line.strip_prefix("vusbd: sent ")?.split(' ').next()?.parse().ok()
 }
 
+/// A long stage of the restore that only the guest's own log shows, and what to say during it.
+pub fn guest_stage(line: &str) -> Option<&'static str> {
+    line.contains("executing /usr/sbin/mtree")
+        .then_some("Verifying every iOS system file (one CPU, no progress reported; this can take a long time)")
+}
+
 /// How far the guest's image restore has got: `ASR RESTORE PROGRESS: 40%`, anywhere in a line.
 pub fn asr_percent(line: &str) -> Option<u64> {
     let (_, rest) = line.split_once("ASR RESTORE PROGRESS:")?;
@@ -196,6 +202,12 @@ mod tests {
         let seen: Vec<u64> = REAL.lines().filter_map(|l| m.advance(l).map(|s| s.0)).collect();
         assert_eq!(seen, (1..=STAGE_COUNT).collect::<Vec<_>>());
         assert_eq!(m.advance("Sending iBSS (380445 bytes)..."), None, "it never goes back");
+    }
+
+    #[test]
+    fn names_the_long_verify_stage() {
+        assert!(guest_stage("executing /usr/sbin/mtree -p /mnt1 -m /mnt5/x -f /mnt5/y").is_some());
+        assert_eq!(guest_stage("Fast mtree path not enabled."), None);
     }
 
     #[test]

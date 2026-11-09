@@ -68,6 +68,8 @@ STAGE=$BUILD/jniLibs/arm64-v8a
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libvphone_native.so" "$STAGE/"
+# Gradle's own strip step does not always run; the debug info is most of this file.
+"$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-debug "$STAGE/libvphone_native.so"
 cargo build --manifest-path "$ANDROID_DIR/vphone-vm/Cargo.toml" --release --target aarch64-linux-android
 cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/vphone_vm" "$STAGE/libvphone_vm.so"
 cp "$QEMU_LIB" "$TURNIP_LIB" "${CREATE_HELPERS[@]}" "$STAGE/"

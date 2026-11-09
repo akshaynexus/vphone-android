@@ -68,8 +68,24 @@ pub fn split_source(line: &str) -> (u8, &str) {
 pub fn is_error(body: &str) -> bool {
     const SAYS: [&str; 9] =
         ["error", "fail", "panic", "fatal", "unable to", "cannot", "timed out", "refused", "denied"];
-    const BUT_NOT: [&str; 7] =
-        ["no error", "0 error", "error: 0", "error=0", "err=0", "failsafe", "fail-safe"];
+    // The last group is what every restore system prints, hundreds of times over, on its way to
+    // working: it would bury whatever really went wrong.
+    const BUT_NOT: [&str; 14] = [
+        "no error",
+        "0 error",
+        "error: 0",
+        "error=0",
+        "err=0",
+        "failsafe",
+        "fail-safe",
+        "considering saving tolerated failures",
+        "not a failure",
+        "failed lookup:",
+        "failed to bootstrap path",
+        "kpersona_find_by_type",
+        "unable to find persona with type",
+        "failed to read nonce slot data",
+    ];
     let lower = body.to_ascii_lowercase();
     SAYS.iter().any(|s| lower.contains(s)) && !BUT_NOT.iter().any(|s| lower.contains(s))
 }
@@ -1414,6 +1430,15 @@ mod tests {
         assert_eq!(split_source("[mux] RX error"), (SRC_USB, "RX error"));
         assert_eq!(split_source("[usb] vusbd: sent 8 MiB in 7.0 s"), (SRC_USB, "vusbd: sent 8 MiB in 7.0 s"));
         assert_eq!(split_source("Waiting for device to enter restore mode...").0, SRC_TOOL);
+        for routine in [
+            "Considering saving tolerated failures: false (null) false",
+            "AppleImage4: magazine[pdmg]: failed to read nonce slot data: 2",
+            "Driver not present yet for region = 3, not a failure",
+            "(user/501) <Warning>: failed lookup: name = com.apple.logd, flags = 0x9",
+        ] {
+            assert!(!is_error(routine), "{routine}");
+        }
+        assert!(is_error("TXM [Error]: Errno: selector: 45 | 78"), "this one can matter");
         for bad in ["ERROR: Unable to connect", "step restore failed", "panic(cpu 0 caller 0x1): x", "the restore timed out"] {
             assert!(is_error(bad), "{bad}");
         }

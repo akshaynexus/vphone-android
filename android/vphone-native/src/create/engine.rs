@@ -306,6 +306,14 @@ impl Engine {
                 if let Some(percent) = mirror::asr_percent(&line) {
                     self.show_restore_progress(percent);
                 }
+                if let Some(text) = mirror::guest_stage(&line) {
+                    self.status(true, |s| {
+                        s.done_bytes = 0;
+                        s.total_bytes = 0;
+                        s.bytes_per_sec = 0;
+                        s.message = text.to_string();
+                    });
+                }
                 self.append_log(&format!("{}{line}", followed.prefix));
             }
         }

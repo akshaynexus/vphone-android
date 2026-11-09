@@ -1,3 +1,104 @@
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index c1e3ad05b3821f42d9f697a49f96651d9fa7613f..35ed310d381294b91fb2a902c97880e495e5bb8d 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -258,7 +258,7 @@ static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
+         return NULL;
+     }
+ 
+-    tb_jmp_cache_fill(jc, hash, s.pc, tb);
++    tb_jmp_cache_fill(jc, cpu->cpu_index, hash, s.pc, tb);
+ 
+ hit:
+     /*
+@@ -1024,7 +1024,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+                  */
+                 h = tb_jmp_cache_hash_func(s.pc);
+                 jc = cpu->tb_jmp_cache;
+-                tb_jmp_cache_fill(jc, h, s.pc, tb);
++                tb_jmp_cache_fill(jc, cpu->cpu_index, h, s.pc, tb);
+             }
+ 
+             /*
+diff --git a/accel/tcg/tb-jmp-cache.h b/accel/tcg/tb-jmp-cache.h
+index 41e788eabca248248e39dab4dc39a6cd192a500c..1f2b5a9593c4c106b6783e567ef0006830749972 100644
+--- a/accel/tcg/tb-jmp-cache.h
++++ b/accel/tcg/tb-jmp-cache.h
+@@ -90,10 +90,20 @@ typedef struct CPUJumpCache {
+     } array[TB_JMP_CACHE_SIZE];
+ } CPUJumpCache;
+ 
+-/* Fill entry @h of @jc with @tb for @pc, in generation @gen. */
+-static inline void tb_jmp_cache_fill(CPUJumpCache *jc, uint32_t h, vaddr pc,
++/* Fill entry @h of @jc, vCPU @cpu_index's, with @tb for @pc, in generation @gen. */
++static inline void tb_jmp_cache_fill(CPUJumpCache *jc, int cpu_index,
++                                     uint32_t h, vaddr pc,
+                                      TranslationBlock *tb)
+ {
++    if (likely(cpu_index < TB_JMP_CPUS)) {
++        uint32_t was = qatomic_read(&tb->jc_hash[cpu_index]);
++
++        if (was == 0) {
++            qatomic_set(&tb->jc_hash[cpu_index], h + 1);
++        } else if (was != h + 1) {
++            qatomic_or(&tb->jc_many, 1u << cpu_index);
++        }
++    }
+     jc->array[h].pc = pc;
+     jc->array[h].cs_base = tb->cs_base;
+     jc->array[h].tc_ptr = tb->tc.ptr;
+@@ -102,6 +112,11 @@ static inline void tb_jmp_cache_fill(CPUJumpCache *jc, uint32_t h, vaddr pc,
+     jc->array[h].gen = jc->gen;
+     jc->array[h].bgen = jc->bgen[h >> TB_JMP_BUCKET_SHIFT];
+     qatomic_set(&jc->array[h].tb, tb);
++    /* An invalidation that ran before this store could not see the entry. */
++    smp_mb();
++    if (unlikely(qatomic_read(&tb->cflags) & CF_INVALID)) {
++        qatomic_set(&jc->array[h].tb, NULL);
++    }
+ }
+ 
+ /* Whether entry @h of @jc is of the current generations (keys aside). */
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index 510c62e60dd0890c43c5578e6a28d4853a3e6b83..f1ab6fdd3b9d44834f9b7fd3be17ef57291155fe 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -800,9 +800,20 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
+     CPUState *cpu;
+ 
+     if (tb_cflags(tb) & CF_PCREL) {
+-        /* A TB may be at any virtual address */
++        /* A TB may be at any virtual address: the TB knows where it was put */
+         CPU_FOREACH(cpu) {
+-            tcg_flush_jmp_cache(cpu);
++            CPUJumpCache *jc = cpu->tb_jmp_cache;
++            int i = cpu->cpu_index;
++
++            if (i >= TB_JMP_CPUS || (qatomic_read(&tb->jc_many) & (1u << i))) {
++                tcg_flush_jmp_cache(cpu);
++            } else {
++                uint32_t h = qatomic_read(&tb->jc_hash[i]);
++
++                if (h && jc && qatomic_read(&jc->array[h - 1].tb) == tb) {
++                    qatomic_set(&jc->array[h - 1].tb, NULL);
++                }
++            }
+         }
+     } else {
+         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 7ad58731eaef058870e608f9199e80d44bf6430c..f932c66921663eb6b2475e41914c5d51687573da 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -295,6 +295,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+         cpu->exception_index = EXCP_INTERRUPT;
+         cpu_loop_exit(cpu);
+     }
++    memset(tb->jc_hash, 0, sizeof(tb->jc_hash));
++    tb->jc_many = 0;
+ 
+     gen_code_buf = tcg_ctx->code_gen_ptr;
+     tb->tc.ptr = tcg_splitwx_to_rx(gen_code_buf);
 diff --git a/backends/hostmem-memfd.c b/backends/hostmem-memfd.c
 index 923239f9cf695743dc79bc1bef8b4d9e1c729e5d..79cc0e17a600b5795683dbeb53b6008ba1f814c1 100644
 --- a/backends/hostmem-memfd.c
@@ -107,6 +208,19 @@ index 97ee78299bf7566a1c0c808dc7bbca7eaad82102..f967680fc16ffa1b007db3787a268f4a
  #endif
  
      filename = g_strdup_printf("%s/vl.XXXXXX", tmpdir);
+diff --git a/host/include/aarch64/host/cpuinfo.h b/host/include/aarch64/host/cpuinfo.h
+index fe671534e40fa0198a42a08e69af4c6054f09be3..6af9b4e0d3b3799aba292aca8de52b6e61c04dd0 100644
+--- a/host/include/aarch64/host/cpuinfo.h
++++ b/host/include/aarch64/host/cpuinfo.h
+@@ -12,6 +12,8 @@
+ #define CPUINFO_AES             (1u << 3)
+ #define CPUINFO_PMULL           (1u << 4)
+ #define CPUINFO_BTI             (1u << 5)
++#define CPUINFO_SHA2            (1u << 6)
++#define CPUINFO_SHA512          (1u << 7)
+ 
+ /* Initialized with a constructor. */
+ extern unsigned cpuinfo;
 diff --git a/hw/arm/apple-silicon/meson.build b/hw/arm/apple-silicon/meson.build
 index 8d0b0fab09ba6d442fd147a115b6e1dedfaa1b01..198f5266994b3f9698b85e7d63c4d9383005a614 100644
 --- a/hw/arm/apple-silicon/meson.build
@@ -1512,6 +1626,37 @@ index 9698e3e12e5d58fb7d9a9002c70faf19139f1321..ec8abb813e8c9302040d500c07da194f
      s->rx_buf = g_byte_array_new();
  }
  
+diff --git a/include/exec/translation-block.h b/include/exec/translation-block.h
+index 8bfb9ac9dd986fd5e654e15ccab5a22888c2c47d..184bb093119c4b18bb5a3ecc22db4c99f324cc71 100644
+--- a/include/exec/translation-block.h
++++ b/include/exec/translation-block.h
+@@ -27,6 +27,9 @@ struct tb_tc {
+     size_t size;
+ };
+ 
++/* vPhone: the vCPUs a TranslationBlock tracks its jump cache entries for. */
++#define TB_JMP_CPUS 10
++
+ struct TranslationBlock {
+     /*
+      * Guest PC corresponding to this block.  This must be the true
+@@ -132,6 +135,16 @@ struct TranslationBlock {
+      * translates to it (see gen_goto_tb_checked in translate-a64.c).
+      */
+     uintptr_t vphone_jmp_host[2];
++
++    /*
++     * vphone-linux: where each vCPU's jump cache holds this TB, as its index
++     * + 1 (0: nowhere), so invalidating a CF_PCREL TB clears those entries
++     * instead of every entry of every vCPU's cache. A bit of jc_many says
++     * that vCPU has it at more than one index (the same code at several
++     * addresses); that vCPU's cache is then emptied. See tb_jmp_cache_fill().
++     */
++    uint32_t jc_hash[TB_JMP_CPUS];
++    uint32_t jc_many;
+ };
+ 
+ /* The alignment given to TranslationBlock during allocation. */
 diff --git a/include/hw/virtio/virtio-vsock-uds.h b/include/hw/virtio/virtio-vsock-uds.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..ca8c4060eb471ccc627d27b01ae04e16aafd07a8
@@ -1884,6 +2029,213 @@ index 86006123076d51be4de1099ebbdd474ed8b2edd9..82845176f6c8ec9d95232c20dd9eea81
  #endif
  
  static void memory_region_set_ram_ptr(MemoryRegion *mr, uint64_t size,
+diff --git a/target/arm/tcg/crypto_helper.c b/target/arm/tcg/crypto_helper.c
+index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48278e3cbe 100644
+--- a/target/arm/tcg/crypto_helper.c
++++ b/target/arm/tcg/crypto_helper.c
+@@ -16,6 +16,10 @@
+ #include "crypto/aes-round.h"
+ #include "crypto/sm4.h"
+ #include "vec_internal.h"
++#include "crypto_sha_host.h"
++#ifdef HAVE_HOST_SHA2
++#include "host/cpuinfo.h"
++#endif
+ 
+ #define HELPER_H "tcg/helper.h"
+ #include "exec/helper-proto.h.inc"
+@@ -298,6 +302,13 @@ static uint32_t s1(uint32_t x)
+ 
+ void HELPER(crypto_sha256h)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA2)) {
++        host_sha256h(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rn = vn;
+     uint64_t *rm = vm;
+@@ -333,6 +344,13 @@ void HELPER(crypto_sha256h)(void *vd, void *vn, void *vm, uint32_t desc)
+ 
+ void HELPER(crypto_sha256h2)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA2)) {
++        host_sha256h2(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rn = vn;
+     uint64_t *rm = vm;
+@@ -360,6 +378,13 @@ void HELPER(crypto_sha256h2)(void *vd, void *vn, void *vm, uint32_t desc)
+ 
+ void HELPER(crypto_sha256su0)(void *vd, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA2)) {
++        host_sha256su0(vd, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rm = vm;
+     union CRYPTO_STATE d = { .l = { rd[0], rd[1] } };
+@@ -378,6 +403,13 @@ void HELPER(crypto_sha256su0)(void *vd, void *vm, uint32_t desc)
+ 
+ void HELPER(crypto_sha256su1)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA2)) {
++        host_sha256su1(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rn = vn;
+     uint64_t *rm = vm;
+@@ -432,6 +464,13 @@ static uint64_t s1_512(uint64_t x)
+ 
+ void HELPER(crypto_sha512h)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA512)) {
++        host_sha512h(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rn = vn;
+     uint64_t *rm = vm;
+@@ -449,6 +488,13 @@ void HELPER(crypto_sha512h)(void *vd, void *vn, void *vm, uint32_t desc)
+ 
+ void HELPER(crypto_sha512h2)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA512)) {
++        host_sha512h2(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rn = vn;
+     uint64_t *rm = vm;
+@@ -466,6 +512,13 @@ void HELPER(crypto_sha512h2)(void *vd, void *vn, void *vm, uint32_t desc)
+ 
+ void HELPER(crypto_sha512su0)(void *vd, void *vn, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA512)) {
++        host_sha512su0(vd, vn);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rn = vn;
+     uint64_t d0 = rd[0];
+@@ -482,6 +535,13 @@ void HELPER(crypto_sha512su0)(void *vd, void *vn, uint32_t desc)
+ 
+ void HELPER(crypto_sha512su1)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA512)) {
++        host_sha512su1(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rn = vn;
+     uint64_t *rm = vm;
+diff --git a/target/arm/tcg/crypto_sha_host.h b/target/arm/tcg/crypto_sha_host.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..01f186f20827ff0a0681c18476856de4cb01c7d1
+--- /dev/null
++++ b/target/arm/tcg/crypto_sha_host.h
+@@ -0,0 +1,74 @@
++/*
++ * The guest's SHA-256 and SHA-512 instructions, by the same instructions
++ * on an AArch64 host that has them
++ *
++ * An iOS restore hashes everything it writes: on a PC, a third of the CPU
++ * time of the image write was in the C versions of these helpers. Each
++ * guest instruction maps to the host's identical one.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef TARGET_ARM_CRYPTO_SHA_HOST_H
++#define TARGET_ARM_CRYPTO_SHA_HOST_H
++
++#if defined(__aarch64__) && defined(__clang__) && !HOST_BIG_ENDIAN
++#define HAVE_HOST_SHA2 1
++
++#include <arm_neon.h>
++
++#define HOST_SHA256 __attribute__((target("sha2")))
++#define HOST_SHA512 __attribute__((target("sha3")))
++
++static inline uint32x4_t host_q32(const void *p)
++{
++    return vld1q_u32(p);
++}
++
++static inline uint64x2_t host_q64(const void *p)
++{
++    return vld1q_u64(p);
++}
++
++static inline HOST_SHA256 void host_sha256h(void *d, void *n, void *m)
++{
++    vst1q_u32(d, vsha256hq_u32(host_q32(d), host_q32(n), host_q32(m)));
++}
++
++static inline HOST_SHA256 void host_sha256h2(void *d, void *n, void *m)
++{
++    vst1q_u32(d, vsha256h2q_u32(host_q32(d), host_q32(n), host_q32(m)));
++}
++
++static inline HOST_SHA256 void host_sha256su0(void *d, void *m)
++{
++    vst1q_u32(d, vsha256su0q_u32(host_q32(d), host_q32(m)));
++}
++
++static inline HOST_SHA256 void host_sha256su1(void *d, void *n, void *m)
++{
++    vst1q_u32(d, vsha256su1q_u32(host_q32(d), host_q32(n), host_q32(m)));
++}
++
++static inline HOST_SHA512 void host_sha512h(void *d, void *n, void *m)
++{
++    vst1q_u64(d, vsha512hq_u64(host_q64(d), host_q64(n), host_q64(m)));
++}
++
++static inline HOST_SHA512 void host_sha512h2(void *d, void *n, void *m)
++{
++    vst1q_u64(d, vsha512h2q_u64(host_q64(d), host_q64(n), host_q64(m)));
++}
++
++static inline HOST_SHA512 void host_sha512su0(void *d, void *n)
++{
++    vst1q_u64(d, vsha512su0q_u64(host_q64(d), host_q64(n)));
++}
++
++static inline HOST_SHA512 void host_sha512su1(void *d, void *n, void *m)
++{
++    vst1q_u64(d, vsha512su1q_u64(host_q64(d), host_q64(n), host_q64(m)));
++}
++
++#endif /* AArch64 */
++#endif /* TARGET_ARM_CRYPTO_SHA_HOST_H */
 diff --git a/target/arm/tcg/host-fpcr.h b/target/arm/tcg/host-fpcr.h
 index 982f302b5cb1e7e872c54b11d1cca629dbb4679e..e3e94dc1ae374063a49c34f8ddb76635a5ff6043 100644
 --- a/target/arm/tcg/host-fpcr.h
@@ -3435,6 +3787,21 @@ index 0000000000000000000000000000000000000000..0f2fa665ef2ef572bf711d9586758f5f
 +
 +    return self && self->caller;
 +}
+diff --git a/util/cpuinfo-aarch64.c b/util/cpuinfo-aarch64.c
+index 57468890c33800147c0af70058366e007012dcd7..4691c614b1ac130dc6f3db3c9065185d5e7d4e40 100644
+--- a/util/cpuinfo-aarch64.c
++++ b/util/cpuinfo-aarch64.c
+@@ -70,6 +70,10 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
+     info |= (hwcap & HWCAP_USCAT ? CPUINFO_LSE2 : 0);
+     info |= (hwcap & HWCAP_AES ? CPUINFO_AES : 0);
+     info |= (hwcap & HWCAP_PMULL ? CPUINFO_PMULL : 0);
++    info |= (hwcap & HWCAP_SHA2 ? CPUINFO_SHA2 : 0);
++#ifdef HWCAP_SHA512
++    info |= (hwcap & HWCAP_SHA512 ? CPUINFO_SHA512 : 0);
++#endif
+ 
+     unsigned long hwcap2 = qemu_getauxval(AT_HWCAP2);
+     info |= (hwcap2 & HWCAP2_BTI ? CPUINFO_BTI : 0);
 diff --git a/util/main-loop.c b/util/main-loop.c
 index b877aaea1da1a01b1f1065380caaab072252bc51..5e9fc1ef7c7b4ec31785101a16cb98dc6618494c 100644
 --- a/util/main-loop.c
