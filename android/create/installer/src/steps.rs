@@ -263,17 +263,23 @@ pub fn gpu_driver(params: &GpuParams) -> Result<GpuDriver> {
     fs::create_dir_all(&run).map_err(|e| Error::path(&run, e))?;
     host.log("=== DFU");
     host.start_vm(VmKind::Dfu, &vm, &run).map_err(Error::msg)?;
+    host.log("=== waiting for the VM's DFU mode");
     let mut in_dfu = false;
-    for _ in 0..60 {
+    // A phone's guest answers slowly: the tool's default of 2 seconds is too short here.
+    let probe = strings(&["recovery-probe", "--timeout", "60"]);
+    for _ in 0..20 {
         check_cancel(host)?;
-        if host.run_helper(CLI, &strings(&["recovery-probe"]), &[], params.log, None).map_err(Error::msg)? == 0 {
+        if !host.vm_alive() {
+            bail!("the temporary VM stopped before reaching DFU\n{}", host.diagnostics());
+        }
+        if host.run_helper(CLI, &probe, &[], params.log, None).map_err(Error::msg)? == 0 {
             in_dfu = true;
             break;
         }
         cancellable_sleep(host, Duration::from_secs(3))?;
     }
     if !in_dfu {
-        bail!("the temporary VM did not enter DFU");
+        bail!("the temporary VM did not reach DFU within 20 minutes\n{}", host.diagnostics());
     }
     let log = run.join("restore.log");
     host.log("=== restoring the stock cloudOS");

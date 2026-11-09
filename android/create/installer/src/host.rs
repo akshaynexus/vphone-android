@@ -31,6 +31,10 @@ pub trait Host: Progress {
     fn stop_vm(&self, vm: &Path) -> Result<(), String>;
     fn vm_alive(&self) -> bool;
     fn serial_log(&self) -> PathBuf;
+    /// What the VM and its USB link last said, for an error message.
+    fn diagnostics(&self) -> String {
+        String::new()
+    }
     /// `POST /v1/rpc` on the guest's vphoned; the result object.
     fn vphoned_rpc(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String>;
     /// Run a `lib*.so` helper to completion. Exit status, Err only when it could not be run.

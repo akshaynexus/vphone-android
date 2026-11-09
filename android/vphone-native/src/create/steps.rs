@@ -269,6 +269,7 @@ fn probe(e: &Engine, run: &std::path::Path) -> Result<(), String> {
     let log = run.join("probe.log");
     let exec = e.exec(CLI, vec!["recovery-probe".into(), "--ecid".into(), id, "--timeout".into(), "600".into()], vec![], &log, Some(Duration::from_secs(900)));
     e.run_lib(exec, "recovery-probe")
+        .map_err(|m| format!("{m}\n{}", vphone_create_steps::host::Host::diagnostics(e)))
 }
 
 /// Runs `exec` while the VM must stay up: a dead QEMU would otherwise leave the tool waiting.

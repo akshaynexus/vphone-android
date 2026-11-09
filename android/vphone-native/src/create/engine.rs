@@ -613,6 +613,15 @@ impl Host for Engine {
     fn serial_log(&self) -> PathBuf {
         self.sup.serial_log()
     }
+    fn diagnostics(&self) -> String {
+        let tail = |path: PathBuf| crate::runtime::log_tail(&path.to_string_lossy(), 1500).trim().to_string();
+        let logs = self.vm.join(state::LOG_DIR);
+        format!(
+            "VM output:\n{}\n\nUSB link:\n{}",
+            tail(self.sup.serial_log()),
+            tail(logs.join("usb-broker.log"))
+        )
+    }
     fn vphoned_rpc(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         self.vphoned().rpc(method, params, timeout)
     }
