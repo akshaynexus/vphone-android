@@ -122,6 +122,32 @@ pub struct Listed {
 /// Every folder in `vms`, the unusable ones with what is wrong with them. Unfinished imports
 /// (`.import-*`) are not VMs.
 pub fn list(vms: &Path) -> Vec<Listed> {
+    list_in(&[vms.to_path_buf()])
+}
+
+/// Every VM in these libraries; a name in the first (internal storage) hides one in a later.
+/// A folder still being created has `.create-spec.json` and no `.create-state` `booted` line:
+/// the wizard shows those, not this list.
+pub fn list_in(roots: &[PathBuf]) -> Vec<Listed> {
+    use std::collections::BTreeMap;
+    let mut merged = BTreeMap::new();
+    for root in roots {
+        for vm in scan(root) {
+            merged.entry(vm.name.clone()).or_insert(vm);
+        }
+    }
+    merged.into_values().collect()
+}
+
+fn in_progress(dir: &Path) -> bool {
+    let temporary = dir
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with("gpu-recovery-"));
+    temporary || dir.join(".create-spec.json").exists()
+        && !fs::read_to_string(dir.join(".create-state")).is_ok_and(|t| t.lines().any(|l| l == "booted"))
+}
+
+fn scan(vms: &Path) -> Vec<Listed> {
     use std::os::unix::fs::MetadataExt;
     let Ok(entries) = fs::read_dir(vms) else {
         return Vec::new();
@@ -129,6 +155,7 @@ pub fn list(vms: &Path) -> Vec<Listed> {
     let mut out: Vec<Listed> = entries
         .flatten()
         .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
+        .filter(|e| !in_progress(&e.path()))
         .map(|e| {
             let dir = e.path();
             let (problems, res) = match Bundle::open(&dir) {
@@ -207,6 +234,24 @@ pub(crate) mod tests {
         fs::remove_file(dir.join("ecid")).unwrap();
         fs::write(dir.join("gfx-res"), "wide").unwrap();
         assert_eq!(Bundle::open(&dir).unwrap_err().len(), 3);
+    }
+
+    #[test]
+    fn merges_libraries_and_hides_creations_in_progress() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/test-fixtures/list2");
+        let _ = fs::remove_dir_all(&root);
+        let (a, b) = (root.join("internal"), root.join("external"));
+        fs::create_dir_all(a.join("made")).unwrap();
+        fs::create_dir_all(a.join("half")).unwrap();
+        fs::create_dir_all(b.join("made")).unwrap();
+        fs::create_dir_all(b.join("imported")).unwrap();
+        fs::write(a.join("half/.create-spec.json"), "{}").unwrap();
+        fs::write(a.join("made/.create-spec.json"), "{}").unwrap();
+        fs::write(a.join("made/.create-state"), "sanity\nbooted\n").unwrap();
+        let l = list_in(&[a.clone(), b]);
+        let names: Vec<_> = l.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["imported", "made"]);
+        assert!(l[1].path.contains("internal"));
     }
 
     #[test]

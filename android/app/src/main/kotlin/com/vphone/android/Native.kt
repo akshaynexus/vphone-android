@@ -31,4 +31,18 @@ object Native {
     external fun importAbort()
     external fun importCancel()
     external fun importProgress(): String
+
+    // VM creation: see src/create/ in the Rust library.
+    external fun createCatalog(): String
+    external fun createPreflight(specJson: String): String
+    external fun createBegin(specJson: String): String
+    external fun createPending(): String
+    external fun createStatus(name: String): String
+    external fun createRun(name: String): String
+    external fun createVmRun(): String
+    external fun createCancel(name: String)
+    external fun createAllowCellular(name: String, allow: Boolean)
+    external fun createNetwork(connected: Boolean, unmetered: Boolean)
+    external fun createThermal(status: Int)
+    external fun createDelete(name: String, alsoFirmware: Boolean): String
 }

@@ -34,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var banner: TextView
     private lateinit var active: Button
     private lateinit var importButton: Button
+    private lateinit var resumeCreate: Button
     private lateinit var importRow: LinearLayout
     private lateinit var importBar: ProgressBar
     private lateinit var importLabel: TextView
@@ -67,6 +68,16 @@ class MainActivity : Activity() {
             isAllCaps = false
             setOnClickListener { pickFolder() }
         }
+        val createButton = Button(this).apply {
+            text = "Create a VM on this phone"
+            isAllCaps = false
+            setOnClickListener { startActivity(Intent(this@MainActivity, CreateActivity::class.java)) }
+        }
+        resumeCreate = Button(this).apply {
+            isAllCaps = false
+            visibility = View.GONE
+            setOnClickListener { startActivity(Intent(this@MainActivity, CreateActivity::class.java)) }
+        }
         importLabel = TextView(this)
         importBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
         importRow = LinearLayout(this).apply {
@@ -94,6 +105,8 @@ class MainActivity : Activity() {
             })
             addView(banner)
             addView(active)
+            addView(resumeCreate)
+            addView(createButton)
             addView(importButton)
             addView(importRow)
             addView(list)
@@ -109,6 +122,24 @@ class MainActivity : Activity() {
         setContentView(scroll)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    /** The wizard's "Launch" and "import instead" arrive here. */
+    private fun handleIntent(intent: Intent) {
+        intent.getStringExtra(EXTRA_BOOT)?.let { name ->
+            intent.removeExtra(EXTRA_BOOT)
+            tryBoot(name)
+        }
+        if (intent.getBooleanExtra(EXTRA_IMPORT, false)) {
+            intent.removeExtra(EXTRA_IMPORT)
+            pickFolder()
         }
     }
 
@@ -157,6 +188,9 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
+        val creating = Native.createPending()
+        resumeCreate.visibility = if (creating.isEmpty()) View.GONE else View.VISIBLE
+        if (creating.isNotEmpty()) resumeCreate.text = "Creating $creating: continue"
         val state = App.state()
         val phase = state.getString("phase")
         val vmUp = phase in setOf("preparing", "booting", "unlocking", "running", "stopping")
@@ -197,7 +231,7 @@ class MainActivity : Activity() {
         if (vms.length() == 0) {
             list.addView(TextView(this).apply {
                 setPadding(0, 32, 0, 0)
-                text = "No VMs yet. Import a VM folder, or push one with adb to:\n${getExternalFilesDir(null)}/vms/<name>/"
+                text = "No VMs yet. Create one, import a VM folder, or push one with adb to:\n${getExternalFilesDir(null)}/vms/<name>/"
             })
         }
         for (i in 0 until vms.length()) list.addView(row(vms.getJSONObject(i)))
@@ -282,6 +316,15 @@ class MainActivity : Activity() {
     }
 
     private fun tryBoot(name: String) {
+        val creating = Native.createPending()
+        if (creating.isNotEmpty() && creating != name) {
+            AlertDialog.Builder(this)
+                .setTitle("A VM is being created")
+                .setMessage("$creating is still being made, and only one VM can run at a time. Finish or delete it first.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
         if (App.state().optBoolean("needsRestart")) {
             App.restart(this)
             return
@@ -350,8 +393,10 @@ class MainActivity : Activity() {
         VmService.import(this, tree)
     }
 
-    private companion object {
-        const val PICK_FOLDER = 2
-        const val MIB = 1024L * 1024
+    companion object {
+        const val EXTRA_BOOT = "boot"
+        const val EXTRA_IMPORT = "import"
+        private const val PICK_FOLDER = 2
+        private const val MIB = 1024L * 1024
     }
 }

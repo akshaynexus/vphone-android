@@ -3,6 +3,7 @@
 
 pub mod bundle;
 pub mod config;
+pub mod create;
 pub mod import;
 pub mod launcher;
 pub mod meminfo;

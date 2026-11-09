@@ -19,10 +19,17 @@ export GRADLE_OPTS="-Djava.io.tmpdir=$TMPDIR ${GRADLE_OPTS:-}"
 QEMU_LIB=$OUT/lib/libqemu-vphone.so
 [ -f "$QEMU_LIB" ] || QEMU_LIB=$OUT/libqemu-vphone.so
 TURNIP_LIB=$OUT/libvulkan_freedreno.so
+# On-device VM creation: PIE helpers run as lib*.so from nativeLibraryDir, and vphone-cli's Swift runtime.
+CREATE=$OUT/create
+CREATE_HELPERS=(
+  "$CREATE/libvphone_cli.so"
+  "$OUT/libusb-1.0.so" "$OUT/libvusbd.so" "$OUT/libusbmuxd_vphone.so" "$OUT/libvphone_portfwd.so"
+  "$OUT/libvphone_apfs.so"
+)
 READELF=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
 
 missing=()
-for lib in "$QEMU_LIB" "$TURNIP_LIB"; do
+for lib in "$QEMU_LIB" "$TURNIP_LIB" "${CREATE_HELPERS[@]}"; do
   [ -f "$lib" ] || missing+=("$lib")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -61,7 +68,11 @@ STAGE=$BUILD/jniLibs/arm64-v8a
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libvphone_native.so" "$STAGE/"
-cp "$QEMU_LIB" "$TURNIP_LIB" "$STAGE/"
+cp "$QEMU_LIB" "$TURNIP_LIB" "${CREATE_HELPERS[@]}" "$STAGE/"
+# vphone-cli's Swift runtime and everything else its build left beside it.
+for so in "$CREATE"/*.so; do
+  [ -f "$STAGE/$(basename "$so")" ] || cp "$so" "$STAGE/"
+done
 find "$TOOLS_BUILD" -name 'lib*.so' \( -name libadrenotools.so -o -name libmain_hook.so -o -name libhook_impl.so \) -exec cp {} "$STAGE/" \;
 
 # Every library a packaged one needs is packaged too, or is the platform's.
@@ -73,13 +84,21 @@ for so in "$STAGE"/*.so; do
     [ -f "$STAGE/$need" ] && continue
     [ -f "$SYSROOT_LIBS/$need" ] && continue
     case "$(basename "$so"):$DRIVER_ONLY" in libvulkan_freedreno.so:*" $need "*) continue ;; esac
-    dep=$(find "$OUT/deps" "$OUT/lib" -name "$need" -type f -print -quit)
+    dep=$(find "$OUT/deps" "$OUT/lib" "$OUT/create" -name "$need" -type f -print -quit)
     if [ -z "$dep" ]; then
       echo "build-apk.sh: $(basename "$so") needs $need, which nothing provides" >&2
       exit 1
     fi
     cp "$dep" "$STAGE/"
   done
+done
+
+# The helpers are exec'd: a helper that is not a PIE executable cannot be run from nativeLibraryDir.
+for helper in libvusbd.so libusbmuxd_vphone.so libvphone_portfwd.so libvphone_apfs.so libvphone_cli.so; do
+  if ! "$READELF" -h "$STAGE/$helper" | grep -q 'Type:.*DYN'; then
+    echo "build-apk.sh: $helper is not a PIE executable" >&2
+    exit 1
+  fi
 done
 
 cd "$ANDROID_DIR"

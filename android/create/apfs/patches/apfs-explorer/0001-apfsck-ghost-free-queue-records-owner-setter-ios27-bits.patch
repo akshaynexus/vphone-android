@@ -1,0 +1,157 @@
+diff --git a/crates/apfs-write/src/file.rs b/crates/apfs-write/src/file.rs
+index 47da122..f68f28d 100644
+--- a/crates/apfs-write/src/file.rs
++++ b/crates/apfs-write/src/file.rs
+@@ -473,8 +473,13 @@ const APFS_INCOMPAT_SEALED_VOLUME: u64 = 0x20;
+ /// snapshots, a rolled encryption key, an incomplete restore, per-file keys,
+ /// preallocated extent records, a secondary root tree), and Apple's own
+ /// implementation refuses to mount a volume with a bit it does not know.
+-const APFS_INCOMPAT_WRITABLE_MASK: u64 =
+-    APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE;
++const APFS_INCOMPAT_WRITABLE_MASK: u64 = APFS_INCOMPAT_CASE_INSENSITIVE
++    | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE
++    // iOS 27 sets PFK (0x40) and a new bit (0x200) on its volumes; on an
++    // unencrypted volume they constrain nothing this writer changes
++    // (patches/linux-apfs-rw-ios27.patch makes the same call).
++    | 0x40
++    | 0x200;
+ /// `apfs_fs_flags` offset in the volume superblock, and its "data is in the
+ /// clear" bit. A FileVault volume leaves the bit clear.
+ const VSBI_FS_FLAGS: usize = 0x108;
+@@ -7918,6 +7923,8 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
+     btime_ns: Option<u64>,
+     bsd_flags_set: Option<u32>,
+     bsd_flags_clear: Option<u32>,
++    uid: Option<u32>,
++    gid: Option<u32>,
+ ) -> Result<(), TxnError> {
+     let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+     let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+@@ -7995,6 +8002,13 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
+         wr_u32(&mut new_inode_val, INODE_BSD_FLAGS, new_flags);
+     }
+ 
++    if let Some(u) = uid {
++        wr_u32(&mut new_inode_val, 72, u); // j_inode_val.owner
++    }
++    if let Some(g) = gid {
++        wr_u32(&mut new_inode_val, 76, g); // j_inode_val.group
++    }
++
+     // Rewrite fstree: remove old inode, insert updated inode (no parent nchildren change).
+     let FstreeRewrite {
+         omap_tree_paddr: new_omap_tree_paddr,
+diff --git a/crates/apfs-write/src/sm_fq.rs b/crates/apfs-write/src/sm_fq.rs
+index c017f47..19ed07a 100644
+--- a/crates/apfs-write/src/sm_fq.rs
++++ b/crates/apfs-write/src/sm_fq.rs
+@@ -250,7 +250,7 @@ pub fn build_sm_fq_leaf_node(
+     wr_u16(&mut buf, 40, 0); // btn_table_space.off
+     wr_u16(&mut buf, 42, TOC_RESERVE as u16); // btn_table_space.len
+     let used_key = entries.len() * KEY_SIZE;
+-    let used_val = entries.len() * LEAF_VAL_SIZE;
++    let used_val = entries.iter().filter(|e| e.2 != 1).count() * LEAF_VAL_SIZE;
+     wr_u16(&mut buf, 44, used_key as u16); // btn_free_space.off
+     wr_u16(&mut buf, 46, (vae - kas - used_key - used_val) as u16); // btn_free_space.len
+     wr_u16(&mut buf, 48, BTOFF_INVALID); // key_free_list sentinel
+@@ -259,18 +259,21 @@ pub fn build_sm_fq_leaf_node(
+     wr_u16(&mut buf, 54, 0);
+ 
+     // TOC + key/val data
++    let mut v_used = 0usize;
+     for (i, &(x, p, c)) in entries.iter().enumerate() {
+         wr_u16(&mut buf, DATA_BASE + i * 4, (i * KEY_SIZE) as u16); // k_off
+-        wr_u16(
+-            &mut buf,
+-            DATA_BASE + i * 4 + 2,
+-            ((i + 1) * LEAF_VAL_SIZE) as u16,
+-        ); // v_off
+         let k_abs = kas + i * KEY_SIZE;
+         wr_u64(&mut buf, k_abs, x);
+         wr_u64(&mut buf, k_abs + 8, p);
+-        let v_abs = vae - (i + 1) * LEAF_VAL_SIZE;
+-        wr_u64(&mut buf, v_abs, c);
++        // A single-block extent is a ghost record: no value (Apple's encoding,
++        // and what apfsck requires).
++        if c == 1 {
++            wr_u16(&mut buf, DATA_BASE + i * 4 + 2, BTOFF_INVALID);
++        } else {
++            v_used += LEAF_VAL_SIZE;
++            wr_u16(&mut buf, DATA_BASE + i * 4 + 2, v_used as u16); // v_off
++            wr_u64(&mut buf, vae - v_used, c);
++        }
+     }
+ 
+     // btree_info_t footer (ROOT nodes only)
+@@ -540,7 +543,7 @@ fn write_leaf_node(
+     // Update key count.
+     wr_u32(&mut buf, 36, entries.len() as u32);
+     let used_key = entries.len() * KEY_SIZE;
+-    let used_val = entries.len() * LEAF_VAL_SIZE;
++    let used_val = entries.iter().filter(|e| e.2 != 1).count() * LEAF_VAL_SIZE;
+     wr_u16(&mut buf, 44, used_key as u16);
+     wr_u16(&mut buf, 46, (vae - kas - used_key - used_val) as u16);
+     // The key and value areas are repacked from scratch below, so any free-list
+@@ -560,18 +563,19 @@ fn write_leaf_node(
+         *b = 0;
+     }
+ 
++    let mut v_used = 0usize;
+     for (i, &(x, p, c)) in entries.iter().enumerate() {
+         wr_u16(&mut buf, DATA_BASE + i * 4, (i * KEY_SIZE) as u16);
+-        wr_u16(
+-            &mut buf,
+-            DATA_BASE + i * 4 + 2,
+-            ((i + 1) * LEAF_VAL_SIZE) as u16,
+-        );
+         let k_abs = kas + i * KEY_SIZE;
+         wr_u64(&mut buf, k_abs, x);
+         wr_u64(&mut buf, k_abs + 8, p);
+-        let v_abs = vae - (i + 1) * LEAF_VAL_SIZE;
+-        wr_u64(&mut buf, v_abs, c);
++        if c == 1 {
++            wr_u16(&mut buf, DATA_BASE + i * 4 + 2, BTOFF_INVALID);
++        } else {
++            v_used += LEAF_VAL_SIZE;
++            wr_u16(&mut buf, DATA_BASE + i * 4 + 2, v_used as u16);
++            wr_u64(&mut buf, vae - v_used, c);
++        }
+     }
+ 
+     // Update btree_info_t footer key_count if this is a ROOT node.
+@@ -973,7 +977,7 @@ fn write_leaf_node_with_flags(
+     wr_u16(&mut buf, 32, flags);
+     wr_u32(&mut buf, 36, entries.len() as u32);
+     let used_key = entries.len() * KEY_SIZE;
+-    let used_val = entries.len() * LEAF_VAL_SIZE;
++    let used_val = entries.iter().filter(|e| e.2 != 1).count() * LEAF_VAL_SIZE;
+     wr_u16(&mut buf, 44, used_key as u16);
+     wr_u16(&mut buf, 46, (vae - kas - used_key - used_val) as u16);
+ 
+@@ -984,18 +988,19 @@ fn write_leaf_node_with_flags(
+         *b = 0;
+     }
+ 
++    let mut v_used = 0usize;
+     for (i, &(x, p, c)) in entries.iter().enumerate() {
+         wr_u16(&mut buf, DATA_BASE + i * 4, (i * KEY_SIZE) as u16);
+-        wr_u16(
+-            &mut buf,
+-            DATA_BASE + i * 4 + 2,
+-            ((i + 1) * LEAF_VAL_SIZE) as u16,
+-        );
+         let k_abs = kas + i * KEY_SIZE;
+         wr_u64(&mut buf, k_abs, x);
+         wr_u64(&mut buf, k_abs + 8, p);
+-        let v_abs = vae - (i + 1) * LEAF_VAL_SIZE;
+-        wr_u64(&mut buf, v_abs, c);
++        if c == 1 {
++            wr_u16(&mut buf, DATA_BASE + i * 4 + 2, BTOFF_INVALID);
++        } else {
++            v_used += LEAF_VAL_SIZE;
++            wr_u16(&mut buf, DATA_BASE + i * 4 + 2, v_used as u16);
++            wr_u64(&mut buf, vae - v_used, c);
++        }
+     }
+ 
+     if keep_root_flag {

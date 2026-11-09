@@ -27,7 +27,7 @@ Start the app once so Android creates its storage folder.
 
 ## Getting a VM onto the phone
 
-A VM is a folder holding `Disk.img`, `nvram.bin`, `ecid`, its two ROMs, and optionally `config.plist`, `serial`,
+Besides creating one on the phone (below), you can bring one from a computer. A VM is a folder holding `Disk.img`, `nvram.bin`, `ecid`, its two ROMs, and optionally `config.plist`, `serial`,
 `gfx-res` and `SEPStorage`: the bundle `run-vphone.sh` boots. Bundles are 20-25 GB.
 
 **Import in the app.** Copy the folder to the phone's shared storage, for example under `Download/`, tap
@@ -40,6 +40,27 @@ the source and the copy at once while this runs.
     adb push my-vm /sdcard/Android/data/com.vphone.android/files/vms/
 
 The folder's name is the VM's name. If the app then reports a file as not writable, use Import instead.
+
+## Creating a VM on the phone
+
+*Create a VM on this phone* runs the whole of `setup/create-vm.sh` with no computer and no root: it downloads
+the firmware from Apple over Wi-Fi (resumably; cellular only if you confirm), patches it, restores it in
+QEMU, installs the CFW, and does the first boot, ending on a running iOS home screen. Choose the device
+and iOS version; the wizard defaults to the tested iPhone17,3 + iOS 26.6.2 at 1x and marks pairings the
+Linux flow has not verified as under test.
+
+Expect it to take many hours (the wizard shows an estimate). It keeps going with the screen off and survives
+the phone restarting: creation resumes from the first unfinished step, with `.create-state` per VM. Charging
+is recommended; a hot phone slows down, and at critical temperature the guest pauses until it cools. It
+needs about 60 GB free in the app's internal storage (at least 25 GB free during the restore, it waits
+below that), and 8 GB of RAM or more. VMs and their restore trees live in internal storage (`<filesDir>/vms`,
+real sparse files); downloaded firmware is in `<filesDir>/fw-cache` and is reused for later VMs unless
+you ask to delete it.
+
+Each QEMU boot runs in its own process: the `:create` foreground service drives the steps and
+binds `:createvm` for each boot, so an app kill or crash costs at most the step in progress. Step logs are in
+`<vm>/.create-logs/` and reachable from the wizard. Nothing here has been run on a phone yet:
+see the build report.
 
 ## Using it
 

@@ -1,0 +1,35 @@
+# Package manifest: the bionic build takes libusb's include path from build-create-tools.sh's -Xcc flags.
+Package.swift	,\s*\.unsafeFlags\(\["-I/usr/include/libusb-1\.0"\]\)	
+# bionic has funopen(3) itself; the glibc fopencookie shim must not redefine it.
+Sources/MobileRestoreCore/Bridge/funopen_compat.c	^#ifdef __linux__$	#if defined(__linux__) && !defined(__ANDROID__)
+Sources/MobileRestoreCore/Bridge/funopen_compat.h	^#ifdef __linux__$	#if defined(__linux__) && !defined(__ANDROID__)
+# bionic's SOCK_* constants are ints already: the __socket_type overload does not exist there.
+Shims/VLDarwin/VLDarwin.swift	public func socket\(_ domain: Int32, _ type: __socket_type, _ proto: Int32\) -> Int32 \{\n.*\n\}\n	
+# swift-argument-parser gained bionic support in 1.5.0; the Linux build's 1.3.1 does not compile for Android.
+Package.swift	swift-argument-parser\.git", exact: "1\.3\.1"	swift-argument-parser.git", exact: "1.5.1"
+# MachOKit's Linux path (swift-crypto instead of CommonCrypto) also serves Android.
+@vendor/MachOKit/Package.swift	let linuxPlatforms: \[Platform\] = \[\.linux, \.openbsd\]	let linuxPlatforms: [Platform] = [.linux, .openbsd, .android]
+Package.swift	\.package\(url: "https://github\.com/p-x9/MachOKit\.git", exact: "0\.55\.0"\)	.package(path: "../vendor-spm/MachOKit")
+@vendor/MachOKit/Sources/MachOKit/Util/CxaDemangle.swift	^import Foundation$	import Foundation\nimport Android
+# bionic declares SEEK_DATA/SEEK_HOLE itself and marks several pointers nonnull or nullable.
+Shims/VLDarwin/VLDarwin.swift	^// Linux has these lseek whences \(same meaning as macOS\) behind _GNU_SOURCE\.\npublic let SEEK_DATA: Int32 = 3\npublic let SEEK_HOLE: Int32 = 4\n	public var MAP_FAILED: UnsafeMutableRawPointer { UnsafeMutableRawPointer(bitPattern: -1)! }\n
+Sources/VPhoneCoreKit/Firmware/VPhoneAPFSSnapshot.swift	guard let base = mmap\(nil, count, PROT_READ, MAP_PRIVATE, fd, off_t\(offset\)\),	guard let base = Optional(mmap(nil, count, PROT_READ, MAP_PRIVATE, fd, off_t(offset))),
+Sources/VPhoneCoreKit/Firmware/VPhoneAPFSSnapshot.swift	pread\(fd, \$0\.baseAddress, blockSize, off_t\(blockOffset\)\)	pread(fd, $0.baseAddress!, blockSize, off_t(blockOffset))
+Sources/VPhoneCoreKit/Firmware/VPhoneAPFSSnapshot.swift	pwrite\(fd, \$0\.baseAddress, blockSize, off_t\(blockOffset\)\)	pwrite(fd, $0.baseAddress!, blockSize, off_t(blockOffset))
+Sources/VPhoneCoreKit/Support/VPhoneNetworking.swift	String\(cString: interface\.pointee\.ifa_name\) == name	String(cString: interface.pointee.ifa_name!) == name
+# bionic's newlocale accepts only C, POSIX, C.UTF-8 and en_US.UTF-8; a bare "UTF-8" would silently leave the C locale.
+Sources/VPhoneArchiveKit/Archive/VPhoneArchiveLocale.swift	duplocale\(uselocale\(nil\)\)	duplocale(uselocale(nil)!)
+Sources/VPhoneArchiveKit/Archive/VPhoneArchiveLocale.swift	newlocale\(LC_CTYPE_MASK, "UTF-8", base\)	newlocale(LC_CTYPE_MASK, "C.UTF-8", base)
+Sources/FirmwarePatcher/DyldSharedCache/Patchers/DyldSharedCacheArm64eX1BootstrapPatcher.swift	freelocale\(locale\)	freelocale(locale!)
+Sources/VPhoneCommand/Firmware/VPhoneCustomFirmwareInstaller.swift	guard geteuid\(\) == 0 else \{\n\s*throw ValidationError\("\\\(mode\.summary\.capitalized\) needs root\. Run this command with sudo\."\)\n\s*\}	throw ValidationError("\\(mode.summary.capitalized) is run by the Android app's installer (vphone-create-steps), not by vphone-cli.")
+Sources/VPhoneCommand/Firmware/VPhoneCustomFirmwareInstaller.swift	static let defaultWorkParent = "/var/tmp"	static let defaultWorkParent = (NSTemporaryDirectory() as NSString).standardizingPath
+Sources/VPhoneCommand/Firmware/VPhoneFirmwareCommand.swift	var workParent = "/var/tmp"	var workParent = (NSTemporaryDirectory() as NSString).standardizingPath
+Sources/VPhoneCoreKit/Process/VPhoneUnixSocket.swift	Array\("/tmp/vphone\.XXXXXX"\.utf8CString\)	Array((NSTemporaryDirectory() as NSString).appendingPathComponent("vphone.XXXXXX").utf8CString)
+Sources/VPhoneCoreKit/Restore/VPhoneRestoreOperations.swift	let code = try VPhoneProcessRunner\.runStreaming\(\n\s*URL\(fileURLWithPath: "/usr/bin/aea"\),\n\s*\["decrypt", "-i", aea\.path, "-o", decrypted\.path, "-key-value", key\],\n\s*\)\n\s*guard code == 0 else \{ throw VPhoneRestoreError\.aeaDecryptFailed\(aea\.lastPathComponent\) \}	do { try VPhoneAEADecrypt.decrypt(input: aea, output: decrypted, key: VPhoneAEADecrypt.parseKey(key)) }\n            catch { throw VPhoneRestoreError.aeaDecryptFailed(aea.lastPathComponent) }
+Sources/FirmwarePatcher/Manifest/ManifestHashPatcher.swift	let result = try VPhoneProcessRunner\.runCapturing\(\n\s*URL\(fileURLWithPath: "/usr/bin/aea"\),\n\s*\["decrypt", "-i", url\.path, "-o", plain\.path, "-key-value", key\],\n\s*\)\n\s*guard result\.succeeded else \{\n\s*throw PatcherError\.invalidFormat\("Unable to decrypt \\\(url\.lastPathComponent\): \\\(result\.stderr\)"\)\n\s*\}	do { try VPhoneAEADecrypt.decrypt(input: url, output: plain, key: VPhoneAEADecrypt.parseKey(key)) }\n        catch { throw PatcherError.invalidFormat("Unable to decrypt \\(url.lastPathComponent): \\(error)") }
+Sources/VPhoneCommand/Firmware/VPhoneFirmwareSnapshotFlipCommand.swift	let output = \(try\? VPhoneProcessRunner\.runCapturing\(\n\s*URL\(fileURLWithPath: "/usr/bin/pgrep"\), \["-af", url\.path\],\n\s*\)\)\?\.stdout \?\? ""\n\s*return output\.contains\("qemu-system"\)	// QEMU holds OFD locks on Disk.img while running; in-process QEMU has no qemu-system command line.\n        let fd = open(url.appendingPathComponent("Disk.img").path, O_RDONLY | O_CLOEXEC)\n        guard fd >= 0 else { return false }\n        defer { close(fd) }\n        var lock = flock()\n        lock.l_type = Int16(F_WRLCK)\n        lock.l_whence = Int16(SEEK_SET)\n        lock.l_start = 0\n        lock.l_len = 0\n        return fcntl(fd, 36 /* F_OFD_GETLK */, &lock) == 0 && lock.l_type != Int16(F_UNLCK)
+# Static linking: everything a shared libimobiledevice or libarchive pulled in on the desktop must be named here.
+Package.swift	\.linkedLibrary\("usbmuxd-2\.0"\), \.linkedLibrary\("tatsu"\), \.linkedLibrary\("curl"\), \.linkedLibrary\("z"\),	.linkedLibrary("usbmuxd-2.0"), .linkedLibrary("tatsu"), .linkedLibrary("curl"), .linkedLibrary("ssl"), .linkedLibrary("z"),
+# The APK has no bundle layout above the executable: the app extracts the resources and names the folder.
+Sources/VPhoneCoreKit/Firmware/VPhoneResources.swift	(public static func resolve\(executablePath: String\? = nil\) -> VPhoneResources \{\n)	\1        if let path = ProcessInfo.processInfo.environment["VPHONE_RESOURCES"], !path.isEmpty {\n            return VPhoneResources(base: URL(fileURLWithPath: path))\n        }\n
+Sources/VPhoneCoreKit/Firmware/VPhoneFirmwareIndex.swift	guard let root = try JSONSerialization\.jsonObject\(with: data\) as\? \[String: Any\],\n\s*let entries = root\["ios"\] as\? \[\[String: Any\]\]\n\s*else \{ throw Error\.unexpectedShape\(catalogueURL\) \}\n\s*return entries	guard let entries = try? VPhoneAndroidCatalogue.entries(from: data) else { throw Error.unexpectedShape(catalogueURL) }\n        return entries

@@ -1,0 +1,14 @@
+[package]
+name = "vusb-portfwd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Connect to a TCP port on the usbmux device, as a stream or as a forwarding proxy (iproxy's job)"
+
+[lib]
+name = "vusb_portfwd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vphone_portfwd"
+path = "src/main.rs"

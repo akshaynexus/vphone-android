@@ -1,0 +1,14 @@
+[package]
+name = "vusbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Owns QEMU's vusb chardev and presents the guest's USB device to the libusb-1.0 replacement"
+
+[[bin]]
+name = "vusbd"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+vusb-common = { path = "../common" }

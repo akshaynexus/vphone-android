@@ -93,10 +93,10 @@ struct LogFile {
     written: u64,
 }
 
-struct Qemu {
+pub(crate) struct Qemu {
     main: unsafe extern "C" fn(c_int, *mut *mut c_char) -> c_int,
-    set_gipa: unsafe extern "C" fn(*mut c_void),
-    set_window: unsafe extern "C" fn(*mut c_void),
+    pub(crate) set_gipa: unsafe extern "C" fn(*mut c_void),
+    pub(crate) set_window: unsafe extern "C" fn(*mut c_void),
     pointer: unsafe extern "C" fn(u16, u16, u32),
 }
 static QEMU: OnceLock<Qemu> = OnceLock::new();
@@ -230,7 +230,7 @@ fn dlsym(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
 }
 
 #[allow(clippy::missing_transmute_annotations)]
-fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
+pub(crate) fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
     if let Some(q) = QEMU.get() {
         return Ok(q);
     }
@@ -252,7 +252,7 @@ fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
 
 #[allow(clippy::missing_transmute_annotations)]
 /// The system's Vulkan loader, hooked by libadrenotools to load the bundled Turnip.
-fn load_vulkan(paths: &Paths) -> Result<*mut c_void, String> {
+pub(crate) fn load_vulkan(paths: &Paths) -> Result<*mut c_void, String> {
     type OpenVulkan = unsafe extern "C" fn(
         c_int,
         c_int,
@@ -348,7 +348,7 @@ fn open_log(vm_dir: &Path) -> Result<PathBuf, String> {
 /// What Boot would refuse or warn about, for the dialog before it.
 pub fn preflight(name: &str) -> preflight::Report {
     let paths = Paths::get();
-    let dir = paths.vms().join(name);
+    let dir = paths.vm_dir(name);
     preflight::check(&dir, &VmConfig::load(&dir), paths, MemInfo::read()).0
 }
 
@@ -389,7 +389,7 @@ pub fn boot(name: &str) -> Result<(), String> {
 
 fn start(name: &str) -> Result<(), String> {
     let paths = Paths::get();
-    let dir = paths.vms().join(name);
+    let dir = paths.vm_dir(name);
     let cfg = VmConfig::load(&dir);
     let (report, bundle) = preflight::check(&dir, &cfg, paths, MemInfo::read());
     if !report.errors.is_empty() {
@@ -482,7 +482,7 @@ fn start(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_qemu(qemu: &Qemu, args: Vec<String>) -> c_int {
+pub(crate) fn run_qemu(qemu: &Qemu, args: Vec<String>) -> c_int {
     let owned: Vec<CString> = args
         .into_iter()
         .map(|a| CString::new(a).unwrap_or_default())

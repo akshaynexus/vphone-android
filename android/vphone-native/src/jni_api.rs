@@ -65,7 +65,12 @@ pub extern "system" fn Java_com_vphone_android_Native_setup(
             crate::platform::log("vphone-panic", &info.to_string())
         }));
         let _ = std::fs::create_dir_all(paths.vms());
-        import::remove_stale(&paths.vms());
+        let _ = std::fs::create_dir_all(paths.vms_internal());
+        // Only the main process: the creation processes share this Application.
+        let main_process = std::fs::read("/proc/self/cmdline").is_ok_and(|c| !c.contains(&b':'));
+        if main_process {
+            import::remove_stale(&paths.vms());
+        }
         Paths::set(paths);
     });
 }
@@ -76,7 +81,8 @@ pub extern "system" fn Java_com_vphone_android_Native_listVms(
     _this: JObject,
 ) -> jstring {
     guarded(&mut env, |_| {
-        serde_json::to_string(&bundle::list(&Paths::get().vms())).unwrap_or_default()
+        let p = Paths::get();
+        serde_json::to_string(&bundle::list_in(&[p.vms_internal(), p.vms()])).unwrap_or_default()
     })
 }
 
@@ -108,7 +114,7 @@ pub extern "system" fn Java_com_vphone_android_Native_saveVmConfig(
         let name = text(env, &name);
         let json = text(env, &config_json);
         match serde_json::from_str::<VmConfig>(&json) {
-            Ok(cfg) => result_text(cfg.save(&Paths::get().vms().join(name))),
+            Ok(cfg) => result_text(cfg.save(&Paths::get().vm_dir(&name))),
             Err(e) => e.to_string(),
         }
     })

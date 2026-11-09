@@ -22,6 +22,23 @@ pub fn quit(socket: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Sends one QMP command without arguments; returns once QEMU has answered.
+pub fn command(socket: &Path, command: &str) -> io::Result<()> {
+    let stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?; // the greeting
+    writer.write_all(b"{\"execute\":\"qmp_capabilities\"}\n")?;
+    line.clear();
+    reader.read_line(&mut line)?;
+    writer.write_all(format!("{{\"execute\":\"{command}\"}}\n").as_bytes())?;
+    line.clear();
+    reader.read_line(&mut line)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

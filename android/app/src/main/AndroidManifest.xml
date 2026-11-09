@@ -8,6 +8,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Tagged heap pointers cannot pass through TCG's host-pointer arithmetic. -->
     <application
@@ -36,6 +39,41 @@
             android:launchMode="singleTask"
             android:resizeableActivity="false"
             android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".CreateActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.Vphone.Create" />
+
+        <!-- Runs the creation; QEMU boots start in the bound process below. -->
+        <service
+            android:name=".CreateService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:process=":create"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Creates a user-started iOS virtual machine, a process of many hours, while the app is not on screen" />
+        </service>
+
+        <!-- One QEMU per process: each boot of a creation runs here, bound from CreateService. -->
+        <service
+            android:name=".CreateVmService"
+            android:exported="false"
+            android:process=":createvm" />
+
+        <!-- A reboot mid-create resumes it. -->
+        <receiver
+            android:name=".CreateBootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".VmService"

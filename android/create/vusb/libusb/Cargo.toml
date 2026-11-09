@@ -1,0 +1,16 @@
+[package]
+name = "usb_1_0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "libusb-1.0 C ABI whose one device is the guest's virtual USB device, through vusbd"
+build = "build.rs"
+
+[lib]
+name = "usb_1_0"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = { workspace = true }
+vusb-common = { path = "../common" }

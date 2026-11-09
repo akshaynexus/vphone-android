@@ -16,10 +16,18 @@ class App : Application() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "Virtual machine", NotificationManager.IMPORTANCE_LOW),
         )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL_CREATE, "VM creation progress", NotificationManager.IMPORTANCE_LOW),
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL_CREATE_DONE, "VM creation finished or stopped", NotificationManager.IMPORTANCE_DEFAULT),
+        )
     }
 
     companion object {
         const val CHANNEL = "vm"
+        const val CHANNEL_CREATE = "create"
+        const val CHANNEL_CREATE_DONE = "create-done"
 
         fun state() = JSONObject(Native.state())
 

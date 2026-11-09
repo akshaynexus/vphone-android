@@ -27,6 +27,27 @@ impl Paths {
     pub fn vms(&self) -> PathBuf {
         self.external.join("vms")
     }
+    /// Where a VM made on the phone lives: internal storage, a real ext4/f2fs with sparse files.
+    pub fn vms_internal(&self) -> PathBuf {
+        self.files.join("vms")
+    }
+    /// A VM's folder: internal storage first, then the importable external location.
+    pub fn vm_dir(&self, name: &str) -> PathBuf {
+        let internal = self.vms_internal().join(name);
+        if internal.is_dir() {
+            internal
+        } else {
+            self.vms().join(name)
+        }
+    }
+    /// Firmware files kept between creations.
+    pub fn fw_cache(&self) -> PathBuf {
+        self.files.join("fw-cache")
+    }
+    /// Short socket directory for the USB broker, usbmuxd and the VM's chardev.
+    pub fn create_sockets(&self) -> PathBuf {
+        self.files.join("cv")
+    }
     pub fn vsock_socket(&self) -> PathBuf {
         self.files
             .join("vsock")

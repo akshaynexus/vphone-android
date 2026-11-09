@@ -7,4 +7,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/scripts"
 ./build-reims.sh
 ./build-qemu.sh
 ./build-turnip.sh
+./build-vusb.sh
+./build-apfs.sh
+./build-create-tools.sh
+./build-create-steps.sh
 ./build-apk.sh
