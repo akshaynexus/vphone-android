@@ -8,6 +8,7 @@ pub mod ctl;
 pub mod download;
 pub mod engine;
 pub mod exec;
+mod mirror;
 pub mod state;
 pub mod steps;
 pub mod vm;

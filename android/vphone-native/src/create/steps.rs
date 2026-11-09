@@ -299,6 +299,7 @@ fn restore(e: &Arc<Engine>) -> Result<(), String> {
     e.status(true, |s| s.message = "Waiting for the VM's DFU mode".into());
     probe(e, &run)?;
     e.status(true, |s| s.message = "Restoring iOS onto the virtual disk".into());
+    e.mirror_log(&run.join("restore.log"));
     let mut exec = e.exec(
         CLI,
         vec!["restore".into(), "-l".into(), library(e), e.name.clone(), "--ecid".into(), ecid(e)?, "-v".into()],

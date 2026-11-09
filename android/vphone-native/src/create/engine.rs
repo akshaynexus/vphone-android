@@ -3,6 +3,7 @@
 use super::compat::Firmware;
 use super::download::{self, Gate};
 use super::exec::{Background, Exec};
+use super::mirror::{self, Mirror};
 use super::state::{self, Spec, Status, StepStatus};
 use super::steps::STEPS;
 use super::vm::{Supervisor, VmKind, VmProcess};
@@ -57,6 +58,7 @@ pub struct Engine {
     usb: Mutex<Vec<Background>>,
     pause: Mutex<bool>,
     paused_in_step: AtomicBool,
+    mirror: Mutex<Option<Mirror>>,
 }
 
 impl Engine {
@@ -103,6 +105,7 @@ impl Engine {
             usb: Mutex::new(Vec::new()),
             pause: Mutex::new(false),
             paused_in_step: AtomicBool::new(false),
+            mirror: Mutex::new(None),
         });
         Ok(e)
     }
@@ -176,6 +179,8 @@ impl Engine {
     }
 
     pub fn end_step(&self, key: &str, state_text: &str, elapsed: Duration) {
+        self.pump_mirror();
+        *self.mirror.lock().unwrap() = None;
         let total = {
             let mut t = self.times.lock().unwrap();
             let e = t.entry(key.to_string()).or_insert(0);
@@ -233,6 +238,28 @@ impl Engine {
 
     pub fn tick_eta(&self) {
         self.status(false, |s| s.eta_secs = self.eta(s));
+    }
+
+    /// Follows a helper's own log: its lines go into the step's log, and a restore's stages show
+    /// as the step's progress.
+    pub fn mirror_log(&self, path: &Path) {
+        *self.mirror.lock().unwrap() = Some(Mirror::new(path));
+    }
+
+    fn pump_mirror(&self) {
+        let mut guard = self.mirror.lock().unwrap();
+        let Some(mirror) = guard.as_mut() else { return };
+        for line in mirror.drain() {
+            if let Some((stage, text)) = mirror.advance(&line) {
+                self.status(true, |s| {
+                    s.done_bytes = stage;
+                    s.total_bytes = mirror::STAGE_COUNT;
+                    s.bytes_per_sec = 0;
+                    s.message = text.to_string();
+                });
+            }
+            self.append_log(&line);
+        }
     }
 
     pub fn append_log(&self, line: &str) {
@@ -402,6 +429,7 @@ impl Engine {
         let _ = std::thread::Builder::new().name("create-pause".into()).spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
+                me.pump_mirror();
                 let mut paused = me.pause.lock().unwrap();
                 if matches!(me.snapshot().state.as_str(), "done" | "failed" | "cancelled") {
                     if *paused {
@@ -528,6 +556,16 @@ impl Gate for Engine {
 impl Progress for Engine {
     fn log(&self, line: &str) {
         self.append_log(line);
+        // A new stage: what the last one reported is over.
+        if let Some(text) = line.strip_prefix("=== ") {
+            let text = if text == "DFU" { "Starting the VM" } else { text }.to_string();
+            self.status(true, |s| {
+                s.done_bytes = 0;
+                s.total_bytes = 0;
+                s.bytes_per_sec = 0;
+                s.message = text;
+            });
+        }
     }
     fn progress(&self, done: u64, total: u64, message: &str) {
         let message = message.to_string();
@@ -596,6 +634,7 @@ impl Host for Engine {
         env: &[(String, String)],
         log_path: &Path,
     ) -> Result<Box<dyn BackgroundHelper>, String> {
+        self.mirror_log(log_path);
         let bg = self
             .exec(lib, args.to_vec(), env.to_vec(), log_path, None)
             .spawn()?;
