@@ -267,6 +267,7 @@ impl Engine {
             follow(path, ""),
             follow(&serial, "[guest] "),
             follow(&usb, "[usb] "),
+            follow(&self.sup.threads_log(), "[vm] "),
         ];
     }
 
@@ -780,7 +781,8 @@ impl Host for Engine {
         self.sup.start(kind, vm, run, &self.vusb_socket(), display::setting(&self.vm))?;
         // From here the step's log shows the guest and the USB link, before any tool runs.
         let guest = Followed { mirror: Mirror::from_start(&self.sup.serial_log()), prefix: "[guest] " };
-        *self.mirror.lock().unwrap() = vec![guest, usb];
+        let threads = Followed { mirror: Mirror::from_start(&run.join(super::vm::THREADS_LOG)), prefix: "[vm] " };
+        *self.mirror.lock().unwrap() = vec![guest, usb, threads];
         Ok(())
     }
     fn stop_vm(&self, _vm: &Path) -> Result<(), String> {
@@ -791,9 +793,6 @@ impl Host for Engine {
     }
     fn serial_log(&self) -> PathBuf {
         self.sup.serial_log()
-    }
-    fn use_safe_emulation(&self) {
-        self.sup.use_safe_emulation();
     }
     fn diagnostics(&self) -> String {
         if let Some(facts) = self.sup.stall_facts() {

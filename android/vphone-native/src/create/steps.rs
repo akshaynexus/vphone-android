@@ -277,34 +277,9 @@ fn reset_targets(e: &Engine) -> Result<(), String> {
 fn probe(e: &Engine, run: &std::path::Path) -> Result<(), String> {
     let id = ecid(e)?;
     let log = run.join("probe.log");
-    let exec = e.exec(CLI, vec!["recovery-probe".into(), "--ecid".into(), id, "--timeout".into(), "180".into()], vec![], &log, Some(Duration::from_secs(300)));
+    let exec = e.exec(CLI, vec!["recovery-probe".into(), "--ecid".into(), id, "--timeout".into(), "600".into()], vec![], &log, Some(Duration::from_secs(900)));
     e.run_lib(exec, "recovery-probe")
         .map_err(|m| format!("{m}\n{}", vphone_create_steps::host::Host::diagnostics(e)))
-}
-
-/// Boots the VM until it answers in DFU: some boots wedge before it, so boot again rather than
-/// wait on one, with the slower CPU emulation for the last try.
-fn boot_to_dfu(e: &Arc<Engine>, run: &std::path::Path) -> Result<(), String> {
-    use vphone_create_steps::host::Host;
-    let mut last = String::new();
-    for boot in 1..=3 {
-        if boot == 3 {
-            e.append_log("[recovery] switching to the slower, safer CPU emulation for this boot");
-            e.use_safe_emulation();
-        }
-        e.start_vm(VmKind::Dfu, &e.vm, run)?;
-        e.status(true, |s| s.message = "Waiting for the VM's DFU mode".into());
-        match probe(e, run) {
-            Ok(()) => return Ok(()),
-            Err(m) if m == "cancelled" => return Err(m),
-            Err(m) => {
-                e.append_log(&format!("[recovery] boot {boot} did not reach DFU\n{m}"));
-                last = m;
-                e.sup.stop()?;
-            }
-        }
-    }
-    Err(format!("the VM did not reach DFU in 3 boots\n{last}"))
 }
 
 /// Runs `exec` while the VM must stay up: a dead QEMU would otherwise leave the tool waiting.
@@ -335,7 +310,9 @@ fn restore(e: &Arc<Engine>) -> Result<(), String> {
     e.sup.stop()?;
     reset_targets(e)?;
     let run = e.vm.join(".runs-dfu");
-    boot_to_dfu(e, &run)?;
+    e.start_vm(VmKind::Dfu, &e.vm, &run)?;
+    e.status(true, |s| s.message = "Waiting for the VM's DFU mode".into());
+    probe(e, &run)?;
     e.status(true, |s| s.message = "Restoring iOS onto the virtual disk".into());
     e.mirror_log(&run.join("restore.log"));
     let mut exec = e.exec(
@@ -438,7 +415,7 @@ mod tests {
 
     struct NoVm;
     impl VmProcess for NoVm {
-        fn start(&self) -> Result<(), String> { Ok(()) }
+        fn start(&self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> { Ok(()) }
         fn release(&self) {}
         fn exit_reason(&self) -> String { String::new() }
     }

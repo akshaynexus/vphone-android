@@ -273,7 +273,7 @@ class CreateActivity : AppCompatActivity() {
         findViewById<Button>(R.id.copy_error).setOnClickListener { copyReport() }
         findViewById<Button>(R.id.live_log).setOnClickListener { CreateLogActivity.open(this, name) }
         findViewById<Button>(R.id.watch_vm).setOnClickListener {
-            startActivity(Intent(this, CreateVmScreen::class.java).putExtra(CreateVmScreen.EXTRA_VM, name))
+            startActivity(Intent(this, CreateVmScreen::class.java))
         }
         findViewById<Button>(R.id.pause).setOnClickListener {
             Native.createPause(name, !paused)

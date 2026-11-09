@@ -55,7 +55,7 @@ pub const FILTER_ERRORS: i32 = 4;
 
 /// Who wrote a line, and the line without the mark the step log gave it.
 pub fn split_source(line: &str) -> (u8, &str) {
-    if let Some(body) = line.strip_prefix("[guest] ") {
+    if let Some(body) = line.strip_prefix("[guest] ").or_else(|| line.strip_prefix("[vm] ")) {
         (SRC_GUEST, body)
     } else if let Some(body) = line.strip_prefix("[usb] ") {
         (SRC_USB, body)

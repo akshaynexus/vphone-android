@@ -52,7 +52,6 @@ class CreateService : Service() {
             return START_NOT_STICKY
         }
         running = true
-        CreateBridge.context = applicationContext
         acquireWakeLock()
         watchNetwork()
         watchThermal()

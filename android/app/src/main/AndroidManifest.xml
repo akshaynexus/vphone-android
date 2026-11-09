@@ -81,12 +81,6 @@
                 android:value="Creates a user-started iOS virtual machine, a process of many hours, while the app is not on screen" />
         </service>
 
-        <!-- One QEMU per process: each boot of a creation runs here, bound from CreateService. -->
-        <service
-            android:name=".CreateVmService"
-            android:exported="false"
-            android:process=":createvm" />
-
         <!-- A reboot mid-create resumes it. -->
         <receiver
             android:name=".CreateBootReceiver"

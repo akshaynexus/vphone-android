@@ -35,6 +35,7 @@ pub const REQUIRED_LIBS: &[&str] = &[
     "libusbmuxd_vphone.so",
     "libvphone_apfs.so",
     "libqemu-vphone.so",
+    "libvphone_vm.so",
 ];
 const FIRST_RESTORE_MIN_GB: u64 = 25;
 const COMFORTABLE_GB: u64 = 60;

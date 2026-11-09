@@ -68,6 +68,8 @@ STAGE=$BUILD/jniLibs/arm64-v8a
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libvphone_native.so" "$STAGE/"
+cargo build --manifest-path "$ANDROID_DIR/vphone-vm/Cargo.toml" --release --target aarch64-linux-android
+cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/vphone_vm" "$STAGE/libvphone_vm.so"
 cp "$QEMU_LIB" "$TURNIP_LIB" "${CREATE_HELPERS[@]}" "$STAGE/"
 # vphone-cli's Swift runtime and everything else its build left beside it.
 for so in "$CREATE"/*.so; do
@@ -94,7 +96,7 @@ for so in "$STAGE"/*.so; do
 done
 
 # The helpers are exec'd: a helper that is not a PIE executable cannot be run from nativeLibraryDir.
-for helper in libvusbd.so libusbmuxd_vphone.so libvphone_portfwd.so libvphone_apfs.so libvphone_cli.so; do
+for helper in libvphone_vm.so libvusbd.so libusbmuxd_vphone.so libvphone_portfwd.so libvphone_apfs.so libvphone_cli.so; do
   if ! "$READELF" -h "$STAGE/$helper" | grep -q 'Type:.*DYN'; then
     echo "build-apk.sh: $helper is not a PIE executable" >&2
     exit 1

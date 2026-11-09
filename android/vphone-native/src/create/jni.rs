@@ -32,67 +32,6 @@ fn result_text(r: Result<(), String>) -> String {
 }
 
 /// The class holding the callbacks, resolved on a Java thread where the app's loader is on hand.
-struct Bridge {
-    vm: JavaVM,
-    class: GlobalRef,
-}
-
-static BRIDGE: OnceLock<Bridge> = OnceLock::new();
-
-fn bridge(env: &mut JNIEnv) -> Result<&'static Bridge, String> {
-    if let Some(b) = BRIDGE.get() {
-        return Ok(b);
-    }
-    let vm = env.get_java_vm().map_err(|e| e.to_string())?;
-    let class = env
-        .find_class("com/vphone/android/CreateBridge")
-        .map_err(|e| e.to_string())?;
-    let class = env.new_global_ref(class).map_err(|e| e.to_string())?;
-    Ok(BRIDGE.get_or_init(|| Bridge { vm, class }))
-}
-
-struct JniProcess;
-
-impl JniProcess {
-    fn call<T>(
-        f: impl FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<T>,
-    ) -> Result<T, String> {
-        let b = BRIDGE.get().ok_or("the bridge is not initialized")?;
-        let mut env = b.vm.attach_current_thread().map_err(|e| e.to_string())?;
-        let class: &JClass = b.class.as_obj().into();
-        f(&mut env, class).map_err(|e| e.to_string())
-    }
-}
-
-impl VmProcess for JniProcess {
-    fn start(&self) -> Result<(), String> {
-        let message = Self::call(|env, class| {
-            let v = env.call_static_method(class, "startVm", "()Ljava/lang/String;", &[])?.l()?;
-            env.get_string(&JString::from(v)).map(String::from)
-        })?;
-        if message.is_empty() {
-            Ok(())
-        } else {
-            Err(message)
-        }
-    }
-
-    fn release(&self) {
-        let _ = Self::call(|env, class| {
-            env.call_static_method(class, "releaseVm", "()V", &[]).map(|_| ())
-        });
-    }
-
-    fn exit_reason(&self) -> String {
-        Self::call(|env, class| {
-            let v = env
-                .call_static_method(class, "vmExitReason", "()Ljava/lang/String;", &[])?
-                .l()?;
-            env.get_string(&JString::from(v)).map(String::from)
-        })
-        .unwrap_or_default()
-    }
-}
 
 #[no_mangle]
 pub extern "system" fn Java_com_vphone_android_Native_createCatalog(mut env: JNIEnv, _this: JObject) -> jstring {
@@ -151,17 +90,10 @@ pub extern "system" fn Java_com_vphone_android_Native_createRun(
 ) -> jstring {
     guarded(&mut env, |env| {
         let name = text(env, &name);
-        if let Err(e) = bridge(env) {
-            return e;
-        }
-        result_text(super::run(Paths::get(), &name, Arc::new(JniProcess)))
+        result_text(super::run(Paths::get(), &name, Arc::new(super::vm::ExecVm::new(Paths::get()))))
     })
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_vphone_android_Native_createVmRun(mut env: JNIEnv, _this: JObject) -> jstring {
-    guarded(&mut env, |_| result_text(super::vm::run_from_spec(Paths::get())))
-}
 
 #[no_mangle]
 pub extern "system" fn Java_com_vphone_android_Native_createCancel(

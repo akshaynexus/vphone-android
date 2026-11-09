@@ -57,8 +57,7 @@ below that), and 8 GB of RAM or more. VMs and their restore trees live in intern
 real sparse files); downloaded firmware is in `<filesDir>/fw-cache` and is reused for later VMs unless
 you ask to delete it.
 
-Each QEMU boot runs in its own process: the `:create` foreground service drives the steps and
-binds `:createvm` for each boot, so an app kill or crash costs at most the step in progress. Step logs are in
+Each QEMU boot runs as its own executable, `libvphone_vm.so`, a child of the `:create` foreground service, so an app kill or crash costs at most the step in progress. Step logs are in
 `<vm>/.create-logs/` and reachable from the wizard. Nothing here has been run on a phone yet:
 see the build report.
 

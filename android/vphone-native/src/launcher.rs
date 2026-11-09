@@ -32,6 +32,7 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     let mut args: Vec<String> = vec!["qemu-system-aarch64".into(), "-M".into(), machine];
     let mut push = |parts: &[&str]| args.extend(parts.iter().map(|s| s.to_string()));
 
+    push(&["-name", "vphone,debug-threads=on"]);
     push(&["-accel", &format!("tcg,tb-size={}", cfg.tb_mib)]);
     push(&[
         "-smp",

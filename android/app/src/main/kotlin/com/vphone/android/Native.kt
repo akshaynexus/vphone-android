@@ -39,7 +39,6 @@ object Native {
     external fun createPending(): String
     external fun createStatus(name: String): String
     external fun createRun(name: String): String
-    external fun createVmRun(): String
     external fun createCancel(name: String)
     external fun createPause(name: String, paused: Boolean)
     external fun createAllowCellular(name: String, allow: Boolean)

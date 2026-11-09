@@ -22,11 +22,17 @@ use std::time::{Duration, Instant};
 
 pub use vphone_create_steps::host::VmKind;
 
+mod diag;
 pub mod display;
 pub mod vitals;
 
 const TAG: &str = "vphone-create";
 const QEMU_STACK: usize = 64 << 20;
+/// What the VM's threads did, beside its serial log; followed into the step's log.
+pub const THREADS_LOG: &str = "threads.log";
+/// The latest per-thread list, for the VM activity screen.
+pub const THREADS_NOW: &str = "vm-threads.txt";
+const EXECUTABLE: &str = "libvphone_vm.so";
 /// dfu-up.sh's sleep: AVPBooter reaches DFU. A phone needs no less.
 const DFU_SETTLE: Duration = Duration::from_secs(20);
 /// The restore runs a full iOS restoreOS; 4 GiB (a 12 GB phone's normal default) is not enough.
@@ -42,6 +48,9 @@ pub struct RunSpec {
     pub pid_file: String,
     pub exit_file: String,
     pub gfx: bool,
+    pub threads_log: String,
+    /// The app's directories: files, cache, external, native libraries.
+    pub paths: [String; 4],
     /// Written, with the reason, when this boot's display could not start.
     pub display_failed: String,
 }
@@ -91,7 +100,7 @@ pub fn dfu_spec(
         machine += &launcher::gfx_machine(&res);
     }
     let (nvram, disk) = (file("nvram.bin"), file("Disk.img"));
-    let mut args: Vec<String> = ["qemu-system-aarch64", "-M", &machine, "-accel"]
+    let mut args: Vec<String> = ["qemu-system-aarch64", "-name", "vphone,debug-threads=on", "-M", &machine, "-accel"]
         .into_iter()
         .map(String::from)
         .collect();
@@ -177,17 +186,6 @@ pub fn first_boot_spec(
     finish_spec(launch.args, env, run, paths, true)
 }
 
-/// Each switch turns off one fast path built and tuned on x86 hosts. Later values win.
-/// `QEMU_TLB_UNSYNCED` stays at 2: with too few host cores, mode 0 kept a restore from reaching
-/// its device at all, where mode 2 got through.
-const SAFE_EMULATION: [(&str, &str); 5] = [
-    ("VPHONE_NATIVE_FP", "0"),
-    ("VPHONE_FAST_F32", "0"),
-    ("VPHONE_INLINE_LOOKUP", "0"),
-    ("VPHONE_XPAGE_LINKS", "0"),
-    ("VPHONE_RET_PREFETCH", "0"),
-];
-
 fn finish_spec(
     args: Vec<String>,
     env: Vec<(String, String)>,
@@ -204,37 +202,41 @@ fn finish_spec(
         pid_file: pid_path(paths).to_string_lossy().into_owned(),
         exit_file: at("qemu.exit"),
         gfx,
+        threads_log: at(THREADS_LOG),
+        paths: [&paths.files, &paths.cache, &paths.external, &paths.native_lib]
+            .map(|p| p.to_string_lossy().into_owned()),
         display_failed: at("display-failed"),
     }
 }
 
-/// The `:createvm` process: runs the spec's QEMU, once. A service that the system restarted
-/// finds its spec already taken and returns an error instead of booting a VM twice.
-pub fn run_from_spec(paths: &Paths) -> Result<(), String> {
-    let path = spec_path(paths);
-    let taken = path.with_extension("taken");
-    fs::rename(&path, &taken).map_err(|_| "no VM spec is waiting".to_string())?;
-    let spec: RunSpec = serde_json::from_slice(&fs::read(&taken).map_err(|e| e.to_string())?)
+/// The VM process's body, in the `libvphone_vm.so` executable: loads QEMU and runs the boot's
+/// spec. QEMU ends the process itself.
+pub fn run_spec_file(file: &Path) -> Result<(), String> {
+    let spec: RunSpec = serde_json::from_slice(&fs::read(file).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-
-    for d in launcher::runtime_dirs(paths) {
+    let paths = Paths {
+        files: spec.paths[0].clone().into(),
+        cache: spec.paths[1].clone().into(),
+        external: spec.paths[2].clone().into(),
+        native_lib: spec.paths[3].clone().into(),
+    };
+    for d in launcher::runtime_dirs(&paths) {
         let _ = fs::create_dir_all(d);
     }
     let write_err = |message: &str| {
         let _ = fs::write(&spec.stderr, format!("{message}\n"));
     };
-    let qemu = runtime::load_qemu(paths).inspect_err(|e| write_err(e))?;
+    let qemu = runtime::load_qemu(&paths).inspect_err(|e| write_err(e))?;
     if spec.gfx {
-        let gipa = runtime::load_vulkan(paths).inspect_err(|e| {
+        let gipa = runtime::load_vulkan(&paths).inspect_err(|e| {
             write_err(e);
             let _ = fs::write(&spec.display_failed, e);
         })?;
         // SAFETY: gipa is vkGetInstanceProcAddr of the loader just opened.
         unsafe { (qemu.set_gipa)(gipa) };
-        // A view that was already open gave its Surface before QEMU's library was loaded.
-        runtime::reapply_window();
     }
-    vitals::spawn_self_stats(vitals::proc_path(paths));
+    vitals::spawn_self_stats(vitals::proc_path(&paths));
+    diag::spawn(spec.threads_log.clone().into(), paths.create_sockets().join(THREADS_NOW));
 
     let open = |p: &str| fs::File::create(p).map_err(|e| format!("cannot create {p}: {e}"));
     let (out, err) = (open(&spec.stdout)?, open(&spec.stderr)?);
@@ -249,7 +251,7 @@ pub fn run_from_spec(paths: &Paths) -> Result<(), String> {
     // Written last: past here, this process dying is the VM's.
     fs::write(&spec.pid_file, std::process::id().to_string()).map_err(|e| e.to_string())?;
     log(TAG, &format!("starting QEMU: {}", spec.args.join(" ")));
-    std::thread::Builder::new()
+    let qemu_thread = std::thread::Builder::new()
         .name("qemu-main".into())
         .stack_size(QEMU_STACK)
         .spawn(move || {
@@ -258,13 +260,28 @@ pub fn run_from_spec(paths: &Paths) -> Result<(), String> {
             std::process::exit(code);
         })
         .map_err(|e| e.to_string())?;
+    let _ = qemu_thread.join();
     Ok(())
+}
+
+/// The entry point of the `libvphone_vm.so` executable.
+#[no_mangle]
+pub extern "C" fn vphone_vm_main(spec: *const std::os::raw::c_char) -> std::os::raw::c_int {
+    // SAFETY: the executable passes a valid C string.
+    let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy().into_owned();
+    match run_spec_file(Path::new(&spec)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("VM process: {e}");
+            1
+        }
+    }
 }
 
 /// What Android does for the Supervisor: a process per VM, and why one died.
 pub trait VmProcess: Send + Sync {
     /// Starts the `:createvm` service. The VM's spec file is ready.
-    fn start(&self) -> Result<(), String>;
+    fn start(&self, spec: &Path, run: &Path) -> Result<(), String>;
     /// Releases it, after the process has ended.
     fn release(&self);
     /// Why Android says the last VM process ended, if it knows.
@@ -278,7 +295,6 @@ struct Current {
 }
 
 pub struct Supervisor {
-    safe_emulation: std::sync::atomic::AtomicBool,
     paths: Paths,
     process: Arc<dyn VmProcess>,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -315,14 +331,96 @@ fn alive(pid: i32) -> bool {
 
 #[cfg(target_os = "android")]
 fn is_our_vm_process(pid: i32) -> bool {
-    // The pid of a dead :createvm may be reused; only ours is ever signalled.
+    // The pid of a dead VM process may be reused; only ours is ever signalled.
     fs::read(format!("/proc/{pid}/cmdline"))
-        .is_ok_and(|c| String::from_utf8_lossy(&c).contains(":createvm"))
+        .is_ok_and(|c| String::from_utf8_lossy(&c).contains(EXECUTABLE))
 }
 
 #[cfg(not(target_os = "android"))]
 fn is_our_vm_process(_pid: i32) -> bool {
     true
+}
+
+/// The VM as an ordinary child process of the creation service.
+pub struct ExecVm {
+    native_lib: PathBuf,
+    child: Mutex<Option<std::process::Child>>,
+    launch_log: PathBuf,
+}
+
+impl ExecVm {
+    pub fn new(paths: &Paths) -> ExecVm {
+        ExecVm {
+            native_lib: paths.native_lib.clone(),
+            child: Mutex::new(None),
+            launch_log: paths.create_sockets().join("vm-launch.log"),
+        }
+    }
+}
+
+impl VmProcess for ExecVm {
+    fn start(&self, spec: &Path, _run: &Path) -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let log = fs::File::create(&self.launch_log).map_err(|e| e.to_string())?;
+        let mut command = Command::new(self.native_lib.join(EXECUTABLE));
+        command
+            .arg(spec)
+            .env("LD_LIBRARY_PATH", &self.native_lib)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log);
+        // SAFETY: setsid is async-signal-safe and allowed between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().map_err(|e| format!("cannot start the VM process: {e}"))?;
+        *self.child.lock().unwrap() = Some(child);
+        Ok(())
+    }
+
+    fn release(&self) {
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
+            let _ = child.try_wait();
+        }
+    }
+
+    fn exit_reason(&self) -> String {
+        use std::os::unix::process::ExitStatusExt;
+        let mut guard = self.child.lock().unwrap();
+        let Some(child) = guard.as_mut() else {
+            return String::new();
+        };
+        let status = match child.try_wait() {
+            Ok(Some(status)) => status,
+            _ => return String::new(),
+        };
+        let launch = fs::read_to_string(&self.launch_log).unwrap_or_default();
+        let launch = launch.trim();
+        let what = match (status.code(), status.signal()) {
+            (Some(code), _) => format!("QEMU exited with status {code}."),
+            (_, Some(signal)) => format!("QEMU was killed by {}.", signal_name(signal)),
+            _ => "QEMU ended.".to_string(),
+        };
+        if launch.is_empty() { what } else { format!("{what}\n{launch}") }
+    }
+}
+
+fn signal_name(signal: i32) -> String {
+    match signal {
+        libc::SIGSEGV => "SIGSEGV (invalid memory access)".into(),
+        libc::SIGBUS => "SIGBUS (bad memory access)".into(),
+        libc::SIGILL => "SIGILL (illegal instruction)".into(),
+        libc::SIGABRT => "SIGABRT (aborted)".into(),
+        libc::SIGKILL => "SIGKILL (Android or the app ended it)".into(),
+        libc::SIGTERM => "SIGTERM".into(),
+        other => format!("signal {other}"),
+    }
 }
 
 pub fn read_pid(paths: &Paths) -> Option<i32> {
@@ -342,7 +440,6 @@ impl Supervisor {
             cancelled,
             paused,
             current: Mutex::new(None),
-            safe_emulation: std::sync::atomic::AtomicBool::new(false),
             display_attached: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             boot_failure: Mutex::new(None),
@@ -376,12 +473,6 @@ impl Supervisor {
 
     /// Why the current boot failed, once, if it had the display attached: the caller redoes the
     /// boot headless. Clears the record either way.
-    /// Boots after this leave out the fast paths written for x86 hosts: slower, but it rules
-    /// them out where a boot has wedged.
-    pub fn use_safe_emulation(&self) {
-        self.safe_emulation.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     pub fn take_display_failure(&self) -> Option<String> {
         let reason = self.boot_failure.lock().unwrap().take();
         if self.display_attached.swap(false, Ordering::SeqCst) {
@@ -413,6 +504,10 @@ impl Supervisor {
             .as_ref()
             .map(|c| c.pid)
             .or_else(|| read_pid(&self.paths))
+    }
+
+    pub fn threads_log(&self) -> PathBuf {
+        self.serial_log().with_file_name(THREADS_LOG)
     }
 
     pub fn serial_log(&self) -> PathBuf {
@@ -528,13 +623,16 @@ impl Supervisor {
         let _ = fs::remove_file(vitals::proc_path(&self.paths));
         let bundle = Bundle::open(vm).map_err(|p| p.join("; "))?;
         let cfg = create_config();
-        let show = setting == display::Setting::On;
+        // A separate process has no Surface: until frames can reach the app, setup is headless.
+        let _ = setting;
+        let setting = display::Setting::Off;
+        let show = false;
         self.display_attached.store(show, Ordering::SeqCst);
         *self.boot_failure.lock().unwrap() = None;
         *self.stall.lock().unwrap() = None;
         let note = match &setting {
             display::Setting::Headless(why) => why.clone(),
-            display::Setting::Off => "The screen is switched off for this VM.".to_string(),
+            display::Setting::Off => "Setup runs without a live picture.".to_string(),
             display::Setting::On => String::new(),
         };
         *self.display_status.lock().unwrap() = (setting.name().to_string(), note);
@@ -547,13 +645,9 @@ impl Supervisor {
                 return Err("a first boot needs the GPU".into());
             }
         };
-        let mut spec = spec;
-        if self.safe_emulation.load(std::sync::atomic::Ordering::SeqCst) {
-            spec.env.extend(SAFE_EMULATION.map(|(k, v)| (k.to_string(), v.to_string())));
-        }
         let json = serde_json::to_vec_pretty(&spec).map_err(|e| e.to_string())?;
         fs::write(spec_path(&self.paths), json).map_err(|e| e.to_string())?;
-        self.process.start()?;
+        self.process.start(&spec_path(&self.paths), run)?;
 
         // The pid is written just before QEMU starts, so one that is already gone died at startup.
         self.wait("the VM process", Duration::from_secs(90), || {
@@ -604,7 +698,6 @@ impl Supervisor {
     pub fn adopt(&self, run: &Path) -> bool {
         match read_pid(&self.paths).filter(|p| alive(*p)) {
             Some(pid) => {
-                let _ = self.process.start();
                 *self.current.lock().unwrap() = Some(Current {
                     pid,
                     run: run.to_path_buf(),
@@ -711,15 +804,13 @@ mod tests {
             external: d.join("e"),
             native_lib: "/nonexistent".into(),
         };
-        // Spec present, no library: fails after being taken, and cannot start a second time.
         fs::write(spec_path(&p), serde_json::to_vec(&RunSpec {
             stdout: d.join("o").to_string_lossy().into_owned(),
             stderr: d.join("e").to_string_lossy().into_owned(),
+            paths: ["/nonexistent".to_string(), "/nonexistent".to_string(), "/nonexistent".to_string(), "/nonexistent".to_string()],
             ..Default::default()
         }).unwrap()).unwrap();
-        let _ = fs::File::create(d.join("o"));
-        assert!(run_from_spec(&p).is_err());
-        assert!(!spec_path(&p).exists());
-        assert_eq!(run_from_spec(&p).unwrap_err(), "no VM spec is waiting");
+        // No QEMU library at that path: reports it and returns, never starts a VM.
+        assert!(run_spec_file(&spec_path(&p)).is_err());
     }
 }
