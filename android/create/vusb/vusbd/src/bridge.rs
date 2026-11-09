@@ -8,7 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vusb_common::{read_frame, status, write_frame, DeviceBlob, OpCode, C2S, PROTOCOL_VERSION, S2C};
 
 const REDISCOVER_DELAY: Duration = Duration::from_millis(200);
@@ -143,6 +143,9 @@ struct Bus {
 pub struct Bridge {
     link: Arc<Link>,
     stage_timeout: Duration,
+    out_window: usize,
+    sent: std::sync::atomic::AtomicU64,
+    sent_since: Mutex<Instant>,
     verbose: bool,
     bus: Mutex<Bus>,
     workers: Mutex<HashMap<u8, Arc<Worker>>>,
@@ -156,6 +159,14 @@ impl Bridge {
         Bridge {
             link,
             stage_timeout,
+            // VUSB_OUT_WINDOW=1 sends one packet per round trip, for comparison.
+            out_window: std::env::var("VUSB_OUT_WINDOW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|w| (1..=48).contains(w))
+                .unwrap_or(crate::link::OUT_WINDOW),
+            sent: std::sync::atomic::AtomicU64::new(0),
+            sent_since: Mutex::new(Instant::now()),
             verbose,
             bus: Mutex::new(Bus {
                 device: None,
@@ -246,6 +257,8 @@ impl Bridge {
         }
         let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
         let address = self.next_address.fetch_add(1, Ordering::SeqCst) as u8 % 127 + 1;
+        self.sent.store(0, Ordering::SeqCst);
+        *self.sent_since.lock().unwrap() = Instant::now();
         eprintln!(
             "vusbd: USB device discovered: {vid:04x}:{pid:04x}, {} configuration(s), active {active_config}",
             configs.len()
@@ -386,6 +399,18 @@ impl Bridge {
         urb.complete(st, actual, data);
     }
 
+    /// A line in the log per 8 MiB sent to the DFU/recovery controller: the only sign of how far
+    /// a transfer of hundreds of megabytes has got.
+    fn note_sent(&self, bytes: u64) {
+        const STEP: u64 = 8 << 20;
+        let before = self.sent.fetch_add(bytes, Ordering::SeqCst);
+        let total = before + bytes;
+        if before / STEP != total / STEP {
+            let elapsed = self.sent_since.lock().unwrap().elapsed().as_secs_f64();
+            eprintln!("vusbd: sent {} MiB in {elapsed:.1} s", total >> 20);
+        }
+    }
+
     /// Returns (actual_length, IN data).
     fn transfer(&self, device: &Device, urb: &Urb) -> Result<(usize, Vec<u8>), LinkError> {
         let cancel = Some(&urb.cancel);
@@ -421,9 +446,9 @@ impl Bridge {
             // DFU/recovery MMIO controller: its receive buffer is small.
             let packet_size = *device.endpoint_sizes.get(&urb.address).unwrap_or(&512) as usize;
             let packet_size = if packet_size == 0 { 512 } else { packet_size };
-            for chunk in urb.payload.chunks(packet_size) {
-                self.link.transfer_out(urb.address, chunk, cancel)?;
-            }
+            self.link
+                .transfer_out_stream(urb.address, &urb.payload, packet_size, self.out_window, cancel)?;
+            self.note_sent(urb.payload.len() as u64);
         }
         Ok((urb.payload.len(), Vec::new()))
     }

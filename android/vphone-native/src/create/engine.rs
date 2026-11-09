@@ -58,7 +58,13 @@ pub struct Engine {
     usb: Mutex<Vec<Background>>,
     pause: Mutex<bool>,
     paused_in_step: AtomicBool,
-    mirror: Mutex<Option<Mirror>>,
+    mirror: Mutex<Vec<Followed>>,
+}
+
+/// A log being followed into the step's log, with what marks its lines there.
+struct Followed {
+    mirror: Mirror,
+    prefix: &'static str,
 }
 
 impl Engine {
@@ -105,7 +111,7 @@ impl Engine {
             usb: Mutex::new(Vec::new()),
             pause: Mutex::new(false),
             paused_in_step: AtomicBool::new(false),
-            mirror: Mutex::new(None),
+            mirror: Mutex::new(Vec::new()),
         });
         Ok(e)
     }
@@ -180,7 +186,7 @@ impl Engine {
 
     pub fn end_step(&self, key: &str, state_text: &str, elapsed: Duration) {
         self.pump_mirror();
-        *self.mirror.lock().unwrap() = None;
+        self.mirror.lock().unwrap().clear();
         let total = {
             let mut t = self.times.lock().unwrap();
             let e = t.entry(key.to_string()).or_insert(0);
@@ -240,25 +246,35 @@ impl Engine {
         self.status(false, |s| s.eta_secs = self.eta(s));
     }
 
-    /// Follows a helper's own log: its lines go into the step's log, and a restore's stages show
-    /// as the step's progress.
+    /// Follows a helper's own log into the step's, with what the VM and the USB link say beside
+    /// it: a restore's stages show as the step's progress, and a guest that panics shows why.
     pub fn mirror_log(&self, path: &Path) {
-        *self.mirror.lock().unwrap() = Some(Mirror::new(path));
+        let follow = |path: &Path, prefix| Followed { mirror: Mirror::new(path), prefix };
+        *self.mirror.lock().unwrap() = vec![
+            follow(path, ""),
+            follow(&self.sup.serial_log(), "[guest] "),
+            follow(&self.vm.join(state::LOG_DIR).join("usb-broker.log"), "[usb] "),
+        ];
     }
 
     fn pump_mirror(&self) {
         let mut guard = self.mirror.lock().unwrap();
-        let Some(mirror) = guard.as_mut() else { return };
-        for line in mirror.drain() {
-            if let Some((stage, text)) = mirror.advance(&line) {
-                self.status(true, |s| {
-                    s.done_bytes = stage;
-                    s.total_bytes = mirror::STAGE_COUNT;
-                    s.bytes_per_sec = 0;
-                    s.message = text.to_string();
-                });
+        for followed in guard.iter_mut() {
+            for line in followed.mirror.drain() {
+                if followed.prefix.is_empty() {
+                    if let Some((stage, text)) = followed.mirror.advance(&line) {
+                        self.status(true, |s| {
+                            s.done_bytes = stage;
+                            s.total_bytes = mirror::STAGE_COUNT;
+                            s.bytes_per_sec = 0;
+                            s.message = text.to_string();
+                        });
+                    }
+                } else if let Some(sent) = mirror::sent_mib(&line) {
+                    self.status(true, |s| s.message = format!("Sent {sent} MB to the VM"));
+                }
+                self.append_log(&format!("{}{line}", followed.prefix));
             }
-            self.append_log(&line);
         }
     }
 

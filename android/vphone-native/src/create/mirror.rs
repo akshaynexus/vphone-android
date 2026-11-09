@@ -31,6 +31,11 @@ pub fn stage_of(line: &str) -> Option<(u64, &'static str)> {
         .map(|i| (i as u64 + 1, STAGES[i].1))
 }
 
+/// The MiB the USB link reports having sent: `vusbd: sent 16 MiB in 3.2 s`.
+pub fn sent_mib(line: &str) -> Option<u64> {
+    line.strip_prefix("vusbd: sent ")?.split(' ').next()?.parse().ok()
+}
+
 pub struct Mirror {
     path: PathBuf,
     /// Kept open once found: the file's VM can be deleted before its last lines have been read.
@@ -101,6 +106,12 @@ mod tests {
         let seen: Vec<u64> = REAL.lines().filter_map(|l| m.advance(l).map(|s| s.0)).collect();
         assert_eq!(seen, (1..=STAGE_COUNT).collect::<Vec<_>>());
         assert_eq!(m.advance("Sending iBSS (380445 bytes)..."), None, "it never goes back");
+    }
+
+    #[test]
+    fn reads_the_usb_link_s_progress() {
+        assert_eq!(sent_mib("vusbd: sent 16 MiB in 3.2 s"), Some(16));
+        assert_eq!(sent_mib("vusbd: listening on /x"), None);
     }
 
     #[test]

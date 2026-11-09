@@ -30,6 +30,10 @@ pub const MSG_PAYLOAD_MAX: usize = VUSB_MSG_MAX - 6;
 pub const CTRL_TIMEOUT: Duration = Duration::from_secs(5);
 const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 const NAK_DELAY: Duration = Duration::from_millis(1);
+/// How long the guest may take to acknowledge one packet: far past any slow phone.
+const OUT_ACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// The controller queues at most 64 host messages (`VUSB_HOST_FIFO`).
+pub const OUT_WINDOW: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
@@ -373,6 +377,40 @@ impl Link {
         retry()?;
         self.next(Queue::Out(address), epoch, None, cancel, &retry)
             .map(|_| ())
+    }
+
+    /// One bulk OUT transfer to the DFU/recovery controller, in packets of `packet` bytes. Up to
+    /// `window` packets are in flight, which the controller queues, so a transfer of hundreds of
+    /// thousands of packets does not wait for a host-side round trip per packet. A guest that stops
+    /// acknowledging (a panic in iBoot, say) fails the transfer instead of hanging it.
+    pub fn transfer_out_stream(
+        &self,
+        address: u8,
+        payload: &[u8],
+        packet: usize,
+        window: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        let epoch = self.epoch();
+        let no_nak = || Err(LinkError::Protocol("NAK from the DFU/recovery controller".into()));
+        let ack = || {
+            let deadline = Some(Instant::now() + OUT_ACK_TIMEOUT);
+            self.next(Queue::Out(address), epoch, deadline, cancel, &no_nak)
+        };
+        let mut in_flight = 0;
+        for chunk in payload.chunks(packet) {
+            if in_flight == window {
+                ack()?;
+                in_flight -= 1;
+            }
+            self.send(address, MSG_DATA, chunk)?;
+            in_flight += 1;
+        }
+        while in_flight > 0 {
+            ack()?;
+            in_flight -= 1;
+        }
+        Ok(())
     }
 
     /// Endpoint abort after a cancelled transfer. A control abort is answered on ep 0 for either

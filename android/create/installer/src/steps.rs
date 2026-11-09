@@ -325,7 +325,7 @@ fn wait_restore(host: &dyn Host, helper: &mut dyn BackgroundHelper, log: &Path) 
             if code != 0 && finished_at.is_none() {
                 let tail = fs::read(log).unwrap_or_default();
                 let tail = String::from_utf8_lossy(&tail[tail.len().saturating_sub(3000)..]).into_owned();
-                bail!("restore exited with status {code}\nIts last output:\n{}", tail.trim());
+                bail!("restore exited with status {code}\nIts last output:\n{}\n\n{}", tail.trim(), host.diagnostics());
             }
             return Ok(());
         }
