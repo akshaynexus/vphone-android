@@ -178,8 +178,9 @@ pub fn first_boot_spec(
 }
 
 /// Each switch turns off one fast path built and tuned on x86 hosts. Later values win.
-const SAFE_EMULATION: [(&str, &str); 6] = [
-    ("QEMU_TLB_UNSYNCED", "0"),
+/// `QEMU_TLB_UNSYNCED` stays at 2: with too few host cores, mode 0 kept a restore from reaching
+/// its device at all, where mode 2 got through.
+const SAFE_EMULATION: [(&str, &str); 5] = [
     ("VPHONE_NATIVE_FP", "0"),
     ("VPHONE_FAST_F32", "0"),
     ("VPHONE_INLINE_LOOKUP", "0"),
