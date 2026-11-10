@@ -17,12 +17,14 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.View
 import android.view.WindowInsets
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
@@ -451,8 +453,24 @@ class MainActivity : Activity() {
             isChecked = config.optBoolean("display", true)
         }
         val compression = CheckBox(this).apply {
-            text = "GPU image compression (UBWC). Off is the fix for a scrambled screen on the Adreno 840"
+            text = "GPU image compression (UBWC) for the driver's own images. Faster where it works; " +
+                "turn it off if the picture is wrong"
             isChecked = config.optBoolean("gpuCompression", false)
+        }
+        // The values the driver reads (TU_ANDROID_SWAPCHAIN_LAYOUT), in the order of the labels.
+        val layoutValues = listOf("auto", "linear", "ubwc")
+        val swapchainLayout = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("Auto (as gralloc says, else linear)", "Linear", "Compressed (UBWC)"),
+            )
+            setSelection(layoutValues.indexOf(config.optString("swapchainLayout", "auto")).coerceAtLeast(0))
+        }
+        val softwareDisplay = CheckBox(this).apply {
+            text = "Draw the screen on the CPU (slower; right whatever the GPU driver does with the " +
+                "screen's buffers)"
+            isChecked = config.optBoolean("softwareDisplay", false)
         }
         val diagnostics = CheckBox(this).apply {
             text = "GPU diagnostics: image layouts in the log, and pictures of the guest's screen " +
@@ -469,6 +487,12 @@ class MainActivity : Activity() {
         form.addView(hints)
         form.addView(display)
         form.addView(compression)
+        labelled(
+            form,
+            "Screen buffer layout. If the picture is smeared into bands or dashes, try the other two",
+            swapchainLayout,
+        )
+        form.addView(softwareDisplay)
         form.addView(diagnostics)
         AlertDialog.Builder(this)
             .setTitle(name)
@@ -482,6 +506,8 @@ class MainActivity : Activity() {
                     .put("display", display.isChecked)
                     .put("gpuCompression", compression.isChecked)
                     .put("gpuDiagnostics", diagnostics.isChecked)
+                    .put("softwareDisplay", softwareDisplay.isChecked)
+                    .put("swapchainLayout", layoutValues[swapchainLayout.selectedItemPosition.coerceIn(0, 2)])
                 val error = Native.saveVmConfig(name, saved.toString())
                 if (error.isNotEmpty()) Toast.makeText(this, error, Toast.LENGTH_LONG).show()
                 showVms()

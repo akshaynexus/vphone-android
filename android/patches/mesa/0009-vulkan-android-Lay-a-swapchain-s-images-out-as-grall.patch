@@ -1,0 +1,292 @@
+From 622f6a05719add5001d2cac78a9897e6ab0ea052 Mon Sep 17 00:00:00 2001
+From: vphone <vphone@localhost>
+Date: Tue, 10 Nov 2026 10:44:49 +0530
+Subject: [PATCH] vulkan/android: Lay a swapchain's images out as gralloc
+ allocated them
+
+A swapchain image whose buffer gralloc says nothing of kept
+DRM_FORMAT_MOD_INVALID, with which Turnip chose a tiled layout of its own
+for a buffer the compositor reads as linear. Such an image is now LINEAR,
+which is what Qualcomm's gralloc allocates without its vendor usage bit.
+
+TU_ANDROID_SWAPCHAIN_LAYOUT=auto|linear|ubwc overrides it: linear whatever
+gralloc says, or ubwc, which also asks gralloc for compressed buffers with
+the vendor usage bit 0x10000000 where Android's loader asks what to allocate
+with (VkAndroidHardwareBufferUsageANDROID on the image format properties, as
+Android 16's does, and vkGetSwapchainGrallocUsage*ANDROID). That placement
+and its CPU usage guard are WinNative-Emu/Drivers'
+patches/add_ubwc_swapchain_usage.py, behind the setting here.
+
+A single plane's row pitch is the loader's stride, whatever the gralloc
+backend read: a pitch the driver has no layout for would fail the swapchain.
+
+The choice is printed once per swapchain, to stderr as well as the log.
+
+Generated-by: LLM
+---
+ src/vulkan/runtime/vk_android.c | 204 +++++++++++++++++++++++++++++++-
+ 1 file changed, 200 insertions(+), 4 deletions(-)
+
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index 32ff550d88f..abcc6d2770a 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -29,6 +29,7 @@
+ #include "vk_common_entrypoints.h"
+ #include "vk_device.h"
+ #include "vk_enum_defines.h"
++#include "vk_enum_to_str.h"
+ #include "vk_format.h"
+ #include "vk_image.h"
+ #include "vk_log.h"
+@@ -41,6 +42,7 @@
+ #include "util/libsync.h"
+ #include "util/log.h"
+ #include "util/os_file.h"
++#include "util/simple_mtx.h"
+ #include "util/u_gralloc/u_gralloc.h"
+ 
+ #include <hardware/gralloc.h>
+@@ -53,9 +55,148 @@
+ #endif
+ 
+ #include <unistd.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ static struct u_gralloc *_gralloc;
+ 
++/* The layout of the swapchain's images, which gralloc allocates and the
++ * compositor reads.  TU_ANDROID_SWAPCHAIN_LAYOUT chooses it:
++ *
++ *    auto    (default) what gralloc says of the buffer; LINEAR where it says
++ *            nothing, which is what gralloc allocates for the usage asked here
++ *    linear  LINEAR whatever gralloc says
++ *    ubwc    gralloc is asked for compressed buffers, and the image is what
++ *            gralloc says of the buffer; QCOM_COMPRESSED where it says nothing
++ */
++enum vk_android_swapchain_layout {
++   VK_ANDROID_SWAPCHAIN_LAYOUT_AUTO,
++   VK_ANDROID_SWAPCHAIN_LAYOUT_LINEAR,
++   VK_ANDROID_SWAPCHAIN_LAYOUT_UBWC,
++};
++
++/* The first vendor usage bit (GRALLOC_USAGE_PRIVATE_0, bit 28 of AIDL
++ * BufferUsage's VENDOR_MASK), which Qualcomm's grallocs read as "allocate
++ * UBWC": without it they allocate linear buffers.
++ */
++#define VK_ANDROID_QCOM_USAGE_ALLOC_UBWC 0x10000000ull
++
++static enum vk_android_swapchain_layout
++vk_android_swapchain_layout(void)
++{
++   const char *value = getenv("TU_ANDROID_SWAPCHAIN_LAYOUT");
++
++   if (value && !strcmp(value, "linear"))
++      return VK_ANDROID_SWAPCHAIN_LAYOUT_LINEAR;
++   if (value && !strcmp(value, "ubwc"))
++      return VK_ANDROID_SWAPCHAIN_LAYOUT_UBWC;
++   return VK_ANDROID_SWAPCHAIN_LAYOUT_AUTO;
++}
++
++static const char *
++vk_android_modifier_name(uint64_t modifier)
++{
++   switch (modifier) {
++   case DRM_FORMAT_MOD_LINEAR:
++      return "LINEAR";
++   case DRM_FORMAT_MOD_QCOM_COMPRESSED:
++      return "QCOM_COMPRESSED (UBWC)";
++   case DRM_FORMAT_MOD_INVALID:
++      return "unknown";
++   default:
++      return "a modifier the driver has no layout for";
++   }
++}
++
++/* The modifier a swapchain image is laid out with, given the one the handle
++ * was read as.  Never DRM_FORMAT_MOD_INVALID, with which a driver would pick
++ * a layout of its own that the compositor does not read.
++ */
++static uint64_t
++vk_android_choose_swapchain_modifier(enum vk_android_swapchain_layout layout,
++                                     uint64_t detected)
++{
++   switch (layout) {
++   case VK_ANDROID_SWAPCHAIN_LAYOUT_LINEAR:
++      return DRM_FORMAT_MOD_LINEAR;
++   case VK_ANDROID_SWAPCHAIN_LAYOUT_UBWC:
++      return detected == DRM_FORMAT_MOD_LINEAR ? DRM_FORMAT_MOD_LINEAR
++                                               : DRM_FORMAT_MOD_QCOM_COMPRESSED;
++   default:
++      /* Anything but these two is no layout the driver has. */
++      return detected == DRM_FORMAT_MOD_QCOM_COMPRESSED ? detected
++                                                        : DRM_FORMAT_MOD_LINEAR;
++   }
++}
++
++struct vk_android_swapchain_layout_line {
++   uint32_t width, height;
++   int stride, format, num_fds, num_ints;
++   uint64_t detected, chosen;
++};
++
++/* One line per swapchain, on stderr as well as the log: an application that
++ * loads the driver itself keeps its stderr, and may not read logcat.
++ */
++static void
++vk_android_log_swapchain_layout(const VkImageCreateInfo *pCreateInfo,
++                                const VkNativeBufferANDROID *anb,
++                                enum vk_android_swapchain_layout layout,
++                                uint64_t detected, uint64_t chosen,
++                                uint64_t row_pitch)
++{
++   static simple_mtx_t mtx = SIMPLE_MTX_INITIALIZER;
++   static struct vk_android_swapchain_layout_line last;
++   const native_handle_t *handle = anb->handle;
++   const struct vk_android_swapchain_layout_line now = {
++      .width = pCreateInfo->extent.width,
++      .height = pCreateInfo->extent.height,
++      .stride = anb->stride,
++      .format = anb->format,
++      .num_fds = handle->numFds,
++      .num_ints = handle->numInts,
++      .detected = detected,
++      .chosen = chosen,
++   };
++
++   /* A swapchain's images are created one after another, and say the same. */
++   simple_mtx_lock(&mtx);
++   const bool same = !memcmp(&last, &now, sizeof(now));
++   last = now;
++   simple_mtx_unlock(&mtx);
++   if (same)
++      return;
++
++   /* The handle's first ints, for a layout this does not read yet. */
++   char ints[8 * 12 + 1] = "";
++   int len = 0;
++   for (int i = 0; i < handle->numInts && i < 8; i++) {
++      len += snprintf(ints + len, sizeof(ints) - len, " 0x%x",
++                      (unsigned)handle->data[handle->numFds + i]);
++   }
++
++   char line[512];
++   snprintf(line, sizeof(line),
++            "swapchain layout: %ux%u %s, gralloc format %d stride %d px, "
++            "handle numFds=%d numInts=%d ints[0..]=%s: gralloc (%s) says %s, "
++            "TU_ANDROID_SWAPCHAIN_LAYOUT=%s, laid out %s (UBWC %s), "
++            "row pitch %llu bytes",
++            now.width, now.height, vk_Format_to_str(pCreateInfo->format),
++            anb->format, anb->stride, handle->numFds, handle->numInts, ints,
++            u_gralloc_get_type(vk_android_get_ugralloc()) ==
++               U_GRALLOC_TYPE_AIMAPPER ? "IMapper 5 metadata" : "the handle",
++            vk_android_modifier_name(detected),
++            layout == VK_ANDROID_SWAPCHAIN_LAYOUT_LINEAR ? "linear" :
++            layout == VK_ANDROID_SWAPCHAIN_LAYOUT_UBWC ? "ubwc" : "auto",
++            vk_android_modifier_name(chosen),
++            chosen == DRM_FORMAT_MOD_QCOM_COMPRESSED ? "yes" : "no",
++            (unsigned long long)row_pitch);
++   mesa_logi("%s", line);
++   fprintf(stderr, "turnip: %s\n", line);
++   fflush(stderr);
++}
++
+ static void
+ vk_android_init_ugralloc_once(void)
+ {
+@@ -317,8 +458,43 @@ vk_android_get_anb_layout(
+       .pixel_stride = native_buffer->stride,
+    };
+ 
+-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+-                                            out_layouts, max_planes);
++   VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
++                                                       out_layouts,
++                                                       max_planes);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* The loader's stride is the allocation's.  A single plane with another
++    * pitch is a backend misreading the buffer, and a pitch the driver has no
++    * layout for would fail the swapchain.
++    */
++   const uint64_t stride_pitch = (uint64_t)MAX2(native_buffer->stride, 0) *
++                                 vk_format_get_blocksize(pCreateInfo->format);
++   if (out->drmFormatModifierPlaneCount == 1 && stride_pitch > 0 &&
++       vk_format_get_blockwidth(pCreateInfo->format) == 1 &&
++       out_layouts[0].rowPitch != stride_pitch) {
++      mesa_logw("swapchain layout: gralloc gives a row pitch of %llu bytes "
++                "for a stride of %d pixels; taking %llu",
++                (unsigned long long)out_layouts[0].rowPitch,
++                native_buffer->stride, (unsigned long long)stride_pitch);
++      fprintf(stderr,
++              "turnip: swapchain layout: gralloc gives a row pitch of %llu "
++              "bytes for a stride of %d pixels; taking %llu\n",
++              (unsigned long long)out_layouts[0].rowPitch,
++              native_buffer->stride, (unsigned long long)stride_pitch);
++      out_layouts[0].rowPitch = stride_pitch;
++   }
++
++   const enum vk_android_swapchain_layout layout =
++      vk_android_swapchain_layout();
++   const uint64_t detected = out->drmFormatModifier;
++   out->drmFormatModifier =
++      vk_android_choose_swapchain_modifier(layout, detected);
++   vk_android_log_swapchain_layout(pCreateInfo, native_buffer, layout,
++                                   detected, out->drmFormatModifier,
++                                   out_layouts[0].rowPitch);
++
++   return VK_SUCCESS;
+ }
+ 
+ VkResult
+@@ -453,6 +629,10 @@ setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage,
+    if (!gralloc_usage)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
++   /* A swapchain laid out as UBWC needs buffers gralloc allocated as UBWC. */
++   if (vk_android_swapchain_layout() == VK_ANDROID_SWAPCHAIN_LAYOUT_UBWC)
++      gralloc_usage |= VK_ANDROID_QCOM_USAGE_ALLOC_UBWC;
++
+    *out_gralloc_usage = gralloc_usage;
+ 
+    return VK_SUCCESS;
+@@ -658,6 +838,8 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
+       *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_GPU_RENDER_TARGET;
+    if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
+       *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE;
++   if (gralloc_usage & VK_ANDROID_QCOM_USAGE_ALLOC_UBWC)
++      *grallocProducerUsage |= VK_ANDROID_QCOM_USAGE_ALLOC_UBWC;
+ 
+    /* for front buffer rendering */
+    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
+@@ -1346,8 +1528,22 @@ vk_android_get_ahb_image_properties(
+ 
+    ahb_usage_props =
+       vk_find_struct(props->pNext, ANDROID_HARDWARE_BUFFER_USAGE_ANDROID);
+-   if (ahb_usage_props)
+-      ahb_usage_props->androidHardwareBufferUsage = ahb_usage;
++   if (ahb_usage_props) {
++      /* Reaching here means the caller chained
++       * VkAndroidHardwareBufferUsageANDROID on the output: it asks what to
++       * allocate with, as Android 16's loader does for a swapchain's buffers
++       * in place of vkGetSwapchainGrallocUsage*ANDROID.  Import validation
++       * never chains it.  gralloc has no compressed buffer the CPU can map.
++       */
++      uint64_t alloc_usage = ahb_usage;
++
++      if (vk_android_swapchain_layout() == VK_ANDROID_SWAPCHAIN_LAYOUT_UBWC &&
++          !(alloc_usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
++                           AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
++         alloc_usage |= VK_ANDROID_QCOM_USAGE_ALLOC_UBWC;
++
++      ahb_usage_props->androidHardwareBufferUsage = alloc_usage;
++   }
+ 
+    return VK_SUCCESS;
+ }
+-- 
+2.56.0
+

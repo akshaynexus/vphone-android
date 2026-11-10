@@ -126,19 +126,30 @@ GPU task on threads inside QEMU.
 
 ### A wrong picture
 
-*Settings* has two GPU switches for each VM:
+*Settings* has these for each VM's picture:
 
 | Setting | Default | What it sets |
 |---|---|---|
-| GPU image compression (UBWC) | off | Off runs Turnip with `TU_DEBUG=noubwc`. |
-| GPU diagnostics | on | `TU_DEBUG=layout`: the driver prints each image's format, size, pitch, tile mode and UBWC sizes to `serial.log`. `REIMS_VGPU_FRAME_DUMP=<files>/runs/frames`: every 15 s at most, the GPU device saves the bytes of the guest surface behind the frame on screen, read by the CPU from the guest's pages with no GPU command between (`reims-vgpu`'s `window/vulkan/dump.rs`). The log screen's *Share* sends the last four as `guest-surface-N.png` with the log. |
+| GPU image compression (UBWC) | off | Off runs Turnip with `TU_DEBUG=noubwc`, for the driver's own images. |
+| Screen buffer layout | Auto | `TU_ANDROID_SWAPCHAIN_LAYOUT=auto\|linear\|ubwc`: how Turnip lays out the swapchain's images, which gralloc allocates and the compositor reads. Auto is what gralloc says of each buffer, and linear where it says nothing. Linear is linear whatever gralloc says. Compressed asks gralloc for UBWC buffers (vendor usage bit `0x10000000`) and lays the images out as gralloc then says, UBWC where it says nothing. |
+| Draw the screen on the CPU | off | `REIMS_VGPU_SOFTWARE_DISPLAY=1`: the GPU device makes no swapchain; for each frame it reads the guest's surface as a frame dump does and copies it into the window's buffer (`ANativeWindow_lock`, at the buffer's stride; `reims-vgpu`'s `window/vulkan/software.rs`). No driver is between the surface and the screen. It costs a conversion and a copy of the frame on the CPU per frame. |
+| GPU diagnostics | on | `TU_DEBUG=layout`: the driver prints each image's format, size, pitch, tile mode and UBWC sizes to `serial.log`. `REIMS_VGPU_FRAME_DUMP=<files>/runs/frames`: every 15 s at most, the GPU device saves the bytes of the guest surface behind the frame on screen, read by the CPU from the guest's pages with no GPU command between (`reims-vgpu`'s `window/vulkan/dump.rs`). The log screen's *Share* sends the last four as `guest-surface-N.png` with the log. No dumps are made while the screen is drawn on the CPU. |
 
-Compression is off because 0.5.6 on an Adreno 840 drew a scrambled screen whose structure is that of a
-UBWC-compressed 864x1864 image of 8 bytes per pixel shown as plain rows: 27 columns of 32 pixels (256-byte
-compressed blocks in 6912-byte rows), repeating every 16 rows (27 macrotiles of 4 KiB). The guest's
-framebuffer surface is such an image (`RGBA16Float`); the swapchain's is 4 bytes per pixel. Which read of
-it goes wrong (the copy back into the guest's pages, the copy into the image, or the draw that samples
-it) is not known, and neither is whether `noubwc` cures it: nothing here was run on the GPU.
+**The scrambled screen of 0.5.6 and 0.5.7** (Adreno 840, Android 17) was the swapchain's layout. The
+frame dumps of 0.5.7 showed the guest's surface right while the screen showed every 16 rows smeared
+across its width, and the `layout` lines showed the swapchain's `R8G8B8A8_UNORM` 864x1864 images `tiled`.
+The cause, in Mesa at the pin: built with `-Dandroid-stub=true` the driver reads a buffer's layout from
+its handle alone (`u_gralloc_fallback.c`), and only where the handle starts with the `'gmsm'` magic of
+Qualcomm's older gralloc. This phone's gralloc (SnapAlloc) has no magic, so the modifier stayed
+`DRM_FORMAT_MOD_INVALID`, and Turnip then picks a layout of its own (`tu_image.cc`: tiled, with UBWC
+where allowed) for a buffer gralloc allocated, and the compositor reads, as linear. The fix is patches
+`0007` to `0009` of `android/patches/mesa` (`android/mesa/README.md`). The driver says what it chose
+once per swapchain, in `serial.log`:
+
+    turnip: swapchain layout: 864x1864 VK_FORMAT_R8G8B8A8_UNORM, gralloc format 1 stride 896 px, handle numFds=2 numInts=34 ints[0..]= ...: gralloc (IMapper 5 metadata) says LINEAR, TU_ANDROID_SWAPCHAIN_LAYOUT=auto, laid out LINEAR (UBWC no), row pitch 3584 bytes
+
+None of this has run on a phone as of 0.5.8. If the picture is still wrong: *Screen buffer layout*
+Linear, then Compressed; then *Draw the screen on the CPU*, which needs no driver to be right.
 
 A screenshot beside a `guest-surface-N.png` tells the two halves apart. The PNG scrambled like the screen:
 the GPU wrote the scramble into the guest's pages (the render or the copy back). The PNG right and the

@@ -102,6 +102,10 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     if let Some(flags) = cfg.tu_debug() {
         env.push(("TU_DEBUG", flags));
     }
+    env.push(("TU_ANDROID_SWAPCHAIN_LAYOUT", cfg.swapchain_layout.env_value().to_string()));
+    if cfg.software_display && cfg.display {
+        env.push(("REIMS_VGPU_SOFTWARE_DISPLAY", "1".to_string()));
+    }
     if cfg.gpu_diagnostics && cfg.display {
         env.push(("REIMS_VGPU_FRAME_DUMP", dir(frame_dump_dir(paths))));
     }
@@ -161,6 +165,7 @@ pub fn runtime_dirs(paths: &Paths) -> Vec<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::bundle::tests::fixture;
+    use crate::config::SwapchainLayout;
     use std::path::PathBuf;
 
     fn paths() -> Paths {
@@ -181,6 +186,8 @@ mod tests {
             display: true,
             gpu_compression: false,
             gpu_diagnostics: true,
+            swapchain_layout: SwapchainLayout::Auto,
+            software_display: false,
         }
     }
 
@@ -236,6 +243,22 @@ mod tests {
         };
         let default = build(&bundle, &cfg(), &paths());
         assert_eq!(value(&default, "TU_DEBUG").as_deref(), Some("noubwc,layout"));
+        assert_eq!(value(&default, "TU_ANDROID_SWAPCHAIN_LAYOUT").as_deref(), Some("auto"));
+        let linear = VmConfig { swapchain_layout: SwapchainLayout::Linear, ..cfg() };
+        let linear = build(&bundle, &linear, &paths());
+        assert_eq!(value(&linear, "TU_ANDROID_SWAPCHAIN_LAYOUT").as_deref(), Some("linear"));
+        let ubwc = VmConfig { swapchain_layout: SwapchainLayout::Ubwc, ..cfg() };
+        let ubwc = build(&bundle, &ubwc, &paths());
+        assert_eq!(value(&ubwc, "TU_ANDROID_SWAPCHAIN_LAYOUT").as_deref(), Some("ubwc"));
+        assert_eq!(value(&default, "REIMS_VGPU_SOFTWARE_DISPLAY"), None);
+        let cpu = VmConfig { software_display: true, ..cfg() };
+        assert_eq!(
+            value(&build(&bundle, &cpu, &paths()), "REIMS_VGPU_SOFTWARE_DISPLAY").as_deref(),
+            Some("1")
+        );
+        // With the screen off nothing draws it, on the CPU or otherwise.
+        let dark = VmConfig { software_display: true, display: false, ..cfg() };
+        assert_eq!(value(&build(&bundle, &dark, &paths()), "REIMS_VGPU_SOFTWARE_DISPLAY"), None);
         assert_eq!(
             value(&default, "REIMS_VGPU_FRAME_DUMP").as_deref(),
             Some("/data/files/runs/frames")

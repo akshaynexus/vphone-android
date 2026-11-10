@@ -39,7 +39,8 @@ check() {
         | awk '$1=="LOAD" && $NF!="0x4000" {print "LOAD not 16K aligned: " $0; bad=1} END{exit bad}'
     strings_in=$("$NDK_BIN/llvm-strings" -a "$so")
     for name in VK_EXT_external_memory_host VK_ANDROID_native_buffer vkGetMemoryHostPointerPropertiesEXT \
-                VK_EXT_post_depth_coverage VK_EXT_fragment_shader_interlock; do
+                VK_EXT_post_depth_coverage VK_EXT_fragment_shader_interlock \
+                TU_ANDROID_SWAPCHAIN_LAYOUT AIMapper_loadIMapper; do
         grep -x "$name" <<<"$strings_in" >/dev/null || { echo "$name is absent from the library" >&2; exit 1; }
     done
     echo "ok: $so"

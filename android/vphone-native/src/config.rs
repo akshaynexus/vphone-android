@@ -10,6 +10,30 @@ pub const MIN_TB_MIB: u32 = 64;
 pub const MIN_RAM_MIB: u32 = 1024;
 const FILE: &str = "android.json";
 
+/// How Turnip lays out the images of the screen's swapchain, which Android's gralloc allocates
+/// and the compositor reads. The driver reads it from `TU_ANDROID_SWAPCHAIN_LAYOUT`
+/// (android/patches/mesa/0007).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SwapchainLayout {
+    /// What the buffer's handle says, and linear where it says nothing.
+    #[default]
+    Auto,
+    Linear,
+    /// Compressed (UBWC); the driver then asks gralloc for compressed buffers too.
+    Ubwc,
+}
+
+impl SwapchainLayout {
+    pub fn env_value(self) -> &'static str {
+        match self {
+            SwapchainLayout::Auto => "auto",
+            SwapchainLayout::Linear => "linear",
+            SwapchainLayout::Ubwc => "ubwc",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct VmConfig {
@@ -21,14 +45,20 @@ pub struct VmConfig {
     /// Draw the guest's screen in the app's window. Off, the GPU device still runs and draws
     /// nowhere (`REIMS_VGPU_WINDOW=0`), as a setup boot with its display off does.
     pub display: bool,
-    /// Let the GPU driver keep images compressed (UBWC). Off, Turnip runs with `TU_DEBUG=noubwc`.
-    /// Off by default: with it on, the Adreno 840 showed a compressed image's bytes as its
-    /// picture (0.5.6's scrambled screen).
+    /// Let the GPU driver keep its own images compressed (UBWC). Off, Turnip runs with
+    /// `TU_DEBUG=noubwc`. The scrambled screen of 0.5.6 and 0.5.7 was the swapchain's layout
+    /// (`swapchain_layout`), with this on and off; it stays off by default until a phone has
+    /// shown a right picture with it on.
     pub gpu_compression: bool,
     /// Diagnostics for a wrong picture: the driver prints each image's layout
     /// (`TU_DEBUG=layout`), and the surface behind the frame on screen is saved every few
     /// seconds (`REIMS_VGPU_FRAME_DUMP`), for the log screen's Share.
     pub gpu_diagnostics: bool,
+    pub swapchain_layout: SwapchainLayout,
+    /// Draw the screen on the CPU: the GPU device copies the guest's surface into the window's
+    /// buffers (`REIMS_VGPU_SOFTWARE_DISPLAY=1`, `ANativeWindow_lock`) and makes no swapchain.
+    /// Slower, and right whatever the GPU driver does with a swapchain.
+    pub software_display: bool,
 }
 
 impl Default for VmConfig {
@@ -57,6 +87,8 @@ impl VmConfig {
             display: true,
             gpu_compression: false,
             gpu_diagnostics: true,
+            swapchain_layout: SwapchainLayout::Auto,
+            software_display: false,
         }
     }
 
@@ -134,6 +166,8 @@ mod tests {
             display: true,
             gpu_compression: false,
             gpu_diagnostics: true,
+            swapchain_layout: SwapchainLayout::Auto,
+            software_display: false,
         };
         assert!(c.validate(8, 11000).is_err());
         assert_eq!(VmConfig { vcpus: 6, ..c }.ram_arg(), "4G");
@@ -165,5 +199,28 @@ mod tests {
         let compressed = VmConfig { gpu_compression: true, ..old };
         assert_eq!(compressed.tu_debug().as_deref(), Some("layout"));
         assert!(serde_json::to_string(&old).unwrap().contains(r#""gpuCompression":false"#));
+    }
+
+    /// Settings saved before the swapchain's layout had a setting leave it to the driver.
+    #[test]
+    fn swapchain_layout_defaults_to_auto_and_names_the_drivers_values() {
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"gpuCompression":false}"#).unwrap();
+        assert_eq!(old.swapchain_layout, SwapchainLayout::Auto);
+        assert!(!old.software_display);
+        let cpu: VmConfig = serde_json::from_str(r#"{"softwareDisplay":true}"#).unwrap();
+        assert!(cpu.software_display);
+        assert!(serde_json::to_string(&old).unwrap().contains(r#""swapchainLayout":"auto""#));
+        for (json, layout, env) in [
+            ("auto", SwapchainLayout::Auto, "auto"),
+            ("linear", SwapchainLayout::Linear, "linear"),
+            ("ubwc", SwapchainLayout::Ubwc, "ubwc"),
+        ] {
+            let set: VmConfig =
+                serde_json::from_str(&format!(r#"{{"swapchainLayout":"{json}"}}"#)).unwrap();
+            assert_eq!(set.swapchain_layout, layout);
+            assert_eq!(layout.env_value(), env);
+        }
+        // An unknown value is a file this build cannot read, and falls to the defaults.
+        assert!(serde_json::from_str::<VmConfig>(r#"{"swapchainLayout":"tiled"}"#).is_err());
     }
 }

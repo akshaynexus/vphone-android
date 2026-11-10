@@ -28,6 +28,65 @@ stock device through libadrenotools via the system Vulkan loader's HAL hook (`HM
 | `0004-tu-Expose-storageInputOutput16` | This repository | 16-bit stage IO, see below. |
 | `0005-tu-Implement-VK_EXT_fragment_shader_interlock` | This repository | Pixel and sample interlock, see below. |
 | `0006-tu-Expose-8-bit-and-16-bit-UBO-and-push-constant-acc` | This repository | 8-bit and 16-bit UBO and push constant reads, widened to dword reads. |
+| `0007-u_gralloc-fallback-detect-UBWC-on-SnapAlloc-buffer-ha` | Mesa MR !44464 by its author (Hugo223), open, unchanged: the MR's `.patch` of 2026-09-23 | Reads the UBWC flag from SnapAlloc's buffer handle (Snapdragon 8 Elite generation: no `'gmsm'` magic, the flags one int later), trusted only where the handle has SnapAlloc's shape and its aligned width is the buffer's stride. See below. |
+| `0008-u_gralloc-Add-an-IMapper-5-backend-that-needs-no-lib` | WinNative-Emu/Drivers `patches/aimapper/u_gralloc_aimapper.c` and `patches/add_aimapper_gralloc.py` at `7bfb3c433c` (by Leb-Sun, MIT; Droid-Deck's DD-Turnip and Banners-Turnip carry the same file); one change here | A gralloc backend over the vendor's IMapper 5 that needs only `dlopen`, so it exists under `-Dandroid-stub=true`. See below. |
+| `0009-vulkan-android-Lay-a-swapchain-s-images-out-as-grall` | This repository; the usage bit's placement from WinNative-Emu/Drivers `patches/add_ubwc_swapchain_usage.py` | A swapchain image gralloc says nothing of is LINEAR, `TU_ANDROID_SWAPCHAIN_LAYOUT`, and the line that says what was chosen. See below. |
+
+## The swapchain's layout on Android
+
+The swapchain's buffers are gralloc's: Android's Vulkan loader allocates them and hands each to the
+driver as a `VkNativeBufferANDROID`, and the compositor reads them as gralloc allocated them. The
+driver has to lay its image out the same way, which it learns from `u_gralloc`
+(`vk_android_get_anb_layout`).
+
+At the pin, a driver built with `-Dandroid-stub=true` has only the fallback backend, which sets a
+modifier only for a handle that starts with the `'gmsm'` magic of Qualcomm's older gralloc
+(`u_gralloc_fallback.c`). SnapAlloc's handle (SM8750, SM8850) has none, the modifier stays
+`DRM_FORMAT_MOD_INVALID`, and `tu_image.cc` then lays the image out tiled, with UBWC where it is
+allowed: a picture smeared across every 16 rows on an Adreno 840 (0.5.6, 0.5.7). Mesa `main` has no
+fix as of the pin; MR !29785 ("u_gralloc/fallback: Set fd from handle directly", merged 2024-06) is in
+the pin and is where the `'gmsm'` check comes from.
+
+What is read, in order:
+
+1. **The mapper's metadata** (`0008`). `u_gralloc_aimapper.c` loads the vendor's mapper with
+   libvndksupport's `android_load_sphal_library` and `AIMapper_loadIMapper`, and asks it for the
+   buffer's planes, modifier and `StandardMetadataType::COMPRESSION`. A buffer is UBWC where
+   COMPRESSION says so, or where its planes are those Qualcomm's mapper gives a UBWC buffer (two, the
+   metadata plane at offset 0), which it reports with a LINEAR modifier. The backend is not made where
+   libvndksupport or a `mapper.*.so` with `AIMapper_loadIMapper` cannot be loaded.
+   The change here: a buffer the mapper does not describe is read from its handle (2), where the
+   original failed the image.
+2. **The handle** (`0007`), where there is no mapper or it does not answer: the `'gmsm'` layout, then
+   SnapAlloc's (34 ints per view, or 33), whose flags word is trusted only where the view is the
+   primary one and its aligned width is the stride the loader gave.
+3. **LINEAR** (`0009`), where neither says: what Qualcomm's gralloc allocates without its vendor usage
+   bit, which Mesa never sets by itself.
+
+The community drivers' other fix, reading `data[numFds + 1]` as the flags of any handle (whitebelyash's
+"always use ubwc detection path", Banners-Turnip's `a8xx_gen8.patch`, WinNative's
+`fix_gralloc_flushall.py`, Droid-Deck's `gralloc_ubwc_detect.py`, Mesa MR !41330), is not used: on
+SnapAlloc that word is the view, so it answers LINEAR for every buffer, a compressed one too.
+
+`TU_ANDROID_SWAPCHAIN_LAYOUT` (`0009`; the app's *Screen buffer layout*): `auto` is the above; `linear`
+is LINEAR whatever gralloc says; `ubwc` asks gralloc for compressed buffers with the vendor usage bit
+`0x10000000` and lays the image out as gralloc then says, compressed where it says nothing. The bit is
+added where the loader asks what to allocate with: `VkAndroidHardwareBufferUsageANDROID` on
+`vkGetPhysicalDeviceImageFormatProperties2`, which WinNative's patch reports is what Android 16's loader
+uses, and `vkGetSwapchainGrallocUsage*ANDROID`. The community drivers set the bit always; here it is
+behind the setting, and the default swapchain is linear, because no compressed swapchain has been
+shown on a phone with this driver and its patches.
+
+A single plane's row pitch is the loader's stride times the format's bytes per pixel whatever the
+backend read, as it was before these patches: a pitch Turnip has no layout for would fail the swapchain.
+
+The driver prints its choice once per swapchain, to stderr and to logcat: the image, gralloc's format
+and stride, the handle's first ints, what gralloc said and through which backend, the setting, and the
+layout and row pitch taken.
+
+`android/scripts/test-turnip-gralloc.sh` runs `android/mesa/tests/gralloc_test.c` on the build
+machine: the patched `u_gralloc` sources against handles of each kind and a mapper made in the test.
+Nothing of 0007 to 0009 has run on a phone.
 
 ## `VK_EXT_external_memory_host` on KGSL
 

@@ -1279,10 +1279,10 @@ index 143839466fd881fc98f20ff35425b8f3c4380110..ae02a1fe5b7a81f3ff619f14649d60dd
  pub use linux::FrameSink;
 diff --git a/crates/reims-vgpu-window/src/native/android.rs b/crates/reims-vgpu-window/src/native/android.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e72b74b01afe4fa4499267e9a5924c6889a9518
+index 0000000000000000000000000000000000000000..cecb9d5f11b7185409857349d4fe90f07659f024
 --- /dev/null
 +++ b/crates/reims-vgpu-window/src/native/android.rs
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,369 @@
 +//! The window on Android: the app's `ANativeWindow`, drawn through Vulkan by the render thread
 +//! Linux's window uses (`crate::native::vulkan_render`). There is no window system to open here:
 +//! the app owns the only Surface and hands it over with [`set_window`], from its
@@ -1438,6 +1438,11 @@ index 0000000000000000000000000000000000000000..1e72b74b01afe4fa4499267e9a5924c6
 +            );
 +            None
 +        }
++    }
++
++    /// The app's `ANativeWindow`.
++    fn native_window(&self) -> Option<NonNull<c_void>> {
++        self.0.as_ref().map(|window| window.0)
 +    }
 +}
 +
@@ -2574,10 +2579,24 @@ index 0000000000000000000000000000000000000000..fd9b4c31ef28b477bfc75e0c5855bf48
 +    }
 +}
 diff --git a/crates/reims-vgpu-window/src/present.rs b/crates/reims-vgpu-window/src/present.rs
-index c037e6e147964be9694d76740a686ea7ad29841e..3ffd6b27a027c4111d0da453d9dff36131c7af83 100644
+index c037e6e147964be9694d76740a686ea7ad29841e..51b576c963c2309dcf000044335f138f06f4742d 100644
 --- a/crates/reims-vgpu-window/src/present.rs
 +++ b/crates/reims-vgpu-window/src/present.rs
-@@ -117,8 +117,8 @@ impl Presenting {
+@@ -85,6 +85,13 @@ pub trait VulkanTarget {
+         get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+         instance: vk::Instance,
+     ) -> Option<vk::SurfaceKHR>;
++
++    /// The window as the system's own handle, where a presenter can draw it with no Vulkan
++    /// surface: on Android the app's `ANativeWindow`, live while the target is. `None`
++    /// elsewhere.
++    fn native_window(&self) -> Option<std::ptr::NonNull<std::ffi::c_void>> {
++        None
++    }
+ }
+ 
+ /// A render thread's presenter, made of the sink at the first draw and made again after one ends,
+@@ -117,8 +124,8 @@ impl Presenting {
      /// `region`, with `cursor` over it: whether to draw again after [`RETRY`] (no image came in
      /// time). Nothing without a presenter.
      #[cfg_attr(
@@ -2744,10 +2763,10 @@ index 6aad5cbbbf70aa42d963f766f185a5b26d4c8c4e..67fc84109506c34a6af3e3eecd1b2828
              dead_code,
              reason = "Linux's sink draws each frame with its decoration"
 diff --git a/crates/reims-vgpu/src/window/vulkan.rs b/crates/reims-vgpu/src/window/vulkan.rs
-index c16496afb52c39cc2f782f76a656a955a951286a..0d3d960e351d970d3de6ac9a29fe3c6ca71b4a53 100644
+index c16496afb52c39cc2f782f76a656a955a951286a..ecdbb875c5832d60cbf4d22f7b949ced6d0bcdb5 100644
 --- a/crates/reims-vgpu/src/window/vulkan.rs
 +++ b/crates/reims-vgpu/src/window/vulkan.rs
-@@ -2,7 +2,8 @@
+@@ -2,10 +2,15 @@
  //! the window's swapchain, on either OS (`swapchain.rs`), and each OS's window asks the sink for
  //! it its own way (`linux.rs`, `macos.rs`).
  
@@ -2757,6 +2776,13 @@ index c16496afb52c39cc2f782f76a656a955a951286a..0d3d960e351d970d3de6ac9a29fe3c6c
  mod linux;
  #[cfg(target_os = "macos")]
  mod macos;
++#[cfg(target_os = "android")]
++mod software;
++#[cfg(any(target_os = "android", test))]
++mod software_rows;
+ mod swapchain;
+ 
+ pub(crate) use swapchain::sink;
 diff --git a/crates/reims-vgpu/src/window/vulkan/dump.rs b/crates/reims-vgpu/src/window/vulkan/dump.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..c61eaffe6ff9da103f7fe61fdd38812e43b35ed7
@@ -3106,8 +3132,347 @@ index 0000000000000000000000000000000000000000..c61eaffe6ff9da103f7fe61fdd38812e
 +        std::fs::remove_dir_all(&dir).unwrap();
 +    }
 +}
+diff --git a/crates/reims-vgpu/src/window/vulkan/software.rs b/crates/reims-vgpu/src/window/vulkan/software.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..03322572169e94184737ae5522b97e4783203efc
+--- /dev/null
++++ b/crates/reims-vgpu/src/window/vulkan/software.rs
+@@ -0,0 +1,211 @@
++//! The software display, Android's reference path for a window whose picture is wrong: with
++//! `REIMS_VGPU_SOFTWARE_DISPLAY=1` the window's presenter makes no Vulkan surface and no
++//! swapchain. For each frame it reads the bytes of the surface behind the display's current
++//! frame, as the CPU reads them in the guest's pages (what a frame dump reads, `dump`), and
++//! copies them into the window's next buffer, which it takes with `ANativeWindow_lock` and
++//! posts with `ANativeWindow_unlockAndPost`, row by row at the stride the buffer says.
++//!
++//! No GPU driver and no image layout is between the guest's surface and the buffer the
++//! compositor reads, so the picture is the guest's whatever the driver does with a swapchain.
++//! It costs a conversion and a copy of the whole frame on the CPU per frame, and it draws the
++//! guest's surface only: no cursor and no decoration, which an Android window has none of.
++//!
++//! The buffers are asked for at the surface's size, as RGBA_8888, and the system scales them
++//! to the app's Surface.
++
++use std::ffi::c_void;
++use std::ptr::NonNull;
++use std::sync::Arc;
++
++use reims_vgpu_core::platform::os::surface::Surface as _;
++use reims_vgpu_core::platform::resource::Texture as _;
++use reims_vgpu_vulkan::VulkanPlatform;
++use reims_vgpu_vulkan::os::lend_surface_bytes_for_reading;
++use reims_vgpu_window::{Drawn, DrawnCursor, PixelRect, Presenter, VulkanTarget};
++
++use super::dump::{Shape, rgba};
++use super::software_rows::{Buffer, FORMAT_RGBA_8888, copy_rows};
++use crate::entry;
++use crate::window::SinkDisplay;
++
++/// The switch.
++const SOFTWARE_VAR: &str = "REIMS_VGPU_SOFTWARE_DISPLAY";
++
++unsafe extern "C" {
++    fn ANativeWindow_acquire(window: *mut c_void);
++    fn ANativeWindow_release(window: *mut c_void);
++    fn ANativeWindow_setBuffersGeometry(
++        window: *mut c_void,
++        width: i32,
++        height: i32,
++        format: i32,
++    ) -> i32;
++    fn ANativeWindow_lock(window: *mut c_void, buffer: *mut Buffer, dirty: *mut c_void) -> i32;
++    fn ANativeWindow_unlockAndPost(window: *mut c_void) -> i32;
++}
++
++/// A reference of the presenter's own to the app's window.
++struct Window(NonNull<c_void>);
++
++// SAFETY: an `ANativeWindow`'s reference count and its buffer queue are safe on any thread, and
++// only the presenter's thread locks and posts through this reference.
++unsafe impl Send for Window {}
++
++impl Drop for Window {
++    fn drop(&mut self) {
++        // SAFETY: the reference `presenter` took.
++        unsafe { ANativeWindow_release(self.0.as_ptr()) };
++    }
++}
++
++/// The software presenter over `target`'s window, where the switch is on and the target has
++/// one; `None` otherwise, and the window presents through a swapchain.
++pub(super) fn presenter(
++    display: &Arc<SinkDisplay<VulkanPlatform>>,
++    target: &dyn VulkanTarget,
++) -> Option<Box<dyn Presenter>> {
++    if std::env::var_os(SOFTWARE_VAR).is_none_or(|v| v != "1") {
++        return None;
++    }
++    let window = target.native_window()?;
++    // SAFETY: the target's window is live while the target is, which this call is within.
++    unsafe { ANativeWindow_acquire(window.as_ptr()) };
++    eprintln!(
++        "reims-vgpu: software display: the window is drawn by the CPU from the guest's surface, \
++         through ANativeWindow_lock; no swapchain is made"
++    );
++    Some(Box::new(SoftwarePresenter {
++        display: Arc::clone(display),
++        window: Window(window),
++        geometry: None,
++        said: None,
++    }))
++}
++
++/// A window's presenter that copies the guest's surface into the window's buffers.
++struct SoftwarePresenter {
++    /// The display.
++    display: Arc<SinkDisplay<VulkanPlatform>>,
++    /// The app's window.
++    window: Window,
++    /// The size the window's buffers were last asked for at.
++    geometry: Option<(i32, i32)>,
++    /// What last kept a frame from being posted, said once on stderr until it changes.
++    said: Option<String>,
++}
++
++impl SoftwarePresenter {
++    /// The current frame's pixels as tight `R G B A` rows, and their width and height.
++    fn pixels(&self) -> Result<Option<(i32, i32, Vec<u8>)>, String> {
++        let Some(frame) = self.display.current_frame() else {
++            // Before the guest's first frame.
++            return Ok(None);
++        };
++        let Some(surface) = frame.iosurface() else {
++            return Err("the frame is over no surface the CPU reads".to_owned());
++        };
++        let shape = Shape {
++            width: surface.width(),
++            height: surface.height(),
++            bytes_per_element: surface.bytes_per_element(),
++            bytes_per_row: surface.bytes_per_row(),
++        };
++        let mut pixels = None;
++        lend_surface_bytes_for_reading(&surface, &mut |bytes| {
++            pixels = rgba(bytes, shape);
++        })
++        .map_err(str::to_owned)?;
++        let pixels = pixels.ok_or_else(|| {
++            format!(
++                "a surface of {} bytes per element and rows of {} bytes is not one it reads",
++                shape.bytes_per_element, shape.bytes_per_row
++            )
++        })?;
++        match (i32::try_from(shape.width), i32::try_from(shape.height)) {
++            (Ok(width), Ok(height)) => Ok(Some((width, height, pixels))),
++            _ => Err("a surface too large for a window's buffer".to_owned()),
++        }
++    }
++
++    /// Copies `pixels`, `width` by `height` tight `R G B A` rows, into the window's next buffer
++    /// and posts it.
++    fn post(&mut self, width: i32, height: i32, pixels: &[u8]) -> Result<(), String> {
++        let window = self.window.0.as_ptr();
++        if self.geometry != Some((width, height)) {
++            // SAFETY: a live window, of which the presenter holds a reference.
++            let set = unsafe {
++                ANativeWindow_setBuffersGeometry(window, width, height, FORMAT_RGBA_8888)
++            };
++            if set != 0 {
++                return Err(format!("ANativeWindow_setBuffersGeometry: {set}"));
++            }
++            self.geometry = Some((width, height));
++        }
++        let mut buffer = Buffer {
++            width: 0,
++            height: 0,
++            stride: 0,
++            format: 0,
++            bits: std::ptr::null_mut(),
++            reserved: [0; 6],
++        };
++        // SAFETY: a live window, and a buffer description for it to fill; no dirty rectangle.
++        let locked = unsafe { ANativeWindow_lock(window, &raw mut buffer, std::ptr::null_mut()) };
++        if locked != 0 {
++            return Err(format!(
++                "ANativeWindow_lock: {locked} (a window a swapchain was made over stays the \
++                 swapchain's until its Surface is made again)"
++            ));
++        }
++        let copied = copy_rows(&buffer, width, height, pixels);
++        // SAFETY: the buffer locked above; nothing reads `bits` after this.
++        let posted = unsafe { ANativeWindow_unlockAndPost(window) };
++        copied?;
++        if posted != 0 {
++            return Err(format!("ANativeWindow_unlockAndPost: {posted}"));
++        }
++        Ok(())
++    }
++
++    /// Says `why` on stderr where it is not what was last said.
++    fn say(&mut self, why: Option<String>) {
++        if self.said != why {
++            match &why {
++                Some(why) => eprintln!("reims-vgpu: software display: no frame posted: {why}"),
++                None => eprintln!("reims-vgpu: software display: frames are posted"),
++            }
++            self.said = why;
++        }
++    }
++}
++
++impl Presenter for SoftwarePresenter {
++    /// The display's current frame, copied into the window's next buffer and posted (the
++    /// module doc). The drawable, the region and the cursor are not used: the buffer is the
++    /// guest's surface, which the system scales to the window.
++    fn draw(
++        &mut self,
++        _drawable: (u64, u64),
++        _region: PixelRect,
++        _cursor: Option<&DrawnCursor>,
++    ) -> Drawn {
++        let pixels = entry::run(|_| self.pixels());
++        match pixels {
++            Ok(None) => Drawn::Nothing,
++            Ok(Some((width, height, pixels))) => match self.post(width, height, &pixels) {
++                Ok(()) => {
++                    self.say(None);
++                    Drawn::Presented
++                }
++                Err(why) => {
++                    self.say(Some(why));
++                    Drawn::Nothing
++                }
++            },
++            Err(why) => {
++                self.say(Some(why));
++                Drawn::Nothing
++            }
++        }
++    }
++}
+diff --git a/crates/reims-vgpu/src/window/vulkan/software_rows.rs b/crates/reims-vgpu/src/window/vulkan/software_rows.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..18b91a39bd52f672c33efea3d3ad9a71cce11159
+--- /dev/null
++++ b/crates/reims-vgpu/src/window/vulkan/software_rows.rs
+@@ -0,0 +1,116 @@
++//! The copy of the software display (`software`): a frame's rows into a window's locked buffer,
++//! at the buffer's stride. Apart from the presenter so the build machine tests it.
++
++use std::ffi::c_void;
++
++/// `WINDOW_FORMAT_RGBA_8888`.
++pub(super) const FORMAT_RGBA_8888: i32 = 1;
++/// `WINDOW_FORMAT_RGBX_8888`: the same bytes, the fourth unused.
++pub(super) const FORMAT_RGBX_8888: i32 = 2;
++
++/// `ANativeWindow_Buffer`.
++#[repr(C)]
++pub(super) struct Buffer {
++    /// Pixels per row that are shown.
++    pub(super) width: i32,
++    /// Rows.
++    pub(super) height: i32,
++    /// Pixels per row in memory.
++    pub(super) stride: i32,
++    /// A `WINDOW_FORMAT_*`.
++    pub(super) format: i32,
++    /// The pixels.
++    pub(super) bits: *mut c_void,
++    /// Unused.
++    pub(super) reserved: [u32; 6],
++}
++
++/// Copies `pixels`, `width` by `height` tight rows of four bytes a pixel, into the locked
++/// `buffer`, each row at the buffer's stride, as many pixels and rows as both have.
++pub(super) fn copy_rows(buffer: &Buffer, width: i32, height: i32, pixels: &[u8]) -> Result<(), String> {
++    if !(buffer.format == FORMAT_RGBA_8888 || buffer.format == FORMAT_RGBX_8888) {
++        return Err(format!(
++            "the window's buffer has format {}, not RGBA_8888",
++            buffer.format
++        ));
++    }
++    let size = |v: i32| usize::try_from(v).ok().filter(|&v| v > 0);
++    let (Some(src_width), Some(src_height), Some(dst_width), Some(dst_height), Some(stride)) = (
++        size(width),
++        size(height),
++        size(buffer.width),
++        size(buffer.height),
++        size(buffer.stride),
++    ) else {
++        return Err(format!(
++            "a buffer of {}x{} with a stride of {} pixels for a frame of {width}x{height}",
++            buffer.width, buffer.height, buffer.stride
++        ));
++    };
++    if buffer.bits.is_null() || stride < dst_width || pixels.len() < src_width * src_height * 4 {
++        return Err("a buffer or a frame smaller than its size says".to_owned());
++    }
++    let row_bytes = src_width.min(dst_width) * 4;
++    let rows = src_height.min(dst_height);
++    for (y, row) in pixels.chunks_exact(src_width * 4).take(rows).enumerate() {
++        // SAFETY: the locked buffer holds `height` rows of `stride` pixels of four bytes; row
++        // `y` is below `height` and `row_bytes` is at most `width * 4`, which `stride * 4`
++        // covers; the source row holds `row_bytes` and the two do not overlap.
++        unsafe {
++            let dst = buffer.bits.cast::<u8>().add(y * stride * 4);
++            std::ptr::copy_nonoverlapping(row.as_ptr(), dst, row_bytes);
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Rows land at the buffer's stride, and no byte past a row's pixels is written.
++    #[test]
++    fn rows_are_copied_at_the_buffers_stride() {
++        // A 3x2 frame into a 3x2 buffer whose rows are 5 pixels apart.
++        let pixels: Vec<u8> = (1..=24).collect();
++        let mut memory = vec![0u8; 5 * 4 * 2];
++        let buffer = Buffer {
++            width: 3,
++            height: 2,
++            stride: 5,
++            format: FORMAT_RGBA_8888,
++            bits: memory.as_mut_ptr().cast(),
++            reserved: [0; 6],
++        };
++        assert_eq!(copy_rows(&buffer, 3, 2, &pixels), Ok(()));
++        assert_eq!(memory[..12], pixels[..12]);
++        assert!(memory[12..20].iter().all(|&b| b == 0));
++        assert_eq!(memory[20..32], pixels[12..]);
++        assert!(memory[32..].iter().all(|&b| b == 0));
++    }
++
++    /// A buffer smaller than the frame takes the frame's top left, and one of another format
++    /// or with no memory takes nothing.
++    #[test]
++    fn a_buffer_of_another_size_or_format() {
++        let pixels: Vec<u8> = (1..=24).collect();
++        let mut memory = vec![0u8; 2 * 4];
++        let mut buffer = Buffer {
++            width: 2,
++            height: 1,
++            stride: 2,
++            format: FORMAT_RGBX_8888,
++            bits: memory.as_mut_ptr().cast(),
++            reserved: [0; 6],
++        };
++        assert_eq!(copy_rows(&buffer, 3, 2, &pixels), Ok(()));
++        assert_eq!(memory, pixels[..8]);
++        buffer.format = 4; // RGB_565
++        assert!(copy_rows(&buffer, 3, 2, &pixels).is_err());
++        buffer.format = FORMAT_RGBA_8888;
++        buffer.bits = std::ptr::null_mut();
++        assert!(copy_rows(&buffer, 3, 2, &pixels).is_err());
++        buffer.bits = memory.as_mut_ptr().cast();
++        assert!(copy_rows(&buffer, 3, 2, &pixels[..20]).is_err());
++    }
++}
 diff --git a/crates/reims-vgpu/src/window/vulkan/swapchain.rs b/crates/reims-vgpu/src/window/vulkan/swapchain.rs
-index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..e62113e89169a3d95e499dae44f5632b6a3a6171 100644
+index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..b682010c407f81526b666a74c8ec457cbac85d17 100644
 --- a/crates/reims-vgpu/src/window/vulkan/swapchain.rs
 +++ b/crates/reims-vgpu/src/window/vulkan/swapchain.rs
 @@ -29,6 +29,9 @@
@@ -3128,7 +3493,19 @@ index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..e62113e89169a3d95e499dae44f5632b
  use crate::entry;
  use crate::stats::DisplayStats;
  use crate::window::{SinkDisplay, WindowFrame};
-@@ -136,6 +140,7 @@ impl SwapchainSink {
+@@ -114,6 +118,11 @@ impl SwapchainSink {
+     /// surface offers it, else FIFO, and whether its presents signal fences
+     /// (`reims_vgpu_vulkan::swapchain`).
+     pub(crate) fn make_presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
++        // Android's software display draws the window with no swapchain (`software`).
++        #[cfg(target_os = "android")]
++        if let Some(presenter) = super::software::presenter(&self.display, target) {
++            return Some(presenter);
++        }
+         // SAFETY: the target makes the surface on the instance it is given, and hands it over.
+         let made = entry::run(|_| unsafe {
+             Swapchain::over(&self.queue, |get_instance_proc_addr, instance| {
+@@ -136,6 +145,7 @@ impl SwapchainSink {
                  Some(Box::new(SwapchainPresenter {
                      display: Arc::clone(&self.display),
                      swapchain,
@@ -3136,7 +3513,7 @@ index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..e62113e89169a3d95e499dae44f5632b
                  }))
              }
              Err(refused) => {
-@@ -155,6 +160,8 @@ struct SwapchainPresenter {
+@@ -155,6 +165,8 @@ struct SwapchainPresenter {
      display: Arc<SinkDisplay<VulkanPlatform>>,
      /// The swapchain.
      swapchain: Swapchain,
@@ -3145,7 +3522,7 @@ index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..e62113e89169a3d95e499dae44f5632b
  }
  
  impl Presenter for SwapchainPresenter {
-@@ -209,6 +216,7 @@ impl Presenter for SwapchainPresenter {
+@@ -209,6 +221,7 @@ impl Presenter for SwapchainPresenter {
                  return Drawn::Nothing;
              };
              self.swapchain.present(frame, command_buffer);

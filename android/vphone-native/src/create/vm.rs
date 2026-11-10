@@ -875,6 +875,8 @@ mod tests {
             display: true,
             gpu_compression: false,
             gpu_diagnostics: true,
+            swapchain_layout: crate::config::SwapchainLayout::Auto,
+            software_display: false,
         }
     }
 

@@ -450,7 +450,10 @@ fn start(name: &str) -> Result<(), String> {
         }
     }
     for (key, value) in env {
-        if key == "TU_DEBUG" || key == "REIMS_VGPU_FRAME_DUMP" {
+        if matches!(key, "TU_DEBUG"
+                | "TU_ANDROID_SWAPCHAIN_LAYOUT"
+                | "REIMS_VGPU_SOFTWARE_DISPLAY"
+                | "REIMS_VGPU_FRAME_DUMP") {
             log_line(&format!("GPU setting: {key}={value}"));
         }
         std::env::set_var(key, value);
