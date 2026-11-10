@@ -1,8 +1,8 @@
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
-index c1e3ad05b3821f42d9f697a49f96651d9fa7613f..35ed310d381294b91fb2a902c97880e495e5bb8d 100644
+index 79601465e23330d30cc68aa9bad7fc0282b0345a..9455d94f6388df93a7852a3c76931f5728ceccf9 100644
 --- a/accel/tcg/cpu-exec.c
 +++ b/accel/tcg/cpu-exec.c
-@@ -258,7 +258,7 @@ static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
+@@ -260,7 +260,7 @@ static inline TranslationBlock *tb_lookup_ptr(CPUState *cpu,
          return NULL;
      }
  
@@ -11,7 +11,7 @@ index c1e3ad05b3821f42d9f697a49f96651d9fa7613f..35ed310d381294b91fb2a902c97880e4
  
  hit:
      /*
-@@ -1024,7 +1024,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+@@ -1283,7 +1283,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                   */
                  h = tb_jmp_cache_hash_func(s.pc);
                  jc = cpu->tb_jmp_cache;
@@ -21,12 +21,12 @@ index c1e3ad05b3821f42d9f697a49f96651d9fa7613f..35ed310d381294b91fb2a902c97880e4
  
              /*
 diff --git a/accel/tcg/tb-jmp-cache.h b/accel/tcg/tb-jmp-cache.h
-index 41e788eabca248248e39dab4dc39a6cd192a500c..1f2b5a9593c4c106b6783e567ef0006830749972 100644
+index 8e72693a0d2a0bc2535847e7e873ba8b0eef6a1c..3898287d48447f91fe9b81701b465ee12f7b7987 100644
 --- a/accel/tcg/tb-jmp-cache.h
 +++ b/accel/tcg/tb-jmp-cache.h
-@@ -90,10 +90,20 @@ typedef struct CPUJumpCache {
-     } array[TB_JMP_CACHE_SIZE];
- } CPUJumpCache;
+@@ -139,10 +139,20 @@ static inline void tb_jmp_cache_ras_stale(CPUJumpCache *jc)
+     qatomic_set(&jc->ras_stamp, jc->ras_stamp + 1);
+ }
  
 -/* Fill entry @h of @jc with @tb for @pc, in generation @gen. */
 -static inline void tb_jmp_cache_fill(CPUJumpCache *jc, uint32_t h, vaddr pc,
@@ -47,7 +47,7 @@ index 41e788eabca248248e39dab4dc39a6cd192a500c..1f2b5a9593c4c106b6783e567ef00068
      jc->array[h].pc = pc;
      jc->array[h].cs_base = tb->cs_base;
      jc->array[h].tc_ptr = tb->tc.ptr;
-@@ -102,6 +112,11 @@ static inline void tb_jmp_cache_fill(CPUJumpCache *jc, uint32_t h, vaddr pc,
+@@ -151,6 +161,11 @@ static inline void tb_jmp_cache_fill(CPUJumpCache *jc, uint32_t h, vaddr pc,
      jc->array[h].gen = jc->gen;
      jc->array[h].bgen = jc->bgen[h >> TB_JMP_BUCKET_SHIFT];
      qatomic_set(&jc->array[h].tb, tb);
@@ -60,34 +60,62 @@ index 41e788eabca248248e39dab4dc39a6cd192a500c..1f2b5a9593c4c106b6783e567ef00068
  
  /* Whether entry @h of @jc is of the current generations (keys aside). */
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
-index 510c62e60dd0890c43c5578e6a28d4853a3e6b83..f1ab6fdd3b9d44834f9b7fd3be17ef57291155fe 100644
+index cf915fd3a30f7207bbab09e4de59bb67eeee55cf..100c22531320105e5c3d017cae77943284a5ed12 100644
 --- a/accel/tcg/tb-maint.c
 +++ b/accel/tcg/tb-maint.c
-@@ -800,9 +800,20 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
-     CPUState *cpu;
- 
-     if (tb_cflags(tb) & CF_PCREL) {
+@@ -806,24 +806,33 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
+             const char *e = getenv("VPHONE_JC_LAZY_INVAL");
+             lazy = !(e && *e == '0');
+         }
 -        /* A TB may be at any virtual address */
-+        /* A TB may be at any virtual address: the TB knows where it was put */
-         CPU_FOREACH(cpu) {
--            tcg_flush_jmp_cache(cpu);
+-        if (lazy) {
+-            /*
+-             * vphone-linux: each CPU starts a new epoch at its next lookup
+-             * (tb-jmp-cache.h 'inval'): emptying 2^17 entries on every CPU
+-             * for each invalidation was 8% of QEMU during app switches.
+-             * CF_INVALID is set before this barrier.
+-             */
+-            smp_wmb();
+-            CPU_FOREACH(cpu) {
+-                CPUJumpCache *jc = cpu->tb_jmp_cache;
+-
+-                if (jc) {
+-                    qatomic_inc(&jc->inval);
+-                }
++        /*
++         * A TB may be at any virtual address, but it knows where each vCPU's
++         * cache has it (jc_hash, tb_jmp_cache_fill()): that entry is cleared,
++         * and every other entry of every cache stays current. Only a vCPU
++         * that has the TB at more than one index (jc_many), or one past
++         * TB_JMP_CPUS, has no single entry to clear. It starts a new epoch
++         * at its next lookup instead (tb-jmp-cache.h 'inval'), as emptying
++         * 2^17 entries for each invalidation was 8% of QEMU during app
++         * switches. CF_INVALID is set before this barrier.
++         */
++        smp_wmb();
++        CPU_FOREACH(cpu) {
 +            CPUJumpCache *jc = cpu->tb_jmp_cache;
 +            int i = cpu->cpu_index;
 +
-+            if (i >= TB_JMP_CPUS || (qatomic_read(&tb->jc_many) & (1u << i))) {
-+                tcg_flush_jmp_cache(cpu);
-+            } else {
++            if (!jc) {
++                continue;
+             }
+-        } else {
+-            CPU_FOREACH(cpu) {
++            if (i < TB_JMP_CPUS && !(qatomic_read(&tb->jc_many) & (1u << i))) {
 +                uint32_t h = qatomic_read(&tb->jc_hash[i]);
 +
-+                if (h && jc && qatomic_read(&jc->array[h - 1].tb) == tb) {
++                if (h && qatomic_read(&jc->array[h - 1].tb) == tb) {
 +                    qatomic_set(&jc->array[h - 1].tb, NULL);
 +                }
-+            }
++            } else if (lazy) {
++                qatomic_inc(&jc->inval);
++            } else {
+                 tcg_flush_jmp_cache(cpu);
+             }
          }
-     } else {
-         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
-index 7ad58731eaef058870e608f9199e80d44bf6430c..f932c66921663eb6b2475e41914c5d51687573da 100644
+index 3b72dcf06ada12685de4621e41d6ecdfc89ba03e..27a29d85e18a99e15a20ed64be6d012a7e759187 100644
 --- a/accel/tcg/translate-all.c
 +++ b/accel/tcg/translate-all.c
 @@ -295,6 +295,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
@@ -1677,7 +1705,7 @@ index 9698e3e12e5d58fb7d9a9002c70faf19139f1321..ec8abb813e8c9302040d500c07da194f
  }
  
 diff --git a/include/exec/translation-block.h b/include/exec/translation-block.h
-index 8bfb9ac9dd986fd5e654e15ccab5a22888c2c47d..184bb093119c4b18bb5a3ecc22db4c99f324cc71 100644
+index b83db056bd2d4218036fa4e40821789b328de010..82074fb6f5dd92ede537ccf9b37cf04da9968c45 100644
 --- a/include/exec/translation-block.h
 +++ b/include/exec/translation-block.h
 @@ -27,6 +27,9 @@ struct tb_tc {
@@ -1690,17 +1718,17 @@ index 8bfb9ac9dd986fd5e654e15ccab5a22888c2c47d..184bb093119c4b18bb5a3ecc22db4c99
  struct TranslationBlock {
      /*
       * Guest PC corresponding to this block.  This must be the true
-@@ -132,6 +135,16 @@ struct TranslationBlock {
-      * translates to it (see gen_goto_tb_checked in translate-a64.c).
+@@ -154,6 +157,16 @@ struct TranslationBlock {
+      * Written by any CPU's helper_vphone_ibc_miss; checked at each use.
       */
-     uintptr_t vphone_jmp_host[2];
+     TranslationBlock *vphone_ibr_tb;
 +
 +    /*
 +     * vphone-linux: where each vCPU's jump cache holds this TB, as its index
 +     * + 1 (0: nowhere), so invalidating a CF_PCREL TB clears those entries
 +     * instead of every entry of every vCPU's cache. A bit of jc_many says
 +     * that vCPU has it at more than one index (the same code at several
-+     * addresses); that vCPU's cache is then emptied. See tb_jmp_cache_fill().
++     * addresses); that vCPU then starts a new epoch. See tb_jmp_cache_fill().
 +     */
 +    uint32_t jc_hash[TB_JMP_CPUS];
 +    uint32_t jc_many;
@@ -2582,7 +2610,7 @@ index 982f302b5cb1e7e872c54b11d1cca629dbb4679e..e3e94dc1ae374063a49c34f8ddb76635
  #define ARM_HOST_MXCSR_BASE  0x1f80
  #define ARM_HOST_MXCSR_FLAGS 0x3f
 diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
-index 209d0379272b84ef37339d353b82c8905747716b..90b826f93795d7fe7bab6630cc2be36066ab3ddf 100644
+index 028e6c22c807a9f086edbea047f4a373923ad95f..f40301589c515768fb0ecad234ff5bf4345a0282 100644
 --- a/target/arm/tcg/translate-a64.c
 +++ b/target/arm/tcg/translate-a64.c
 @@ -22,6 +22,7 @@
@@ -2593,7 +2621,7 @@ index 209d0379272b84ef37339d353b82c8905747716b..90b826f93795d7fe7bab6630cc2be360
  #include "qemu/log.h"
  #include "arm_ldst.h"
  #include "semihosting/semihost.h"
-@@ -5482,12 +5483,34 @@ typedef struct FPScalar {
+@@ -6015,12 +6016,34 @@ typedef struct FPScalar {
   * guard"). The helper path recomputes from the untouched inputs; the flags
   * the native attempt raised are a subset of what the helper raises.
   *
@@ -2628,7 +2656,7 @@ index 209d0379272b84ef37339d353b82c8905747716b..90b826f93795d7fe7bab6630cc2be360
  static bool fp_native_ok(DisasContext *s)
  {
      return arm_native_fp_enabled && !s->fpcr_ah && !s->fpcr_nep &&
-@@ -12385,6 +12408,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
+@@ -12919,6 +12942,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
  {
      DisasContext *dc = container_of(dcbase, DisasContext, base);
      CPUARMState *env = cpu_env(cpu);

@@ -43,10 +43,10 @@ index cb4629622e812410dfce07c34bafe57547c294cd..ea5e95bb71e1433d37ce632dc52306e2
          } else {
              Os::Other
 diff --git a/crates/reims-ctl/src/reims_util.rs b/crates/reims-ctl/src/reims_util.rs
-index b52be627fd938fec495fd34c14d0c9ef6e4967ed..6a3d23f1a929e005a08df9d3a7e34ef2b1562a63 100644
+index 49b639d75221af228701e473a1f57d6f09410766..27b81a95ebfc3c98b84002712c799bc7ad2887b5 100644
 --- a/crates/reims-ctl/src/reims_util.rs
 +++ b/crates/reims-ctl/src/reims_util.rs
-@@ -410,7 +410,7 @@ fn size(bytes: u64) -> String {
+@@ -457,7 +457,7 @@ fn size(bytes: u64) -> String {
  /// it, so with reims-ctl: a download stops where it is when the interface quits, and the next
  /// one continues it.
  fn end_with_parent(cmd: &mut Command) {
@@ -55,7 +55,7 @@ index b52be627fd938fec495fd34c14d0c9ef6e4967ed..6a3d23f1a929e005a08df9d3a7e34ef2
      {
          use std::os::unix::process::CommandExt;
          let parent = std::process::id() as libc::pid_t;
-@@ -428,7 +428,7 @@ fn end_with_parent(cmd: &mut Command) {
+@@ -475,7 +475,7 @@ fn end_with_parent(cmd: &mut Command) {
              });
          }
      }
@@ -65,7 +65,7 @@ index b52be627fd938fec495fd34c14d0c9ef6e4967ed..6a3d23f1a929e005a08df9d3a7e34ef2
  }
  
 diff --git a/crates/reims-ctl/src/runtime.rs b/crates/reims-ctl/src/runtime.rs
-index 25f0ed47639871ee5490c452f8a3fe041311287d..e9a8519684c93feb394b85dd64c5ff2fba8e04dc 100644
+index 7af10ee68ac41a8005c55115d6e0bbd12154d532..cbe17df7cc058befd8ebf69227d253adac8771ee 100644
 --- a/crates/reims-ctl/src/runtime.rs
 +++ b/crates/reims-ctl/src/runtime.rs
 @@ -45,7 +45,7 @@ fn alive(pid: i32) -> bool {
@@ -207,19 +207,19 @@ index 54693cc3d9c2bc0106f65941d43cebb8d84bc198..57ad48dd3237fce86239cceb67edb421
  #[cfg(target_os = "macos")]
  mod macos;
 diff --git a/crates/reims-vgpu-c/src/lib.rs b/crates/reims-vgpu-c/src/lib.rs
-index 4bf0da5acb4fd22d068929f4c04c7fe51d1bf94a..10396c6294e95eb65efd6d6e358658cff39aeed1 100644
+index 368a9d2be98961d36a94ba5a6d8f764902b811c5..7613fd665a572ddeaee5da267b732b61839523ef 100644
 --- a/crates/reims-vgpu-c/src/lib.rs
 +++ b/crates/reims-vgpu-c/src/lib.rs
-@@ -38,6 +38,8 @@ pub mod window;
- // The scaler device after the rest, so that the functions before it keep their places.
- pub mod scaler;
+@@ -41,6 +41,8 @@ pub mod scaler;
+ // The graphics device after the scaler, for the same reason.
+ pub mod graphics;
  
 +#[cfg(target_os = "android")]
 +mod android;
  mod ffi;
  mod handle;
  mod sized;
-@@ -55,13 +57,13 @@ pub use status::RvgStatus;
+@@ -58,13 +60,13 @@ pub use status::RvgStatus;
  /// [`device::rvg_bytes_free`]'s, goes back through that function, and the bytes the library gives
  /// Metal to free are `malloc`'s own.
  #[cfg(any(
@@ -236,10 +236,10 @@ index 4bf0da5acb4fd22d068929f4c04c7fe51d1bf94a..10396c6294e95eb65efd6d6e358658cf
  
  /// The platform every handle is made on.
 diff --git a/crates/reims-vgpu-c/tests/exports.rs b/crates/reims-vgpu-c/tests/exports.rs
-index 754a7780c6d5b02814ea118d3046a75582b36744..aac8d2e605ab1b132d14bc6c86ea2a9692b8edf6 100644
+index 20981a86d587a667a518e89aa82b1a29fcddf95e..54e5ead565759892578ca625de3734469962a996 100644
 --- a/crates/reims-vgpu-c/tests/exports.rs
 +++ b/crates/reims-vgpu-c/tests/exports.rs
-@@ -201,8 +201,13 @@ fn every_export_runs_its_body_inside_ffi_export() {
+@@ -200,8 +200,13 @@ fn every_export_runs_its_body_inside_ffi_export() {
          errors.extend(found.errors);
      }
      assert!(errors.is_empty(), "{}", errors.join("\n"));
@@ -293,10 +293,10 @@ index c31e3c96509799092f535ff7e17dc24610e011c2..65cba97deefaa13d191cf27fd6bf44ef
  serde_json.workspace = true
  
 diff --git a/crates/reims-vgpu-vulkan/src/answer.rs b/crates/reims-vgpu-vulkan/src/answer.rs
-index e57223f401d431d51e0a8fa6b319d7dc6391c3c2..1cd838df25137afdf9ec327d7c196910bbad756f 100644
+index ddc627d110d3b868a654f7871857ec14a483a096..45dd37acb82e9dc7f4788a2b06fcb18964e7caa7 100644
 --- a/crates/reims-vgpu-vulkan/src/answer.rs
 +++ b/crates/reims-vgpu-vulkan/src/answer.rs
-@@ -1593,7 +1593,7 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
+@@ -1747,7 +1747,7 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
  /// one: neither relayed, counted, kept nor dying. A kind the runtime announces once per device
  /// is announced at every occurrence where a probe may meet it ([`crate::platform`]'s
  /// `announced_each`), so that the probe's takes no later occurrence's line.
@@ -328,19 +328,19 @@ index caa55e58a5c39e22f520d8797bf2d5e253048bb0..36547a5cbf109007f595f0b8fe32ce5a
              chosen(Some("/census".to_owned())),
              linux.then(|| PathBuf::from("/census"))
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/device.rs b/crates/reims-vgpu-vulkan/src/gpu/device.rs
-index 8fa1022ecfe4066278088c7869d5402594b7c379..b2ce16a742158c3709da0c8749359d6ba1e1afdc 100644
+index efb4230a11c041cfaf56d9214b1d4d1386443aeb..e3d80193862792ead3ff3015bfdc9e7f3d60ac27 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/device.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/device.rs
-@@ -252,7 +252,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
+@@ -322,7 +322,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
      }
      metal_space::count_sampler_ids(&raw);
      crate::answer::native::device_made(raw.properties());
 -    #[cfg(target_os = "linux")]
 +    #[cfg(any(target_os = "linux", target_os = "android"))]
      crate::os::learn_view_imports(&raw);
-     let made = Obj::new(DeviceObject {
-         raw,
-@@ -2144,7 +2144,7 @@ pub(crate) mod tests {
+     #[cfg(not(test))]
+     if let Some(home) = std::env::var_os("HOME") {
+@@ -2791,7 +2791,7 @@ pub(crate) mod tests {
      /// command buffer completes, and the memory is unmapped once the import was freed. The command
      /// buffer reads another texture through its ID, so no command of it names the surface's.
      /// Linux's: on macOS IOSurface's memory is the surface's own
@@ -349,7 +349,7 @@ index 8fa1022ecfe4066278088c7869d5402594b7c379..b2ce16a742158c3709da0c8749359d6b
      #[test]
      fn a_released_surface_texture_keeps_the_surfaces_memory_while_imported() {
          use std::sync::atomic::{AtomicU32, Ordering};
-@@ -2367,7 +2367,7 @@ pub(crate) mod tests {
+@@ -3014,7 +3014,7 @@ pub(crate) mod tests {
      /// own twin. Counted by the process's mappings of the guest's pages' file, which every view of
      /// them mapped from it takes (`/proc/self/maps`), a view through dma-bufs none, a twin always
      /// a mapping a run. Linux's: on macOS IOSurface maps the surface
@@ -372,10 +372,10 @@ index dc54e59b47c808be91687b01d733b70cd1ba8621..01334370eeab4db2ca7d712a4163bd9d
      fn a_dispatch_through_read_only_pages_dies_on_linux() {
          use reims_vgpu_core::platform::os::vm::HostVm as _;
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
-index f18f304c2cfc23296e6eb1e473c9635143a4a8b6..45bd6dba5b7d69633e18dbd0486fc366a5e60663 100644
+index 778f27eb39b09bb0734ab04a61a048b17688742d..e1f5ccdc82d3beba30a7a4d6d90ca246fc7a7124 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
-@@ -4705,7 +4705,7 @@ pub(crate) mod tests {
+@@ -5559,7 +5559,7 @@ pub(crate) mod tests {
      /// vertex function's slot 2 too, a `device` pointer, the draw dies where it is encoded: on
      /// Linux the runtime imports a writable twin of the pages, which the write would reach
      /// ([`crate::gpu::writes::kept_write`]). The pages stay zeros
@@ -385,10 +385,10 @@ index f18f304c2cfc23296e6eb1e473c9635143a4a8b6..45bd6dba5b7d69633e18dbd0486fc366
      fn a_draw_through_read_only_pages_at_slots_it_cannot_write_draws_on_linux() {
          use reims_vgpu_core::platform::os::vm::HostVm as _;
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs b/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs
-index 049e5eefc0ea38210401cb35b6b97a162f180158..9b980a2fb3cc03aad682368a8bd79337e7823a00 100644
+index 22c34a3dbe8faccaa9fd4620c373b13b1eca3a7e..4b04cfc6c0e18655db4dba93389c5640eda18ca7 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/frame_cost.rs
-@@ -143,7 +143,7 @@ fn cpu_now() -> [u64; 3] {
+@@ -145,7 +145,7 @@ fn cpu_now() -> [u64; 3] {
      // `CLOCK_THREAD_CPUTIME_ID`, `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_MONOTONIC`.
      #[cfg(target_os = "macos")]
      const CLOCKS: [i32; 3] = [16, 12, 6];
@@ -398,10 +398,10 @@ index 049e5eefc0ea38210401cb35b6b97a162f180158..9b980a2fb3cc03aad682368a8bd79337
      CLOCKS.map(|clock| {
          let mut at = Timespec { sec: 0, nsec: 0 };
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource.rs b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
-index 2b01a22aa57ed5d99ba4cf7206465eb6417d339a..365987a9d13c68da83b74a5bcb914e7a0f2dcc1c 100644
+index a053113024372d0fc8a54b0f7b918d4d51aad270..233fe0f5d3283fcb1891d053eaed8c07b084e426 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
-@@ -2080,7 +2080,7 @@ pub(crate) mod tests {
+@@ -2402,7 +2402,7 @@ pub(crate) mod tests {
      /// A no-copy buffer over `pages` pages of zeros mapped read-only, which the runtime imports
      /// through a writable twin of them on Linux, and the pages' first byte, which the caller
      /// frees once the buffer is gone.
@@ -410,7 +410,7 @@ index 2b01a22aa57ed5d99ba4cf7206465eb6417d339a..365987a9d13c68da83b74a5bcb914e7a
      pub(crate) fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
          use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
  
-@@ -2106,7 +2106,7 @@ pub(crate) mod tests {
+@@ -2428,7 +2428,7 @@ pub(crate) mod tests {
      /// runtime imports a writable twin of the pages, which the fill would reach, where Metal
      /// drops the write (`os/linux/import.rs`, [`crate::gpu::writes::kept_write`]). The rest of
      /// the command buffer runs, and the pages stay zeros
@@ -420,7 +420,7 @@ index 2b01a22aa57ed5d99ba4cf7206465eb6417d339a..365987a9d13c68da83b74a5bcb914e7a
      fn a_fill_into_read_only_pages_dies_on_linux() {
          use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/writes.rs b/crates/reims-vgpu-vulkan/src/gpu/writes.rs
-index f32c86e1db334f945e6923b591c9974f1e9716f9..c6827d8d84e5dba013adcda4950cdd069d31c668 100644
+index ffeda6f7cd3d48b563fa4db5fa954cd9f97e64fd..c000fedac24b9ec4711712938cb86d2753334232 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/writes.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/writes.rs
 @@ -249,11 +249,11 @@ pub(crate) fn set_kept(flag: &AtomicBool, kept: bool) {
@@ -447,11 +447,11 @@ index f32c86e1db334f945e6923b591c9974f1e9716f9..c6827d8d84e5dba013adcda4950cdd06
      fn drop(&mut self) {
          KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
 diff --git a/crates/reims-vgpu-vulkan/src/lib.rs b/crates/reims-vgpu-vulkan/src/lib.rs
-index 21ef548cd30bd51df032c28682c53cb39995bd49..75f63f66f53fe2b53788ec8d7e051ce26ca002f1 100644
+index 05f527456835a8d38692e17cca618c36e7de4994..597f6c62f24a7aeb53ccdd9ac71baeabe7e147c0 100644
 --- a/crates/reims-vgpu-vulkan/src/lib.rs
 +++ b/crates/reims-vgpu-vulkan/src/lib.rs
-@@ -34,3 +34,9 @@ pub mod remap;
- pub mod swapchain;
+@@ -37,3 +37,9 @@ pub mod swapchain;
+ pub(crate) mod work_log;
  
  pub use platform::{Obj, VulkanPlatform};
 +
@@ -461,10 +461,10 @@ index 21ef548cd30bd51df032c28682c53cb39995bd49..75f63f66f53fe2b53788ec8d7e051ce2
 +#[cfg(target_os = "android")]
 +pub use metal2vulkan_runtime::set_android_vulkan_gipa;
 diff --git a/crates/reims-vgpu-vulkan/src/os.rs b/crates/reims-vgpu-vulkan/src/os.rs
-index a0921aefdb7330e829ae3a82f3dd813a79a5fe60..3371e4a007f0328fb82e46ce3be199f623a65116 100644
+index 97c72c2427304a05dbb7b71e771e4d1de526078b..e376ed136c1109a897adda3149aa9bae0eda4c2d 100644
 --- a/crates/reims-vgpu-vulkan/src/os.rs
 +++ b/crates/reims-vgpu-vulkan/src/os.rs
-@@ -13,14 +13,14 @@
+@@ -13,17 +13,17 @@
  //! its loader, and fetching an image's drawable ahead where the driver needs it
  //! (`Drawables`: MoltenVK's, on macOS).
  
@@ -473,6 +473,10 @@ index a0921aefdb7330e829ae3a82f3dd813a79a5fe60..3371e4a007f0328fb82e46ce3be199f6
  mod linux;
  #[cfg(target_os = "macos")]
  mod macos;
+ /// The dirty log's kept resolutions of an import's ranges, Linux's alone but measured anywhere.
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ pub(crate) mod resolutions;
  mod surface;
  mod wsi;
  
@@ -481,7 +485,7 @@ index a0921aefdb7330e829ae3a82f3dd813a79a5fe60..3371e4a007f0328fb82e46ce3be199f6
  use linux as host_os;
  #[cfg(target_os = "macos")]
  use macos as host_os;
-@@ -30,22 +30,22 @@ use std::sync::Arc;
+@@ -33,22 +33,22 @@ use std::sync::Arc;
  
  /// The dirty source's side on Linux: the device's log, the harvester's interface, and the
  /// per-import answers the runtime asks (`os/linux/dirty.rs`).
@@ -509,10 +513,10 @@ index a0921aefdb7330e829ae3a82f3dd813a79a5fe60..3371e4a007f0328fb82e46ce3be199f6
  pub(crate) use host_os::{
      Drawables, ImportView, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, dma_buf_refusal,
 diff --git a/crates/reims-vgpu-vulkan/src/os/linux.rs b/crates/reims-vgpu-vulkan/src/os/linux.rs
-index 6686fef4c9c199c20b418a5d1fa14c48f6a675c5..24fec190d1729763e2148cdd823bfe8a1cd5e04e 100644
+index f03e166d70a77ea76f8ea31080797b9e6adcc0fc..688989a5d1ab8362b4314372c930dcded6e437d7 100644
 --- a/crates/reims-vgpu-vulkan/src/os/linux.rs
 +++ b/crates/reims-vgpu-vulkan/src/os/linux.rs
-@@ -47,17 +47,28 @@ pub(crate) use vm::tests::{PAGE, mapped, writable};
+@@ -50,17 +50,28 @@ pub(crate) use vm::tests::{PAGE, mapped, writable};
  /// The instance's surface extensions a display's window may present over, besides
  /// `VK_KHR_surface`, each asked for where the loader lists it (`crate::os`'s `wsi`): Wayland's,
  /// XCB's and Xlib's, so a window opens over whichever the window library picks.
@@ -571,10 +575,10 @@ index cf52fd2bb23616f9a144ada14d3f90877dbd6db7..978fb0aef47d4ac3bb4991be11620459
  
  /// The limit as last read, reading it the first time; a test's, where the thread set one.
 diff --git a/crates/reims-vgpu-vulkan/src/os/linux/hints.rs b/crates/reims-vgpu-vulkan/src/os/linux/hints.rs
-index 9a0811104b5bc5dc865a98d391d67d4b1cf81c25..17dd9e9f4e0f9ff6420d1758b1f3259ab737421d 100644
+index 2f03c4ea6340c18d1148e7047c320f1a28453ca6..544818a87a76aedefd0ebf7864e54ae2dc72b4c8 100644
 --- a/crates/reims-vgpu-vulkan/src/os/linux/hints.rs
 +++ b/crates/reims-vgpu-vulkan/src/os/linux/hints.rs
-@@ -52,6 +52,8 @@
+@@ -54,6 +54,8 @@
  //! without `CONFIG_UCLAMP_TASK` refuses the call, and the thread runs as it would have. The first
  //! hint's outcome is logged once; a dropped floor is not logged.
  
@@ -583,7 +587,7 @@ index 9a0811104b5bc5dc865a98d391d67d4b1cf81c25..17dd9e9f4e0f9ff6420d1758b1f3259a
  use std::sync::atomic::{AtomicBool, Ordering};
  
  /// `SCHED_FLAG_KEEP_POLICY`: the thread keeps its policy.
-@@ -119,7 +121,15 @@ fn util_floor_request(floor: u32) -> SchedAttr {
+@@ -121,7 +123,15 @@ fn util_floor_request(floor: u32) -> SchedAttr {
      }
  }
  
@@ -758,11 +762,11 @@ index d5ea7726a1fedd64d0138ae1e6616e8d9b8a1928..2ab723a4174af9ef5476cc2ab7ddd796
  # Vulkan crate's threads.
  [target.'cfg(target_os = "linux")'.dependencies]
 diff --git a/crates/reims-vgpu-window/features.md b/crates/reims-vgpu-window/features.md
-index 6d787e4f981ae398395f7e14ed4001ea494cf62c..25ac919a08fdc7d6c1d3903f46af35d5e5e9176c 100644
+index df622074fcc92ab52be71e02005948b997e11f29..436ce8bc7d855ef2a00a451d3bc5ddef738be7da 100644
 --- a/crates/reims-vgpu-window/features.md
 +++ b/crates/reims-vgpu-window/features.md
-@@ -347,9 +347,9 @@ runtime's own device. The switches above apply, and `resolution=` too.
-   `manual`
+@@ -353,9 +353,9 @@ runtime's own device. The switches above apply, and `resolution=` too.
+   the guest's mode, as on macOS. `manual`
  - Nothing is drawn while the window is hidden or minimized, nor before it
    and its layout exist; it redraws when it shows.
 -  `test: native::linux::render::a_hidden_window_is_drawn_when_it_shows`,
@@ -774,7 +778,7 @@ index 6d787e4f981ae398395f7e14ed4001ea494cf62c..25ac919a08fdc7d6c1d3903f46af35d5
  - Nothing is presented while the compositor suspends the window (Wayland's
    suspended state, as KWin and Mutter set it for a covered window or one on
    another desktop): from SDL's occluded event until it is exposed again, the
-@@ -363,7 +363,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
+@@ -369,7 +369,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
    when it shows, and holds none back.
    `test: sdl::shell::a_covered_window_stops_drawing_until_exposed`,
    `test: sdl::shell::the_last_show_or_hide_of_a_batch_decides`,
@@ -783,7 +787,7 @@ index 6d787e4f981ae398395f7e14ed4001ea494cf62c..25ac919a08fdc7d6c1d3903f46af35d5
  - Pointer: absolute, held at the image's nearest edge; five buttons; a
    drag ends in the guest; the click that focuses the window is not sent;
    nothing is sent before the guest has a mode.
-@@ -443,7 +443,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
+@@ -449,7 +449,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
    `test: decor::the_texture_coordinates_turn_the_image`,
    `test: decor::the_pointer_over_a_turned_image_reaches_the_pixel_under_it`,
    `test: native::linux::input::over_a_turned_image_the_pointer_reaches_the_pixel_under_it`,
@@ -2165,8 +2169,21 @@ index c037e6e147964be9694d76740a686ea7ad29841e..3ffd6b27a027c4111d0da453d9dff361
      )]
      pub(crate) fn draw(
          &mut self,
+diff --git a/crates/reims-vgpu/src/graphics/vulkan.rs b/crates/reims-vgpu/src/graphics/vulkan.rs
+index 8f3f29d68f8d13d571d148dfe711f3374a98bb0d..379c6ce0d54a09610609b93638d87b57cd678a0e 100644
+--- a/crates/reims-vgpu/src/graphics/vulkan.rs
++++ b/crates/reims-vgpu/src/graphics/vulkan.rs
+@@ -18,7 +18,7 @@ use super::{Presented, Shown};
+ use crate::display::no_catch;
+ use crate::entry;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
 diff --git a/crates/reims-vgpu/src/lib.rs b/crates/reims-vgpu/src/lib.rs
-index a88d015fdc023bf6103928cdfe342699a214ff8b..8f655466df6bb6955406b76270f486a55e59eeec 100644
+index 8e00fe240133d3e407643e048360f3b459e5ce2b..f32b82a2384ff1f4f65d16fe58ba96cc5dbd7507 100644
 --- a/crates/reims-vgpu/src/lib.rs
 +++ b/crates/reims-vgpu/src/lib.rs
 @@ -29,7 +29,7 @@
@@ -2177,8 +2194,8 @@ index a88d015fdc023bf6103928cdfe342699a214ff8b..8f655466df6bb6955406b76270f486a5
 +#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "vulkan")))]
  compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
  
- mod device;
-@@ -81,7 +81,7 @@ pub use video::{
+ /// The unit tests' allocator, which counts a thread's allocations where a test asks.
+@@ -94,7 +94,7 @@ pub use video::{
  #[cfg(target_os = "macos")]
  pub type DefaultPlatform = MetalPlatform;
  /// The platform every handle is made on by default: `VulkanPlatform` on Linux.
@@ -2187,7 +2204,7 @@ index a88d015fdc023bf6103928cdfe342699a214ff8b..8f655466df6bb6955406b76270f486a5
  pub type DefaultPlatform = VulkanPlatform;
  pub use reims_vgpu_window::{
      BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
-@@ -97,3 +97,27 @@ pub const DEVICE_MMIO_SIZE: u64 = reims_vgpu_core::device::config::DEFAULT_MMIO_
+@@ -110,3 +110,27 @@ pub const DEVICE_MMIO_SIZE: u64 = reims_vgpu_core::device::config::DEFAULT_MMIO_
  pub const PCI_VENDOR_ID: u16 = 0x106b;
  /// The PCI device ID of the device.
  pub const PCI_DEVICE_ID: u16 = 0xeeee;
@@ -2216,10 +2233,10 @@ index a88d015fdc023bf6103928cdfe342699a214ff8b..8f655466df6bb6955406b76270f486a5
 +    }
 +}
 diff --git a/crates/reims-vgpu/src/platform.rs b/crates/reims-vgpu/src/platform.rs
-index f669a6eb4e9eec69e8b94a3323e2f0e5601f179c..2184dc89a3fabc944424a1b367fb0f63c5eae75d 100644
+index f7baf9b78ab1f2eb5779a52983a2f565b3afcd35..e96060ef5d8d856fa2183c2ff95eaa79200f8858 100644
 --- a/crates/reims-vgpu/src/platform.rs
 +++ b/crates/reims-vgpu/src/platform.rs
-@@ -315,7 +315,7 @@ mod tests {
+@@ -325,7 +325,7 @@ mod tests {
      /// The Vulkan platform's lease of the guest's RAM lets views be made of the pages the host
      /// names a file behind, showing the file from its offset, while it lives; never of a range
      /// without a file
@@ -2229,7 +2246,7 @@ index f669a6eb4e9eec69e8b94a3323e2f0e5601f179c..2184dc89a3fabc944424a1b367fb0f63
      fn the_vulkan_lease_lets_views_be_made_of_the_guests_ram() {
          use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 diff --git a/crates/reims-vgpu/src/platform/vulkan.rs b/crates/reims-vgpu/src/platform/vulkan.rs
-index a30c30e415800f37e4d8511e4c35b45d2902c8ca..683f75e0ce0d76c06a9daeb657ca1a1508d3e84d 100644
+index 6eda6ad77617ed0b98b77252a8f4ddc6b5cf2c5c..f362d97311112c608556dadb0466d3021f934d54 100644
 --- a/crates/reims-vgpu/src/platform/vulkan.rs
 +++ b/crates/reims-vgpu/src/platform/vulkan.rs
 @@ -9,7 +9,7 @@ use reims_vgpu_vulkan::os::GuestRamFile;
@@ -2241,7 +2258,7 @@ index a30c30e415800f37e4d8511e4c35b45d2902c8ca..683f75e0ce0d76c06a9daeb657ca1a15
  mod lent_memory;
  
  /// The platform over metal2vulkan's runtime (architecture 2.2): the runtime's devices, and on
-@@ -106,7 +106,7 @@ impl ApiPlatform for VulkanPlatform {
+@@ -114,7 +114,7 @@ impl ApiPlatform for VulkanPlatform {
      /// udmabuf and as the surface's view of them, with an identity attached to the surface
      /// (`platform/vulkan/lent_memory.rs`). On macOS none: there the Metal platform lends a
      /// surface's IOSurface to VideoToolbox (`platform/metal/lent_memory.rs`).
@@ -2251,10 +2268,10 @@ index a30c30e415800f37e4d8511e4c35b45d2902c8ca..683f75e0ce0d76c06a9daeb657ca1a15
          &self,
          surface: &<Self as Platform>::Surface,
 diff --git a/crates/reims-vgpu/src/scaler/gpu/tests.rs b/crates/reims-vgpu/src/scaler/gpu/tests.rs
-index 5bdf9a005f9a9a492374cd4468c81efd44613f80..fef8731cf41971a443c525412e99b47b249f628c 100644
+index c8e3a4ace816b7e54455b153b48393dd52bb13ef..b1773b3868a4dce84936db6e7087764055fe110f 100644
 --- a/crates/reims-vgpu/src/scaler/gpu/tests.rs
 +++ b/crates/reims-vgpu/src/scaler/gpu/tests.rs
-@@ -739,7 +739,7 @@ fn platform_surfaces_are_reached_in_place() {
+@@ -752,7 +752,7 @@ fn platform_surfaces_are_reached_in_place() {
          let source = platform_surface(sl.clone(), &picture_bytes(&sl, None), None);
          let grey = picture_bytes(&dl, Some([0.5, 0.5, 0.5, 1.0]));
          let destination = platform_surface(dl.clone(), &grey, Some(2));
@@ -2264,7 +2281,7 @@ index 5bdf9a005f9a9a492374cd4468c81efd44613f80..fef8731cf41971a443c525412e99b47b
              continue;
          }
 diff --git a/crates/reims-vgpu/src/video/backend_choice.rs b/crates/reims-vgpu/src/video/backend_choice.rs
-index 285882a1a348b0241f3086379c6365b4e2d6936b..c71412ef1483af69d0515247a905ca970a93e337 100644
+index d7f1134db6b05371559e034a54f28be838686f31..3bb14613d096b6fc400c7decf5107fcff97f3f7f 100644
 --- a/crates/reims-vgpu/src/video/backend_choice.rs
 +++ b/crates/reims-vgpu/src/video/backend_choice.rs
 @@ -372,7 +372,7 @@ pub(crate) fn choose(
