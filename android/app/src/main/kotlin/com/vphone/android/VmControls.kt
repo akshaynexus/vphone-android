@@ -3,45 +3,55 @@ package com.vphone.android
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.RectF
-import android.graphics.drawable.GradientDrawable
+import android.graphics.Path
 import android.os.Handler
 import android.os.Looper
-import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
-import android.view.ViewGroup
-import android.widget.FrameLayout
-import android.widget.GridLayout
-import android.widget.LinearLayout
-import android.widget.TextView
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.MaterialShapes
+import androidx.graphics.shapes.toPath
 import kotlin.math.abs
 import kotlin.math.hypot
 
 /**
  * A floating button over the guest's screen, as iOS's AssistiveTouch: drag it anywhere and it
  * settles at the nearer side; tap it for the menu, hold it for Home. Where it sits is kept.
+ *
+ * It is a plain View drawn by hand, in one of Material 3 Expressive's shapes and the theme's
+ * colours ([container] and [content]): nothing of it lies over the guest's picture but itself.
  */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @SuppressLint("ViewConstructor")
-class FloatingButton(context: Context, private val onTap: () -> Unit, private val onHold: () -> Unit) : View(context) {
+class FloatingButton(
+    context: Context,
+    private val container: Int,
+    private val content: Int,
+    private val onTap: () -> Unit,
+    private val onHold: () -> Unit,
+) : View(context) {
     private val density = resources.displayMetrics.density
     val size = (56 * density).toInt()
     private val margin = 8 * density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
     private val handler = Handler(Looper.getMainLooper())
     private val prefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
-    private val body = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCC1C1C1E.toInt() }
+    private val body = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = container }
     private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0x66FFFFFF
+        color = content
         style = Paint.Style.STROKE
-        strokeWidth = 2 * density
+        strokeWidth = 2.5f * density
     }
-    private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xE6FFFFFF.toInt() }
-    private val box = RectF()
+    private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = content }
+    /** Material's nine-sided cookie, which its polygons give in a unit square. */
+    private val shape = Path().also { path ->
+        MaterialShapes.Cookie9Sided.toPath(path)
+        path.transform(Matrix().apply { setScale(size.toFloat(), size.toFloat()) })
+    }
     private var downX = 0f
     private var downY = 0f
     private var startX = 0f
@@ -71,11 +81,9 @@ class FloatingButton(context: Context, private val onTap: () -> Unit, private va
 
     override fun onDraw(canvas: Canvas) {
         val s = size.toFloat()
-        box.set(0f, 0f, s, s)
-        canvas.drawRoundRect(box, s * 0.3f, s * 0.3f, body)
-        canvas.drawCircle(s / 2, s / 2, s * 0.32f, ring)
-        canvas.drawCircle(s / 2, s / 2, s * 0.24f, ring)
-        canvas.drawCircle(s / 2, s / 2, s * 0.16f, dot)
+        canvas.drawPath(shape, body)
+        canvas.drawCircle(s / 2, s / 2, s * 0.25f, ring)
+        canvas.drawCircle(s / 2, s / 2, s * 0.13f, dot)
     }
 
     /** Back where it was left, inside a parent of this size. */
@@ -150,110 +158,7 @@ class FloatingButton(context: Context, private val onTap: () -> Unit, private va
     private companion object {
         const val KEY_RIGHT = "floatRight"
         const val KEY_Y = "floatY"
-        const val IDLE_ALPHA = 0.55f
+        const val IDLE_ALPHA = 0.6f
         const val FADE_AFTER = 2500L
-    }
-}
-
-/** The controls' menu: a dimmed screen with a panel of tiles, closed by a tap outside or Back. */
-@SuppressLint("ViewConstructor")
-class ControlsMenu(context: Context) : FrameLayout(context) {
-    class Item(val icon: String, val label: String, val action: () -> Unit)
-
-    private val density = resources.displayMetrics.density
-    private val title = TextView(context).apply {
-        setTextColor(Color.WHITE)
-        textSize = 15f
-        gravity = Gravity.CENTER
-    }
-    private val hint = TextView(context).apply {
-        setTextColor(0xB3FFFFFF.toInt())
-        textSize = 12f
-        gravity = Gravity.CENTER
-    }
-    private val grid = GridLayout(context).apply { columnCount = 3 }
-
-    val isOpen get() = visibility == VISIBLE
-
-    init {
-        setBackgroundColor(0x99000000.toInt())
-        visibility = GONE
-        isClickable = true
-        setOnClickListener { close() }
-        val pad = (20 * density).toInt()
-        val panel = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            background = GradientDrawable().apply {
-                cornerRadius = 28 * density
-                setColor(0xF01C1C1E.toInt())
-            }
-            isClickable = true // a tap between tiles leaves it open
-            addView(title)
-            addView(grid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                topMargin = (12 * density).toInt()
-                bottomMargin = (8 * density).toInt()
-            })
-            addView(hint)
-        }
-        addView(panel, LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-    }
-
-    fun setItems(items: List<Item>) {
-        grid.removeAllViews()
-        val side = (88 * density).toInt()
-        for (item in items) {
-            grid.addView(tile(item), GridLayout.LayoutParams().apply {
-                width = side
-                height = side
-                setMargins(4, 4, 4, 4)
-            })
-        }
-    }
-
-    private fun tile(item: Item) = LinearLayout(context).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
-        background = GradientDrawable().apply {
-            cornerRadius = 18 * density
-            setColor(0xFF2C2C2E.toInt())
-        }
-        isClickable = true
-        isFocusable = true
-        contentDescription = item.label
-        setOnClickListener {
-            close()
-            item.action()
-        }
-        addView(TextView(context).apply {
-            text = item.icon
-            textSize = 24f
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-        })
-        addView(TextView(context).apply {
-            text = item.label
-            textSize = 12f
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-        })
-    }
-
-    fun open(heading: String, note: String) {
-        title.text = heading
-        hint.text = note
-        hint.visibility = if (note.isEmpty()) GONE else VISIBLE
-        visibility = VISIBLE
-        alpha = 0f
-        animate().alpha(1f).setDuration(120).start()
-    }
-
-    fun setHeading(heading: String) {
-        title.text = heading
-    }
-
-    fun close() {
-        visibility = GONE
     }
 }

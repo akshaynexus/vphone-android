@@ -1,9 +1,7 @@
 package com.vphone.android
 
-import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.Typeface
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
@@ -12,26 +10,25 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
-import android.text.style.StyleSpan
-import android.view.View
-import android.widget.ArrayAdapter
-import android.widget.AutoCompleteTextView
-import android.widget.Button
-import android.widget.GridLayout
-import android.widget.LinearLayout
-import android.widget.TextView
-import android.widget.Toast
-import androidx.activity.addCallback
-import androidx.appcompat.app.AppCompatActivity
-import com.google.android.material.button.MaterialButtonToggleGroup
-import com.google.android.material.color.MaterialColors
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.materialswitch.MaterialSwitch
-import com.google.android.material.progressindicator.LinearProgressIndicator
-import com.google.android.material.textfield.TextInputEditText
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.vphone.android.ui.AppDialog
+import com.vphone.android.ui.CreatePickActions
+import com.vphone.android.ui.CreatePickScreen
+import com.vphone.android.ui.CreatePickUi
+import com.vphone.android.ui.CreateProgressActions
+import com.vphone.android.ui.CreateProgressScreen
+import com.vphone.android.ui.CreateProgressUi
+import com.vphone.android.ui.CreateStep
+import com.vphone.android.ui.DialogAction
+import com.vphone.android.ui.DialogHost
+import com.vphone.android.ui.DialogSpec
+import com.vphone.android.ui.Fact
+import com.vphone.android.ui.VphoneTheme
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -39,18 +36,22 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** The wizard: pick a device and iOS version, then follow the creation to the running VM. */
-class CreateActivity : AppCompatActivity() {
+class CreateActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
-    private var following: String? = null
+    private val dialogs = DialogHost()
+    /** The VM being followed; null while the pickers are shown. */
+    private var following by mutableStateOf<String?>(null)
+    private var pick by mutableStateOf(CreatePickUi())
+    private var progress by mutableStateOf(CreateProgressUi())
     private var lastStatus: JSONObject? = null
     private var paused = false
     private lateinit var catalog: JSONObject
+    private lateinit var deviceIds: List<String>
     private lateinit var pairingsByDevice: Map<String, List<JSONObject>>
     private var pickedDevice = ""
     private var pickedIos: JSONObject? = null
-    private var rowsFor = ""
-    private val rows = HashMap<String, View>()
     private var stageText = ""
+    private var stepTimes: JSONObject? = null
     private val worker = Executors.newSingleThreadExecutor()
     private val polling = AtomicBoolean(false)
 
@@ -70,18 +71,70 @@ class CreateActivity : AppCompatActivity() {
             polling.set(false)
             handler.post {
                 if (following == name) {
-                    status?.let(::showStatus)
                     live?.let(::showLive)
+                    status?.let(::showStatus)
                 }
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         val pending = Native.createPending()
         if (pending.isNotEmpty()) follow(pending) else showPicker()
-        onBackPressedDispatcher.addCallback(this) { finish() }
+        val pickActions = CreatePickActions(
+            device = { i -> selectDevice(deviceIds[i]) },
+            version = { i -> selectIos(pairingsByDevice.getValue(pickedDevice)[i]) },
+            name = { edit { copy(name = it) } },
+            scale = { edit { copy(scale = it) } },
+            cellular = { edit { copy(cellular = it) } },
+            deleteFirmware = { edit { copy(deleteFirmware = it) } },
+            trimServices = { edit { copy(trimServices = it) } },
+            start = ::confirmAndStart,
+            importInstead = {
+                startActivity(Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_IMPORT, true))
+                finish()
+            },
+            back = ::finish,
+        )
+        val progressActions = CreateProgressActions(
+            copyError = ::copyReport,
+            liveLog = { following?.let { CreateLogActivity.open(this, it) } },
+            watchVm = { startActivity(Intent(this, CreateVmScreen::class.java)) },
+            pause = { following?.let { if (paused) Native.createPause(it, false) else confirmPause(it) } },
+            cancel = { following?.let(::confirmCancel) },
+            delete = { following?.let(::confirmDelete) },
+            retry = { following?.let { CreateService.start(this, it) } },
+            useCellular = {
+                following?.let { name ->
+                    dialogs.show(
+                        DialogSpec(
+                            "Download over cellular?",
+                            "The remaining firmware (up to about 12 GB) would use your mobile data.",
+                            confirm = DialogAction("Use cellular") { Native.createAllowCellular(name, true) },
+                            dismiss = DialogAction("Wait for Wi-Fi"),
+                        ),
+                    )
+                }
+            },
+            launch = {
+                following?.let { name ->
+                    startActivity(Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_BOOT, name))
+                    finish()
+                }
+            },
+            stepLog = { key -> following?.let { CreateLogActivity.open(this, it, key) } },
+            back = ::finish,
+        )
+        setContent {
+            VphoneTheme {
+                if (following == null) CreatePickScreen(pick, pickActions) else CreateProgressScreen(progress, progressActions)
+                dialogs.current?.let { spec ->
+                    AppDialog(spec, onCopy = { App.copy(this, it) }, onDismiss = { dialogs.current = null })
+                }
+            }
+        }
     }
 
     override fun onStart() {
@@ -101,46 +154,32 @@ class CreateActivity : AppCompatActivity() {
 
     // ------------------------------------------------------------------ the pickers
 
+    /** A change to what is picked, and what the native side says of the result. */
+    private fun edit(change: CreatePickUi.() -> CreatePickUi) {
+        pick = pick.change()
+        updatePreflight()
+    }
+
     private fun showPicker() {
         following = null
-        setContentView(R.layout.create_pick)
-        App.fitSystemBars(findViewById(R.id.pick_scroll))
         catalog = JSONObject(Native.createCatalog())
         val devices = catalog.getJSONArray("devices")
         val all = (0 until devices.length()).map { devices.getJSONObject(it) }
+        deviceIds = all.map { it.getString("id") }
         pairingsByDevice = all.associate { d ->
             val p = d.getJSONArray("pairings")
             d.getString("id") to (0 until p.length()).map { p.getJSONObject(it) }
         }
-        findViewById<TextView>(R.id.about).text = ABOUT
-        findViewById<TextView>(R.id.trim_note).text = TRIM_NOTE
-
-        val deviceView = findViewById<AutoCompleteTextView>(R.id.device)
-        val deviceLabels = all.map { "${it.getString("name")} (${it.getString("id")})" }
-        deviceView.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, deviceLabels))
-        deviceView.setOnItemClickListener { _, _, position, _ ->
-            selectDevice(all[position].getString("id"))
-        }
-        val iosView = findViewById<AutoCompleteTextView>(R.id.ios)
-        iosView.setOnItemClickListener { _, _, position, _ ->
-            selectIos(pairingsByDevice.getValue(pickedDevice)[position])
-        }
-        findViewById<Button>(R.id.start).setOnClickListener { confirmAndStart() }
-        findViewById<Button>(R.id.import_instead).setOnClickListener {
-            startActivity(Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_IMPORT, true))
-            finish()
-        }
-
+        pick = CreatePickUi(
+            about = ABOUT,
+            trimNote = TRIM_NOTE,
+            devices = all.map { "${it.getString("name")} (${it.getString("id")})" },
+        )
         val def = catalog.getString("defaultDevice")
-        val i = all.indexOfFirst { it.getString("id") == def }.coerceAtLeast(0)
-        deviceView.setText(deviceLabels[i], false)
-        selectDevice(all[i].getString("id"))
-        val defaultIos = pairingsByDevice.getValue(pickedDevice)
+        selectDevice(deviceIds[deviceIds.indexOf(def).coerceAtLeast(0)])
+        pairingsByDevice.getValue(pickedDevice)
             .firstOrNull { it.getString("ios") == catalog.getString("defaultIos") }
-        defaultIos?.let {
-            iosView.setText(labelFor(it), false)
-            selectIos(it)
-        }
+            ?.let(::selectIos)
     }
 
     private fun labelFor(p: JSONObject): String {
@@ -155,67 +194,56 @@ class CreateActivity : AppCompatActivity() {
     private fun selectDevice(id: String) {
         pickedDevice = id
         val pairings = pairingsByDevice.getValue(id)
-        val iosView = findViewById<AutoCompleteTextView>(R.id.ios)
-        iosView.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, pairings.map { labelFor(it) }))
+        pick = pick.copy(device = deviceIds.indexOf(id), versions = pairings.map { labelFor(it) })
         val first = pairings.firstOrNull { it.optBoolean("recommended") }
             ?: pairings.firstOrNull { it.getString("status") == "tested" }
             ?: pairings.first()
-        iosView.setText(labelFor(first), false)
         selectIos(first)
     }
 
-    @SuppressLint("SetTextI18n")
     private fun selectIos(p: JSONObject) {
         pickedIos = p
-        findViewById<TextView>(R.id.pairing_note).text = p.optString("note")
-        val warning = findViewById<TextView>(R.id.warning)
         val underTest = p.getString("status") != "tested"
-        warning.visibility = if (underTest) View.VISIBLE else View.GONE
-        if (underTest) {
-            warning.text = "Under test: this pairing has been verified on macOS only, not with the Linux flow this app follows. " +
-                "Expect it may need manual attention, and hours of work to be lost if it fails."
-        }
         val minScale = p.optInt("minScale", 1)
-        val group = findViewById<MaterialButtonToggleGroup>(R.id.scale)
-        findViewById<Button>(R.id.scale1).isEnabled = minScale <= 1
-        group.check(if (minScale <= 1) R.id.scale1 else R.id.scale2)
-        findViewById<TextInputEditText>(R.id.name).setText(
-            "vphone-" + pickedDevice.replace(",", "-") + "-" + p.getString("ios").replace(".", ""),
+        pick = pick.copy(
+            version = pairingsByDevice.getValue(pickedDevice).indexOf(p).coerceAtLeast(0),
+            pairingNote = p.optString("note"),
+            warning = if (underTest) {
+                "Under test: this pairing has been verified on macOS only, not with the Linux flow this app follows. " +
+                    "Expect it may need manual attention, and hours of work to be lost if it fails."
+            } else {
+                ""
+            },
+            minScale = minScale,
+            scale = if (minScale <= 1) 1 else 2,
+            name = "vphone-" + pickedDevice.replace(",", "-") + "-" + p.getString("ios").replace(".", ""),
         )
         updatePreflight()
     }
 
     private fun specJson(): JSONObject {
         val p = pickedIos!!
-        val group = findViewById<MaterialButtonToggleGroup>(R.id.scale)
-        val scale = when (group.checkedButtonId) {
-            R.id.scale3 -> 3
-            R.id.scale2 -> 2
-            else -> 1
-        }
         return JSONObject()
-            .put("name", findViewById<TextInputEditText>(R.id.name).text.toString())
+            .put("name", pick.name)
             .put("device", pickedDevice)
             .put("ios", p.getString("ios"))
             .put("build", p.getString("build"))
-            .put("scale", scale)
-            .put("allowCellular", findViewById<MaterialSwitch>(R.id.cellular).isChecked)
-            .put("deleteFirmwareAfter", findViewById<MaterialSwitch>(R.id.delete_fw).isChecked)
-            .put("keepAllServices", !findViewById<MaterialSwitch>(R.id.trim_services).isChecked)
+            .put("scale", pick.scale)
+            .put("allowCellular", pick.cellular)
+            .put("deleteFirmwareAfter", pick.deleteFirmware)
+            .put("keepAllServices", !pick.trimServices)
     }
 
-    @SuppressLint("SetTextI18n")
     private fun updatePreflight(): JSONObject {
         val report = JSONObject(Native.createPreflight(specJson().toString()))
-        val line = StringBuilder()
-        line.append(report.optString("estimate")).append("\n")
-        line.append("Storage free: ${report.optLong("freeGb")} GB (about ${report.optLong("wantGb")} GB will be used).")
         val errors = report.getJSONArray("errors")
         val warnings = report.getJSONArray("warnings")
-        for (i in 0 until errors.length()) line.append("\n✕ ").append(errors.getString(i))
-        for (i in 0 until warnings.length()) line.append("\n⚠ ").append(warnings.getString(i))
-        findViewById<TextView>(R.id.preflight).text = line
-        findViewById<Button>(R.id.start).isEnabled = errors.length() == 0
+        pick = pick.copy(
+            estimate = report.optString("estimate"),
+            storage = "Storage free: ${report.optLong("freeGb")} GB (about ${report.optLong("wantGb")} GB will be used).",
+            errors = (0 until errors.length()).map { errors.getString(it) },
+            warnings = (0 until warnings.length()).map { warnings.getString(it) },
+        )
         return report
     }
 
@@ -228,12 +256,14 @@ class CreateActivity : AppCompatActivity() {
         val spec = specJson()
         if (updatePreflight().getJSONArray("errors").length() > 0) return
         val battery = if (charging()) "" else "\n\nThe phone is not charging. Plug it in: this draws power for hours and may heat the phone."
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Create ${spec.getString("name")}?")
-            .setMessage("$TIME_WARNING$battery")
-            .setPositiveButton("Start") { _, _ -> maybeAskBattery(spec) }
-            .setNegativeButton("Back", null)
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Create ${spec.getString("name")}?",
+                "$TIME_WARNING$battery",
+                confirm = DialogAction("Start") { maybeAskBattery(spec) },
+                dismiss = DialogAction("Back"),
+            ),
+        )
     }
 
     /** Without this, Samsung's and OnePlus's battery managers stop the app in the background. */
@@ -243,21 +273,23 @@ class CreateActivity : AppCompatActivity() {
             start(spec)
             return
         }
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Keep it running with the screen off")
-            .setMessage("Without unrestricted battery use, this phone's battery manager can stop creation when the app is not on screen. Allow it for vphone.")
-            .setPositiveButton("Allow") { _, _ ->
-                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
-                start(spec)
-            }
-            .setNegativeButton("Not now") { _, _ -> start(spec) }
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Keep it running with the screen off",
+                "Without unrestricted battery use, this phone's battery manager can stop creation when the app is not on screen. Allow it for vphone.",
+                confirm = DialogAction("Allow") {
+                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                    start(spec)
+                },
+                dismiss = DialogAction("Not now") { start(spec) },
+            ),
+        )
     }
 
     private fun start(spec: JSONObject) {
         val error = Native.createBegin(spec.toString())
         if (error.isNotEmpty()) {
-            MaterialAlertDialogBuilder(this).setTitle("Cannot start").setMessage(error).setPositiveButton("OK", null).show()
+            dialogs.show(DialogSpec.error("Cannot start", error))
             return
         }
         val name = spec.getString("name")
@@ -268,33 +300,10 @@ class CreateActivity : AppCompatActivity() {
     // ------------------------------------------------------------------ following one
 
     private fun follow(name: String) {
+        progress = CreateProgressUi(name = name, nowStep = "Getting ready", busy = true)
+        stageText = ""
+        stepTimes = null
         following = name
-        rowsFor = ""
-        setContentView(R.layout.create_progress)
-        App.fitSystemBars(findViewById(R.id.progress_root))
-        findViewById<Button>(R.id.copy_error).setOnClickListener { copyReport() }
-        findViewById<Button>(R.id.live_log).setOnClickListener { CreateLogActivity.open(this, name) }
-        findViewById<Button>(R.id.watch_vm).setOnClickListener {
-            startActivity(Intent(this, CreateVmScreen::class.java))
-        }
-        findViewById<Button>(R.id.pause).setOnClickListener {
-            if (paused) Native.createPause(name, false) else confirmPause(name)
-        }
-        findViewById<Button>(R.id.cancel).setOnClickListener { confirmCancel(name) }
-        findViewById<Button>(R.id.delete).setOnClickListener { confirmDelete(name) }
-        findViewById<Button>(R.id.retry).setOnClickListener { CreateService.start(this, name) }
-        findViewById<Button>(R.id.use_cellular).setOnClickListener {
-            MaterialAlertDialogBuilder(this)
-                .setTitle("Download over cellular?")
-                .setMessage("The remaining firmware (up to about 12 GB) would use your mobile data.")
-                .setPositiveButton("Use cellular") { _, _ -> Native.createAllowCellular(name, true) }
-                .setNegativeButton("Wait for Wi-Fi", null)
-                .show()
-        }
-        findViewById<Button>(R.id.launch).setOnClickListener {
-            startActivity(Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_BOOT, name))
-            finish()
-        }
     }
 
     /** What a pause keeps and what it cannot, said before it starts rather than found out after. */
@@ -315,37 +324,42 @@ class CreateActivity : AppCompatActivity() {
                 "it is paused, $step starts again from its beginning. Steps already finished are never redone.\n\n" +
                 "While paused, the VM still holds its memory, so other apps have less of it."
         }
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Pause now?")
-            .setMessage(message)
-            .setPositiveButton("Pause") { _, _ -> Native.createPause(name, true) }
-            .setNegativeButton("Keep running", null)
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Pause now?",
+                message,
+                confirm = DialogAction("Pause") { Native.createPause(name, true) },
+                dismiss = DialogAction("Keep running"),
+            ),
+        )
     }
 
     private fun confirmCancel(name: String) {
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Stop creating this VM?")
-            .setMessage("It ends the current step. You can resume later from the start of that step. To carry on without losing the step, use Pause instead.")
-            .setPositiveButton("Stop it") { _, _ -> Native.createCancel(name) }
-            .setNegativeButton("Keep going", null)
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Stop creating this VM?",
+                "It ends the current step. You can resume later from the start of that step. To carry on without losing the step, use Pause instead.",
+                confirm = DialogAction("Stop it") { Native.createCancel(name) },
+                dismiss = DialogAction("Keep going"),
+            ),
+        )
     }
 
     private fun confirmDelete(name: String) {
-        val checks = arrayOf("Also delete the cached firmware")
-        val checked = booleanArrayOf(false)
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Delete $name?")
-            .setMultiChoiceItems(checks, checked) { _, which, value -> checked[which] = value }
-            .setPositiveButton("Delete") { _, _ ->
-                Native.createCancel(name)
-                val error = Native.createDelete(name, checked[0])
-                if (error.isNotEmpty()) Toast.makeText(this, error, Toast.LENGTH_LONG).show()
-                finish()
-            }
-            .setNegativeButton("Keep it", null)
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Delete $name?",
+                confirm = DialogAction("Delete"),
+                dismiss = DialogAction("Keep it"),
+                checkLabel = "Also delete the cached firmware",
+                onConfirmChecked = { alsoFirmware ->
+                    Native.createCancel(name)
+                    val error = Native.createDelete(name, alsoFirmware)
+                    // A failure is shown whole, and the screen stays so it can be read.
+                    if (error.isNotEmpty()) dialogs.show(DialogSpec.error("$name was not deleted", error)) else finish()
+                },
+            ),
+        )
     }
 
     /** The error, the phone and the failed step's log, ready to paste into a bug report. */
@@ -369,138 +383,83 @@ class CreateActivity : AppCompatActivity() {
         App.copy(this, report)
     }
 
-    @SuppressLint("SetTextI18n")
     private fun showStatus(s: JSONObject) {
         lastStatus = s
         val state = s.optString("state")
         paused = s.optBoolean("paused")
         val failed = state == "failed"
-        findViewById<TextView>(R.id.title).text = "${s.optString("name")} \u00b7 ${s.optString("device")}, iOS ${s.optString("ios")}"
         val all = s.optJSONArray("steps")
         val stepList = (0 until (all?.length() ?: 0)).map { all!!.getJSONObject(it) }
         val at = stepList.indexOfFirst { it.optString("key") == s.optString("step") }
-        findViewById<TextView>(R.id.now_step).text = when {
-            state == "done" -> "All ${stepList.size} steps finished"
-            at >= 0 -> "Step ${at + 1} of ${stepList.size} \u00b7 ${stepList[at].optString("title")}"
-            else -> "Getting ready"
-        }
         // The time left is only ever made of times this phone measured; without them, the reason.
         val left = s.optLong("etaSecs")
         val estimate = when {
             left > 0 -> "About ${durationText(left)} left, going by this phone's last run of these steps"
             else -> s.optString("etaNote")
         }
-        findViewById<TextView>(R.id.eta).text = when (state) {
-            "done" -> "Finished."
-            "failed" -> "Stopped with an error."
-            "cancelled" -> "Stopped. Resume it or delete it."
-            "interrupted" -> if (paused) "Paused. Tap Resume to carry on." else "Interrupted. Tap Resume to continue."
-            else -> {
-                val running = if (paused) "Paused: tap Resume to carry on" else "Running"
-                if (estimate.isEmpty()) "$running." else "$running. $estimate."
-            }
-        }
-
-        val hold = findViewById<TextView>(R.id.hold)
         val holdKey = s.optString("hold")
-        hold.visibility = if (holdKey.isNotEmpty()) View.VISIBLE else View.GONE
-        hold.text = when (holdKey) {
-            "wifi" -> "On hold: waiting for Wi-Fi."
-            "network" -> "On hold: waiting for a connection."
-            "storage" -> "On hold: storage is low. ${s.optString("message")}"
-            "thermal" -> "On hold: the phone is cooling down."
-            else -> ""
-        }
-        findViewById<Button>(R.id.use_cellular).visibility = if (holdKey == "wifi") View.VISIBLE else View.GONE
-
-        val thermal = findViewById<TextView>(R.id.thermal)
         val hot = s.optInt("thermal")
-        thermal.visibility = if (hot >= 2) View.VISIBLE else View.GONE
-        thermal.text = when (hot) {
-            2 -> "The phone is warm; this may be slower."
-            3 -> "The phone is hot; this will be slower."
-            else -> "The phone is overheating: let it cool down."
-        }
-
-        findViewById<TextView>(R.id.message).text = s.optString("message").let {
-            val speed = s.optLong("bytesPerSec")
-            if (speed > 0) "$it (${speed / MIB} MB/s)" else it
-        }
         // The headline is what the step says it is doing; with nothing said, the stage its log is at.
-        if (s.optString("message").isEmpty()) findViewById<TextView>(R.id.message).text = stageText
-        val nothing = s.optString("message").isEmpty() && stageText.isEmpty()
-        findViewById<TextView>(R.id.message).visibility =
-            if (failed || nothing || state == "done" || state == "cancelled") View.GONE else View.VISIBLE
-        findViewById<TextView>(R.id.error).apply {
-            visibility = if (failed) View.VISIBLE else View.GONE
-            val error = s.optString("error").ifEmpty { "No details were recorded. See the step's log." }
-            if (text.toString() != error) text = error
+        val said = s.optString("message")
+        val speed = s.optLong("bytesPerSec")
+        val message = when {
+            failed || state == "done" || state == "cancelled" -> ""
+            said.isEmpty() -> stageText
+            speed > 0 -> "$said (${speed / MIB} MB/s)"
+            else -> said
         }
-        findViewById<Button>(R.id.copy_error).visibility = if (failed) View.VISIBLE else View.GONE
-        val bar = findViewById<LinearProgressIndicator>(R.id.bar)
         val total = s.optLong("totalBytes")
-        bar.isIndeterminate = state == "running" && total == 0L && !paused
-        if (total > 0) bar.setProgressCompat((1000 * s.optLong("doneBytes") / total).toInt(), true)
-        bar.visibility = if (state == "done" || state == "failed" || state == "cancelled") View.GONE else View.VISIBLE
-
-        renderSteps(s)
-        findViewById<Button>(R.id.launch).visibility = if (state == "done") View.VISIBLE else View.GONE
         val stopped = state == "failed" || state == "cancelled" || state == "interrupted"
-        findViewById<Button>(R.id.retry).visibility = if (stopped) View.VISIBLE else View.GONE
-        findViewById<Button>(R.id.retry).text = if (state == "failed") "Retry from the failed step" else "Resume"
-        findViewById<Button>(R.id.cancel).visibility = if (state == "running") View.VISIBLE else View.GONE
-        findViewById<Button>(R.id.pause).apply {
-            visibility = if (state == "running") View.VISIBLE else View.GONE
-            text = if (paused) "Resume" else "Pause"
-        }
-    }
-
-    private fun renderSteps(s: JSONObject) {
-        val container = findViewById<LinearLayout>(R.id.steps)
-        val steps = s.getJSONArray("steps")
-        if (rowsFor != s.optString("name")) {
-            rowsFor = s.optString("name")
-            rows.clear()
-            container.removeAllViews()
-            for (i in 0 until steps.length()) {
-                val st = steps.getJSONObject(i)
-                val row = layoutInflater.inflate(R.layout.create_step_row, container, false)
-                row.findViewById<TextView>(R.id.step_title).text = st.getString("title")
-                row.findViewById<Button>(R.id.step_log).setOnClickListener {
-                    CreateLogActivity.open(this, s.optString("name"), st.getString("key"))
+        progress = CreateProgressUi(
+            name = s.optString("name"),
+            subtitle = "${s.optString("device")}, iOS ${s.optString("ios")}",
+            nowStep = when {
+                state == "done" -> "All ${stepList.size} steps finished"
+                at >= 0 -> "Step ${at + 1} of ${stepList.size} \u00b7 ${stepList[at].optString("title")}"
+                else -> "Getting ready"
+            },
+            eta = when (state) {
+                "done" -> "Finished."
+                "failed" -> "Stopped with an error."
+                "cancelled" -> "Stopped. Resume it or delete it."
+                "interrupted" -> if (paused) "Paused. Tap Resume to carry on." else "Interrupted. Tap Resume to continue."
+                else -> {
+                    val running = if (paused) "Paused: tap Resume to carry on" else "Running"
+                    if (estimate.isEmpty()) "$running." else "$running. $estimate."
                 }
-                rows[st.getString("key")] = row
-                container.addView(row)
-            }
-        }
-        for (i in 0 until steps.length()) {
-            val st = steps.getJSONObject(i)
-            val row = rows[st.getString("key")] ?: continue
-            val state = st.getString("state")
-            val current = st.getString("key") == s.optString("step") && state == "running"
-            row.findViewById<TextView>(R.id.mark).apply {
-                text = when (state) {
-                    "done" -> "✓"
-                    "running" -> "▶"
-                    "failed" -> "✕"
-                    else -> "·"
-                }
-                setTextColor(
-                    MaterialColors.getColor(
-                        this,
-                        when (state) {
-                            "failed" -> androidx.appcompat.R.attr.colorError
-                            "done", "running" -> androidx.appcompat.R.attr.colorPrimary
-                            else -> com.google.android.material.R.attr.colorOnSurfaceVariant
-                        },
-                    ),
-                )
-            }
-            row.findViewById<TextView>(R.id.step_title).apply {
-                setTypeface(null, if (current || state == "failed") Typeface.BOLD else Typeface.NORMAL)
-                alpha = if (state == "pending") PENDING_ALPHA else 1f
-            }
-        }
+            },
+            hold = when (holdKey) {
+                "wifi" -> "On hold: waiting for Wi-Fi."
+                "network" -> "On hold: waiting for a connection."
+                "storage" -> "On hold: storage is low. $said"
+                "thermal" -> "On hold: the phone is cooling down."
+                else -> ""
+            },
+            showCellular = holdKey == "wifi",
+            thermal = when {
+                hot < 2 -> ""
+                hot == 2 -> "The phone is warm; this may be slower."
+                hot == 3 -> "The phone is hot; this will be slower."
+                else -> "The phone is overheating: let it cool down."
+            },
+            message = message,
+            error = if (failed) s.optString("error").ifEmpty { "No details were recorded. See the step's log." } else null,
+            barVisible = !(state == "done" || state == "failed" || state == "cancelled"),
+            fraction = if (total > 0) s.optLong("doneBytes").toFloat() / total else null,
+            busy = state == "running" && !paused,
+            steps = stepList.map { st ->
+                val key = st.getString("key")
+                val stepState = st.getString("state")
+                CreateStep(key, st.getString("title"), stepState, key == s.optString("step") && stepState == "running", stepTimes?.optString(key).orEmpty())
+            },
+            phases = progress.phases,
+            facts = progress.facts,
+            machine = progress.machine,
+            showLaunch = state == "done",
+            retryLabel = if (!stopped) null else if (failed) "Retry from the failed step" else "Resume",
+            showCancel = state == "running",
+            pauseLabel = if (state != "running") null else if (paused) "Resume" else "Pause",
+        )
     }
 
     // ------------------------------------------------------------------ the live panel
@@ -508,84 +467,41 @@ class CreateActivity : AppCompatActivity() {
     private fun objects(a: JSONArray?): List<JSONObject> =
         if (a == null) emptyList() else (0 until a.length()).map { a.getJSONObject(it) }
 
-    private fun fact(label: String, value: String, warn: Boolean): JSONObject =
-        JSONObject().put("label", label).put("value", value).put("warn", warn)
+    private fun facts(a: JSONArray?): List<Fact> =
+        objects(a).map { Fact(it.optString("label"), it.optString("value"), it.optBoolean("warn"), it.optBoolean("wide")) }
 
     /** Android's own numbers: the battery's temperature and its thermal status, in what it reports. */
-    private fun temperatureFacts(): List<JSONObject> {
+    private fun temperatureFacts(): List<Fact> {
         val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val tenths = battery?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE
         val temp = if (tenths == Int.MIN_VALUE) {
-            fact("Battery", "not reported", false)
+            Fact("Battery", "not reported")
         } else {
-            fact("Battery", String.format(Locale.US, "%.1f °C", tenths / 10.0), tenths >= HOT_BATTERY_TENTHS)
+            Fact("Battery", String.format(Locale.US, "%.1f °C", tenths / 10.0), tenths >= HOT_BATTERY_TENTHS)
         }
         val status = getSystemService(PowerManager::class.java).currentThermalStatus
         val names = arrayOf("normal", "light", "moderate", "severe", "critical", "emergency", "shutdown")
-        val thermal = fact("Thermal state", names.getOrElse(status) { "unknown" }, status >= PowerManager.THERMAL_STATUS_MODERATE)
+        val thermal = Fact("Thermal state", names.getOrElse(status) { "unknown" }, status >= PowerManager.THERMAL_STATUS_MODERATE)
         return listOf(temp, thermal)
     }
 
     private fun showLive(live: JSONObject) {
-        val facts = objects(live.optJSONArray("facts"))
-        renderFacts(findViewById(R.id.facts), facts)
-        stageText = facts.firstOrNull()?.optString("value").orEmpty()
-        renderFacts(
-            findViewById(R.id.machine),
-            objects(live.optJSONArray("vm")) + objects(live.optJSONArray("phone")) + temperatureFacts(),
-        )
+        val stepFacts = facts(live.optJSONArray("facts"))
+        stageText = stepFacts.firstOrNull()?.value.orEmpty()
         // The first boot's phases: what each took, how long the running one has run, and what it
         // last took on this phone, or that there is no estimate yet.
         val phases = live.optJSONArray("phases")
-        findViewById<TextView>(R.id.phases).apply {
-            val lines = (0 until (phases?.length() ?: 0)).map { phases!!.getString(it) }
-            visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE
-            val joined = lines.joinToString("\n")
-            if (text.toString() != joined) text = joined
-        }
-        val times = live.optJSONObject("stepTimes") ?: return
-        for ((key, row) in rows) {
-            row.findViewById<TextView>(R.id.step_time).text = times.optString(key)
-        }
-    }
-
-    private fun renderFacts(grid: GridLayout, facts: List<JSONObject>) {
-        val shape = facts.joinToString("|") { "${it.optString("label")}:${it.optBoolean("wide")}" }
-        if (grid.tag != shape) {
-            grid.tag = shape
-            grid.removeAllViews()
-            for (f in facts) {
-                val span = if (f.optBoolean("wide")) 2 else 1
-                grid.addView(
-                    TextView(this).apply { textSize = FACT_SP },
-                    GridLayout.LayoutParams(
-                        GridLayout.spec(GridLayout.UNDEFINED),
-                        GridLayout.spec(GridLayout.UNDEFINED, span, 1f),
-                    ).apply { width = 0 },
-                )
-            }
-        }
-        val dim = MaterialColors.getColor(grid, com.google.android.material.R.attr.colorOnSurfaceVariant)
-        val alert = MaterialColors.getColor(grid, androidx.appcompat.R.attr.colorError)
-        facts.forEachIndexed { i, f ->
-            val text = SpannableStringBuilder(f.optString("label"))
-            text.setSpan(ForegroundColorSpan(dim), 0, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            text.append("  ")
-            val start = text.length
-            text.append(f.optString("value"))
-            if (f.optBoolean("warn")) {
-                text.setSpan(ForegroundColorSpan(alert), start, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                text.setSpan(StyleSpan(Typeface.BOLD), start, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            }
-            (grid.getChildAt(i) as TextView).text = text
-        }
+        stepTimes = live.optJSONObject("stepTimes") ?: stepTimes
+        progress = progress.copy(
+            facts = stepFacts,
+            machine = facts(live.optJSONArray("vm")) + facts(live.optJSONArray("phone")) + temperatureFacts(),
+            phases = (0 until (phases?.length() ?: 0)).map { phases!!.getString(it) },
+        )
     }
 
     companion object {
         private const val MIB = 1024L * 1024
         private const val HOT_BATTERY_TENTHS = 430
-        private const val FACT_SP = 12f
-        private const val PENDING_ALPHA = 0.7f
 
         /** As the native side writes durations: "2 h 05 min", "12 min", "40 s". */
         fun durationText(secs: Long): String {

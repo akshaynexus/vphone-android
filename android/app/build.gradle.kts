@@ -1,5 +1,6 @@
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -32,6 +33,21 @@ android {
     buildFeatures {
         viewBinding = false
         buildConfig = true
+        compose = true
+    }
+
+    testOptions {
+        unitTests {
+            // The screenshot tests draw the real resources and theme (Robolectric).
+            isIncludeAndroidResources = true
+            all {
+                // Roborazzi writes PNGs only when recording; they land under android/build, which is ignored.
+                it.systemProperty("roborazzi.test.record", "true")
+                it.systemProperty("vphone.screenshots", rootDir.resolve("build/ui-screenshots").path)
+                it.systemProperty("robolectric.graphicsMode", "NATIVE")
+                it.maxHeapSize = "3g"
+            }
+        }
     }
 
     packaging {
@@ -44,8 +60,25 @@ android {
 }
 
 dependencies {
-    // The wizard only: the VM screen stays framework-only.
-    implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("androidx.activity:activity-ktx:1.10.1")
-    implementation("com.google.android.material:material:1.12.0")
+    // The UI is Jetpack Compose with Material 3 Expressive. The BOM pins Compose itself;
+    // material3 is pinned above the BOM's 1.4.0, which has no expressive components.
+    implementation(platform("androidx.compose:compose-bom:2026.09.00"))
+    implementation("androidx.compose.material3:material3:1.5.0-beta02")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material:material-icons-core")
+    // Material's shapes as paths, for the VM screen's floating button, which is a plain View.
+    implementation("androidx.graphics:graphics-shapes:1.0.1")
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.core:core-ktx:1.19.1")
+    // The creation log's rows: a RecyclerView paged from the Rust log view.
+    implementation("androidx.recyclerview:recyclerview:1.4.0")
+
+    // Screenshots of the screens on the JVM, with fake state: scripts/ui-screenshots.sh.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.17")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi:1.77.0")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:1.77.0")
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

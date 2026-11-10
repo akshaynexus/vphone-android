@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Vphone.Create" parent="Theme.Material3.DayNight.NoActionBar">
-        <item name="android:statusBarColor">?attr/colorSurface</item>
-        <item name="android:windowLightStatusBar">?attr/isLightTheme</item>
+    <!-- The window behind the Compose screens: they draw their own Material 3 theme, edge to edge.
+         This only sets what shows before the first frame, and the system bars' icons. -->
+    <style name="Theme.Vphone" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
     </style>
 </resources>

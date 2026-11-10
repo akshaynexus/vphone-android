@@ -1,16 +1,17 @@
 package com.vphone.android
 
-import android.app.Activity
-import android.graphics.Color
-import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.WindowManager
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.vphone.android.ui.CreateVmVitalsScreen
+import com.vphone.android.ui.VphoneTheme
 import org.json.JSONObject
 import java.io.File
 import java.util.Locale
@@ -24,10 +25,10 @@ object CreateVmNative {
 }
 
 /** What the VM's process is doing during setup: its vitals and each thread's CPU use. */
-class CreateVmScreen : Activity() {
+class CreateVmScreen : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
-    private lateinit var status: TextView
-    private lateinit var threads: TextView
+    private var status by mutableStateOf("")
+    private var threads by mutableStateOf("")
 
     private val poll = object : Runnable {
         override fun run() {
@@ -37,46 +38,12 @@ class CreateVmScreen : Activity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val dp = resources.displayMetrics.density
-        status = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 15f
-            setTextIsSelectable(true)
+        setContent {
+            VphoneTheme { CreateVmVitalsScreen(status, threads, onBack = ::finish) }
         }
-        threads = TextView(this).apply {
-            setTextColor(0xFFCCCCCC.toInt())
-            typeface = Typeface.MONOSPACE
-            textSize = 12f
-            setTextIsSelectable(true)
-            setPadding(0, (16 * dp).toInt(), 0, (16 * dp).toInt())
-        }
-        val note = TextView(this).apply {
-            setTextColor(0xFFCCCCCC.toInt())
-            textSize = 12f
-            text = "Setup has no live picture yet. Each thread's history and native stacks are in Live log under VM."
-        }
-        val close = Button(this).apply {
-            text = "Back to progress"
-            isAllCaps = false
-            setOnClickListener { finish() }
-        }
-        val pad = (16 * dp).toInt()
-        val column = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            addView(status)
-            addView(threads)
-            addView(note)
-            addView(close)
-        }
-        val root = ScrollView(this).apply {
-            setBackgroundColor(Color.BLACK)
-            addView(column)
-        }
-        setContentView(root)
-        App.fitSystemBars(root)
     }
 
     override fun onStart() {
@@ -92,7 +59,7 @@ class CreateVmScreen : Activity() {
     private fun refresh() {
         val text = CreateVmNative.vitals()
         val v = if (text.isEmpty()) JSONObject() else runCatching { JSONObject(text) }.getOrDefault(JSONObject())
-        status.text = if (!v.optBoolean("alive")) {
+        status = if (!v.optBoolean("alive")) {
             "No VM is running at the moment."
         } else {
             buildString {
@@ -112,6 +79,6 @@ class CreateVmScreen : Activity() {
             }
         }
         val list = runCatching { File(filesDir, "cv/vm-threads.txt").readText() }.getOrDefault("")
-        threads.text = if (list.isEmpty()) "No thread data yet." else list
+        threads = if (list.isEmpty()) "No thread data yet." else list
     }
 }

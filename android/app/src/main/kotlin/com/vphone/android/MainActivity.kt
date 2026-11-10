@@ -1,64 +1,70 @@
 package com.vphone.android
 
 import android.Manifest
-import android.app.Activity
 import android.app.ActivityManager
-import android.app.AlertDialog
-import android.app.PendingIntent
 import android.app.ApplicationExitInfo
+import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
-import android.text.InputType
-import android.view.View
-import android.view.WindowInsets
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ProgressBar
-import android.widget.ScrollView
-import android.widget.Spinner
-import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.vphone.android.ui.AppDialog
+import com.vphone.android.ui.DialogAction
+import com.vphone.android.ui.DialogHost
+import com.vphone.android.ui.DialogSpec
+import com.vphone.android.ui.FailureUi
+import com.vphone.android.ui.MainActions
+import com.vphone.android.ui.MainScreen
+import com.vphone.android.ui.MainUi
+import com.vphone.android.ui.ProgressUi
+import com.vphone.android.ui.UpdateUi
+import com.vphone.android.ui.VmCardUi
+import com.vphone.android.ui.VmStatus
+import com.vphone.android.ui.VphoneTheme
+import com.vphone.android.ui.leftText
+import com.vphone.android.ui.rateText
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** The VMs in app-specific storage, importing one, and what happened to the last run. */
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
-    private lateinit var banner: TextView
-    private lateinit var active: Button
-    private lateinit var activeLog: Button
-    private lateinit var importButton: Button
-    private lateinit var resumeCreate: Button
-    private lateinit var importRow: LinearLayout
-    private lateinit var importBar: ProgressBar
-    private lateinit var importLabel: TextView
-    private lateinit var list: LinearLayout
+    private val worker = Executors.newSingleThreadExecutor()
+
+    /** What the screen shows: built by [refresh] every second, drawn by [MainScreen]. */
+    private var ui by mutableStateOf(MainUi(BuildConfig.VERSION_NAME))
+    private val dialogs = DialogHost()
+
+    /** The VMs as the native side listed them, before what each is doing is added. */
+    private var listed: List<VmCardUi> = emptyList()
+    private var device = ""
     private var importWasActive = false
-    private lateinit var transferRow: LinearLayout
-    private lateinit var transferLabel: TextView
-    private lateinit var transferBar: ProgressBar
+    private var importSample: Pair<Long, Long>? = null
+    private var importRate = 0L
     private var transferWasActive = false
     private var transferSample: Pair<Long, Long>? = null
     /** The VM a "Save to…" is choosing a place for. */
     private var savingVm = ""
     private var lastRunLog = ""
     private var storageGeneration = 0L
-    private lateinit var updateRow: LinearLayout
-    private lateinit var updateText: TextView
-    private lateinit var updateBar: ProgressBar
-    private lateinit var updatePrimary: Button
-    private lateinit var updateSecondary: Button
     private var shownUpdate: Updater.State? = null
+    /** The creation under way, as its status file had it at the last poll. */
+    @Volatile private var creation: VmStatus.Creating? = null
+    private var creationFor = ""
+    private val creationPolling = AtomicBoolean(false)
 
     private val poll = object : Runnable {
         override fun run() {
@@ -68,129 +74,54 @@ class MainActivity : Activity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        banner = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setBackgroundColor(0xFF7A1F1F.toInt())
-            setPadding(32, 24, 32, 24)
-            visibility = View.GONE
-            setOnClickListener { if (lastRunLog.isNotEmpty()) VmLogActivity.open(this@MainActivity, lastRunLog) }
-        }
-        active = Button(this).apply {
-            isAllCaps = false
-            visibility = View.GONE
-            setOnClickListener { startActivity(Intent(this@MainActivity, VmActivity::class.java)) }
-        }
-        activeLog = Button(this).apply {
-            text = "Its log"
-            isAllCaps = false
-            visibility = View.GONE
-            setOnClickListener { VmLogActivity.open(this@MainActivity) }
-        }
-        importButton = Button(this).apply {
-            text = "Import a VM"
-            isAllCaps = false
-            setOnClickListener { askImport() }
-        }
-        val createButton = Button(this).apply {
-            text = "Create a VM on this phone"
-            isAllCaps = false
-            setOnClickListener { startActivity(Intent(this@MainActivity, CreateActivity::class.java)) }
-        }
-        resumeCreate = Button(this).apply {
-            isAllCaps = false
-            visibility = View.GONE
-            setOnClickListener { startActivity(Intent(this@MainActivity, CreateActivity::class.java)) }
-        }
-        importLabel = TextView(this)
-        importBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
-        importRow = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            addView(importLabel)
-            addView(importBar)
-            addView(Button(this@MainActivity).apply {
-                text = "Cancel import"
-                isAllCaps = false
-                setOnClickListener { VmService.cancelImport() }
-            })
-        }
-        transferLabel = TextView(this)
-        transferBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
-        transferRow = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            addView(transferLabel)
-            addView(transferBar)
-            addView(Button(this@MainActivity).apply {
-                text = "Cancel"
-                isAllCaps = false
-                setOnClickListener { Native.shareCancel() }
-            })
-        }
-        list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        updateText = TextView(this)
-        updateBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
-        updatePrimary = Button(this).apply { isAllCaps = false }
-        updateSecondary = Button(this).apply { isAllCaps = false }
-        updateRow = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            setPadding(0, 16, 0, 16)
-            addView(updateText)
-            addView(updateBar)
-            addView(LinearLayout(this@MainActivity).apply {
-                addView(updatePrimary)
-                addView(updateSecondary)
-            })
-        }
-        val info = JSONObject(Native.deviceInfo())
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 32, 32, 32)
-            addView(TextView(this@MainActivity).apply {
-                text = "vphone ${BuildConfig.VERSION_NAME}"
-                textSize = 28f
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = "${info.getInt("cpus")} CPU cores, ${info.getLong("totalMib") / 1024} GiB RAM, ${info.getLong("availableMib") / 1024} GiB free"
-            })
-            addView(banner)
-            addView(updateRow)
-            addView(active)
-            addView(activeLog)
-            addView(resumeCreate)
-            addView(createButton)
-            addView(importButton)
-            addView(Button(this@MainActivity).apply {
-                text = "Storage"
-                isAllCaps = false
-                setOnClickListener { startActivity(Intent(this@MainActivity, StorageActivity::class.java)) }
-            })
-            addView(Button(this@MainActivity).apply {
-                text = "Check for updates"
-                isAllCaps = false
-                setOnClickListener { Updater.check(this@MainActivity, manual = true) }
-            })
-            addView(importRow)
-            addView(transferRow)
-            addView(list)
-        }
-        val scroll = ScrollView(this).apply {
-            addView(content)
-            setOnApplyWindowInsetsListener { v, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars())
-                v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-                insets
+        val actions = MainActions(
+            boot = ::tryBoot,
+            open = { startActivity(Intent(this, VmActivity::class.java)) },
+            continueCreate = { startActivity(Intent(this, CreateActivity::class.java)) },
+            settings = { name -> startActivity(Intent(this, VmSettingsActivity::class.java).putExtra(VmSettingsActivity.EXTRA_VM, name)) },
+            send = ::askSend,
+            log = ::openLog,
+            delete = { name -> startActivity(Intent(this, StorageActivity::class.java).putExtra(StorageActivity.EXTRA_DELETE, name)) },
+            create = { startActivity(Intent(this, CreateActivity::class.java)) },
+            importFile = ::pickVmFile,
+            importUsb = ::usbImport,
+            importFolder = ::pickFolder,
+            storage = { startActivity(Intent(this, StorageActivity::class.java)) },
+            checkUpdates = { Updater.check(this, manual = true) },
+            updatePrimary = ::updatePrimary,
+            updateNotes = {
+                when (val s = Updater.state) {
+                    is Updater.State.Available -> notes(s.release)
+                    is Updater.State.Ready -> notes(s.release)
+                    else -> Unit
+                }
+            },
+            updateCancel = { Updater.cancel() },
+            cancelImport = { VmService.cancelImport() },
+            cancelTransfer = { Native.shareCancel() },
+            failureLog = { if (lastRunLog.isNotEmpty()) VmLogActivity.open(this, lastRunLog) },
+            copy = { App.copy(this, it) },
+        )
+        setContent {
+            VphoneTheme {
+                MainScreen(ui, actions)
+                dialogs.current?.let { spec ->
+                    AppDialog(spec, onCopy = { App.copy(this, it) }, onDismiss = { dialogs.current = null })
+                }
             }
         }
-        setContentView(scroll)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
         registerReceiver(usbPermission, android.content.IntentFilter(UsbVmSource.ACTION_PERMISSION), RECEIVER_NOT_EXPORTED)
         handleIntent(intent)
     }
+
+    private fun ask(title: String, message: String) = dialogs.show(DialogSpec(title, message))
+
+    private fun fail(title: String, message: String) = dialogs.show(DialogSpec.error(title, message))
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -219,20 +150,11 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun askImport() {
-        AlertDialog.Builder(this)
-            .setTitle("Import a VM")
-            .setItems(arrayOf("A .vphone file (sent from another phone)", "From a phone plugged in by USB", "A VM folder")) { _, which ->
-                when (which) {
-                    0 -> startActivityForResult(
-                        Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"),
-                        PICK_VM_FILE,
-                    )
-                    1 -> usbImport()
-                    else -> pickFolder()
-                }
-            }
-            .show()
+    private fun pickVmFile() {
+        startActivityForResult(
+            Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"),
+            PICK_VM_FILE,
+        )
     }
 
     private val usbPermission = object : android.content.BroadcastReceiver() {
@@ -250,27 +172,28 @@ class MainActivity : Activity() {
     private fun usbImport() {
         val devices = UsbVmSource.devices(this)
         if (devices.isEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle("No phone found on USB")
-                .setMessage(
-                    "1. On the sending phone, open the VM list, tap Send, then Save to… and choose Downloads.\n" +
-                        "2. Connect the two phones with a USB-C cable.\n" +
-                        "3. On the sending phone, tap the USB notification and choose File transfer. Keep it unlocked.\n" +
-                        "4. On this phone, if Android asks, choose USB controlled by: This device.\n" +
-                        "5. Tap Import a VM → From a phone plugged in by USB again.",
-                )
-                .setPositiveButton("OK", null)
-                .show()
+            ask(
+                "No phone found on USB",
+                "1. On the sending phone, open the VM list, tap Send, then Save to… and choose Downloads.\n" +
+                    "2. Connect the two phones with a USB-C cable.\n" +
+                    "3. On the sending phone, tap the USB notification and choose File transfer. Keep it unlocked.\n" +
+                    "4. On this phone, if Android asks, choose USB controlled by: This device.\n" +
+                    "5. Tap + → Import from a phone by USB again.",
+            )
             return
         }
         if (devices.size == 1) {
             usbAccess(devices[0])
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("Which device?")
-            .setItems(devices.map { UsbVmSource.label(it) }.toTypedArray()) { _, i -> usbAccess(devices[i]) }
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Which device?",
+                items = devices.map { d -> DialogAction(UsbVmSource.label(d)) { usbAccess(d) } },
+                confirm = null,
+                dismiss = DialogAction("Cancel"),
+            ),
+        )
     }
 
     private fun usbAccess(device: android.hardware.usb.UsbDevice) {
@@ -294,33 +217,39 @@ class MainActivity : Activity() {
             }
             handler.post {
                 result.exceptionOrNull()?.let {
-                    AlertDialog.Builder(this).setTitle("Cannot read ${UsbVmSource.label(device)}").setMessage(it.message ?: it.toString())
-                        .setPositiveButton("OK", null).setNeutralButton("Copy") { _, _ -> App.copy(this, it.message ?: it.toString()) }.show()
+                    fail("Cannot read ${UsbVmSource.label(device)}", it.message ?: it.toString())
                     return@post
                 }
                 val files = result.getOrThrow()
                 if (files.isEmpty()) {
-                    AlertDialog.Builder(this).setTitle("No VM files on ${UsbVmSource.label(device)}")
-                        .setMessage("No .vphone file was found in its shared folders. On that phone, use Send → Save to… → Downloads, then try again.")
-                        .setPositiveButton("OK", null).show()
+                    ask(
+                        "No VM files on ${UsbVmSource.label(device)}",
+                        "No .vphone file was found in its shared folders. On that phone, use Send → Save to… → Downloads, then try again.",
+                    )
                     return@post
                 }
-                AlertDialog.Builder(this)
-                    .setTitle("Import from ${UsbVmSource.label(device)}")
-                    .setItems(files.map { "${it.name}  (${it.size / MIB} MB, ${it.folder})" }.toTypedArray()) { _, i ->
-                        if (JSONObject(Native.shareProgress()).optBoolean("active")) {
-                            Toast.makeText(this, "Another VM is being sent or received", Toast.LENGTH_LONG).show()
-                        } else {
-                            VmService.receiveVmFromUsb(this, files[i])
-                        }
-                    }
-                    .setNegativeButton("Cancel", null)
-                    .show()
+                dialogs.show(
+                    DialogSpec(
+                        "Import from ${UsbVmSource.label(device)}",
+                        items = files.map { f ->
+                            DialogAction("${f.name}  (${f.size / MIB} MB, ${f.folder})") {
+                                if (JSONObject(Native.shareProgress()).optBoolean("active")) {
+                                    Toast.makeText(this, "Another VM is being sent or received", Toast.LENGTH_LONG).show()
+                                } else {
+                                    VmService.receiveVmFromUsb(this, f)
+                                }
+                            }
+                        },
+                        confirm = null,
+                        dismiss = DialogAction("Cancel"),
+                    ),
+                )
             }
         }.start()
     }
 
     override fun onDestroy() {
+        worker.shutdown()
         runCatching { unregisterReceiver(usbPermission) }
         super.onDestroy()
     }
@@ -330,21 +259,23 @@ class MainActivity : Activity() {
             contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
                 ?.use { if (it.moveToFirst()) it.getString(0) else null }
         }.getOrNull() ?: uri.lastPathSegment ?: "the file"
-        AlertDialog.Builder(this)
-            .setTitle("Import $name?")
-            .setMessage("It is added to your VMs. A VM with the same name is kept, and this one gets a new name.")
-            .setPositiveButton("Import") { _, _ ->
-                runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-                VmService.receiveVm(this, uri)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Import $name?",
+                "It is added to your VMs. A VM with the same name is kept, and this one gets a new name.",
+                confirm = DialogAction("Import") {
+                    runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                    VmService.receiveVm(this, uri)
+                },
+                dismiss = DialogAction("Cancel"),
+            ),
+        )
     }
 
     /** Send `vm`: Quick Share and other apps, or a file in a place the person picks. */
     private fun askSend(vm: String) {
         val state = App.state()
-        val running = state.optString("vm") == vm && state.getString("phase") in setOf("preparing", "booting", "unlocking", "running", "stopping")
+        val running = state.optString("vm") == vm && state.getString("phase") in UP
         val reason = when {
             running -> "$vm is running. Shut it down first, so its disk is complete."
             Native.createPending() == vm -> "$vm is still being created. Finish creating it first."
@@ -352,52 +283,59 @@ class MainActivity : Activity() {
             else -> ""
         }
         if (reason.isNotEmpty()) {
-            AlertDialog.Builder(this).setTitle("Cannot send $vm").setMessage(reason).setPositiveButton("OK", null).show()
+            ask("Cannot send $vm", reason)
             return
         }
         val estimate = JSONObject(Native.shareEstimate(vm))
         estimate.optString("error").takeIf { it.isNotEmpty() }?.let {
-            AlertDialog.Builder(this).setTitle("Cannot send $vm").setMessage(it).setPositiveButton("OK", null).show()
+            fail("Cannot send $vm", it)
             return
         }
         val dataMb = estimate.optLong("dataBytes") / MIB
         val freeMb = (VmService.shareDir(this).apply { mkdirs() }.usableSpace) / MIB
-        AlertDialog.Builder(this)
-            .setTitle("Send $vm")
-            .setMessage(
+        dialogs.show(
+            DialogSpec(
+                "Send $vm",
                 "It holds about $dataMb MB of data, compressed as it is packed into one .vphone file. " +
                     "Sharing packs it on this phone first ($freeMb MB free there); saving writes it straight to the place you pick.\n\n" +
                     "Logs and this phone's settings stay here; the other phone uses its own.",
-            )
-            .setPositiveButton("Share…") { _, _ -> VmService.sendVm(this, vm, null) }
-            .setNeutralButton("Save to…") { _, _ ->
-                savingVm = vm
-                startActivityForResult(
-                    Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-                        .setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, "$vm.vphone"),
-                    SAVE_VM_FILE,
-                )
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+                confirm = DialogAction("Share…") { VmService.sendVm(this, vm, null) },
+                neutral = DialogAction("Save to…") {
+                    savingVm = vm
+                    startActivityForResult(
+                        Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                            .setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, "$vm.vphone"),
+                        SAVE_VM_FILE,
+                    )
+                },
+                dismiss = DialogAction("Cancel"),
+            ),
+        )
     }
 
-    /** The send or receive row, and what to do when one ends. */
-    private fun showTransfer() {
-        val p = JSONObject(Native.shareProgress())
+    /** The send or receive card, and what to do when one ends. `p` is `Native.shareProgress()`. */
+    private fun transferUi(p: JSONObject): ProgressUi? {
         val active = p.optBoolean("active")
-        transferRow.visibility = if (active) View.VISIBLE else View.GONE
+        var card: ProgressUi? = null
         if (active) {
             val done = p.optLong("doneBytes")
             val total = p.optLong("totalBytes")
             val now = System.currentTimeMillis()
             val rate = transferSample?.let { (t, d) -> if (now > t && done >= d) (done - d) * 1000 / (now - t) else 0 } ?: 0
             transferSample = now to done
-            val left = if (rate > 0 && total > done) ", about ${(total - done) / rate / 60} min ${(total - done) / rate % 60} s left" else ""
-            val verb = if (p.optString("op") == "import") "Receiving" else "Packing"
-            transferBar.progress = if (total > 0) (1000 * done / total).toInt() else 0
-            transferLabel.text = "$verb ${p.optString("name")} (${p.optString("file")}): ${done / MIB} of ${total / MIB} MB, " +
-                "${rate / MIB} MB/s$left; file so far ${p.optLong("archiveBytes") / MIB} MB"
+            val receiving = p.optString("op") == "import"
+            card = ProgressUi(
+                title = "${if (receiving) "Receiving" else "Packing"} ${p.optString("name")}",
+                detail = p.optString("file"),
+                fraction = if (total > 0) done.toFloat() / total else null,
+                stats = listOf(
+                    "${done / MIB} of ${total / MIB} MB",
+                    rateText(rate),
+                    if (rate > 0 && total > done) leftText((total - done) / rate) else "",
+                    "file so far ${p.optLong("archiveBytes") / MIB} MB",
+                ),
+                cancelLabel = "Cancel",
+            )
         } else {
             transferSample = null
         }
@@ -405,12 +343,7 @@ class MainActivity : Activity() {
             VmService.lastTransfer?.let { t ->
                 VmService.lastTransfer = null
                 when {
-                    t.error.isNotEmpty() -> AlertDialog.Builder(this)
-                        .setTitle(if (t.op == "import") "The VM did not import" else "${t.name} was not sent")
-                        .setMessage(t.error)
-                        .setPositiveButton("OK", null)
-                        .setNeutralButton("Copy") { _, _ -> App.copy(this, t.error) }
-                        .show()
+                    t.error.isNotEmpty() -> fail(if (t.op == "import") "The VM did not import" else "${t.name} was not sent", t.error)
                     t.op == "import" -> {
                         Toast.makeText(this, "${t.name} is ready to boot", Toast.LENGTH_LONG).show()
                         showVms()
@@ -421,11 +354,14 @@ class MainActivity : Activity() {
             }
         }
         transferWasActive = active
+        return card
     }
 
     override fun onStart() {
         super.onStart()
         noteDeadProcess()
+        val info = JSONObject(Native.deviceInfo())
+        device = "${info.getInt("cpus")} CPU cores, ${info.getLong("totalMib") / 1024} GiB RAM, ${info.getLong("availableMib") / 1024} GiB free"
         showVms()
         Updater.checkIfDue(this)
         handler.post(poll)
@@ -469,36 +405,52 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
-        showUpdate()
-        showTransfer()
+        val update = updateUi()
+        val share = JSONObject(Native.shareProgress())
+        val transfer = transferUi(share)
         val cleaned = StorageNative.generation()
         if (cleaned != storageGeneration) {
             storageGeneration = cleaned
             showVms()
         }
         val creating = Native.createPending()
-        resumeCreate.visibility = if (creating.isEmpty()) View.GONE else View.VISIBLE
-        if (creating.isNotEmpty()) resumeCreate.text = "Creating $creating: continue"
+        pollCreation(creating)
         val state = App.state()
         val phase = state.getString("phase")
-        val vmUp = phase in setOf("preparing", "booting", "unlocking", "running", "stopping")
-        active.visibility = if (vmUp) View.VISIBLE else View.GONE
-        activeLog.visibility = active.visibility
-        active.text = "Return to ${state.optString("vm")} (${VmService.phaseText(phase)})"
+        val vmUp = phase in UP
+        val runningVm = if (vmUp) state.optString("vm") else ""
 
         val progress = JSONObject(Native.importProgress())
         val importing = progress.optBoolean("active")
-        importRow.visibility = if (importing) View.VISIBLE else View.GONE
-        importButton.isEnabled = !importing
+        var folderImport: ProgressUi? = null
         if (importing) {
             val total = progress.optLong("totalBytes")
             val done = progress.optLong("doneBytes")
-            importBar.progress = if (total > 0) (1000 * done / total).toInt() else 0
-            importLabel.text = "${progress.optString("name")}: ${progress.optString("file")}, ${done / MIB} of ${total / MIB} MiB"
+            val now = System.currentTimeMillis()
+            importSample?.let { (t, d) -> if (now > t && done >= d) importRate = (done - d) * 1000 / (now - t) }
+            importSample = now to done
+            folderImport = ProgressUi(
+                title = "Importing ${progress.optString("name")}",
+                detail = progress.optString("file"),
+                fraction = if (total > 0) done.toFloat() / total else null,
+                stats = listOf(
+                    "${done / MIB} of ${total / MIB} MiB",
+                    rateText(importRate),
+                    if (importRate > 0 && total > done) leftText((total - done) / importRate) else "",
+                ),
+                cancelLabel = "Cancel import",
+            )
+        } else {
+            importSample = null
+            importRate = 0
         }
         if (importWasActive && !importing) {
             VmService.lastImportResult?.let {
-                Toast.makeText(this, it.ifEmpty { "Import finished" }, Toast.LENGTH_LONG).show()
+                if (it.isEmpty()) {
+                    Toast.makeText(this, "Import finished", Toast.LENGTH_LONG).show()
+                } else {
+                    fail("The VM did not import", it)
+                }
             }
             showVms()
         }
@@ -507,102 +459,160 @@ class MainActivity : Activity() {
         val last = Native.lastRun()
         val run = if (last.isEmpty()) JSONObject() else JSONObject(last)
         val showRun = !vmUp && (run.optString("phase") in setOf("failed", "died") || (run.optString("phase") == "exited" && run.optInt("code", 0) != 0))
-        banner.visibility = if (showRun) View.VISIBLE else View.GONE
+        var failure: FailureUi? = null
         if (showRun) {
             lastRunLog = run.optString("logPath")
-            banner.text = "${run.optString("vm")}: ${run.optString("message")}" + if (lastRunLog.isNotEmpty()) "\nTap for the log." else ""
+            failure = FailureUi(run.optString("vm"), run.optString("message"), lastRunLog.isNotEmpty())
+        }
+
+        // What each VM is doing; one that is up or being made but not listed still gets its card.
+        val started = state.optLong("startedMs")
+        val running = VmStatus.Running(
+            VmService.phaseText(phase),
+            if (started > 0 && phase in TIMED) VmLogActivity.clock((System.currentTimeMillis() - started) / 1000) else "",
+            phase == "running",
+        )
+        val making = if (creating.isEmpty()) null else creation?.takeIf { creationFor == creating } ?: VmStatus.Creating("getting ready", null, false)
+        val sendingVm = if (share.optBoolean("active") && share.optString("op") != "import") share.optString("name") else ""
+        val sending = VmStatus.Sending(transfer?.fraction)
+        var vms = listed.map { vm ->
+            when (vm.name) {
+                runningVm -> vm.copy(status = running)
+                creating -> vm.copy(status = making!!)
+                sendingVm -> vm.copy(status = sending)
+                else -> vm
+            }
+        }
+        if (creating.isNotEmpty() && vms.none { it.name == creating }) vms = listOf(VmCardUi(creating, status = making!!)) + vms
+        if (runningVm.isNotEmpty() && vms.none { it.name == runningVm }) vms = listOf(VmCardUi(runningVm, status = running)) + vms
+        vms = vms.sortedBy {
+            when (it.status) {
+                is VmStatus.Running -> 0
+                is VmStatus.Creating -> 1
+                else -> 2
+            }
+        }
+        ui = MainUi(
+            version = BuildConfig.VERSION_NAME,
+            device = device,
+            vms = vms,
+            vmsPath = "${getExternalFilesDir(null)}/vms/<name>/",
+            failure = failure,
+            update = update,
+            folderImport = folderImport,
+            transfer = transfer,
+        )
+    }
+
+    /** The creation's step and progress for its card: file work, so off the main thread. */
+    private fun pollCreation(name: String) {
+        if (name.isEmpty()) {
+            creation = null
+            creationFor = ""
+            return
+        }
+        if (!creationPolling.compareAndSet(false, true)) return
+        worker.execute {
+            val s = runCatching { JSONObject(Native.createStatus(name)) }.getOrNull()
+            creationPolling.set(false)
+            if (s == null) return@execute
+            val made = creationStatus(s)
+            handler.post {
+                creation = made
+                creationFor = name
+            }
         }
     }
 
-    /** The update row: what was found, the download's progress, and the next step. */
-    private fun showUpdate() {
+    private fun creationStatus(s: JSONObject): VmStatus.Creating {
+        val state = s.optString("state")
+        val all = s.optJSONArray("steps")
+        val steps = (0 until (all?.length() ?: 0)).map { all!!.getJSONObject(it) }
+        val at = steps.indexOfFirst { it.optString("key") == s.optString("step") }
+        val step = if (at >= 0) "step ${at + 1} of ${steps.size}, ${steps[at].optString("title")}" else "getting ready"
+        val total = s.optLong("totalBytes")
+        val left = s.optLong("etaSecs")
+        val text = when (state) {
+            "done" -> "all ${steps.size} steps finished"
+            "failed" -> "$step failed"
+            "cancelled", "interrupted" -> "$step, waiting to be resumed"
+            else -> if (left > 0) "$step, about ${CreateActivity.durationText(left)} left" else step
+        }
+        return VmStatus.Creating(
+            text = text,
+            fraction = if (total > 0) s.optLong("doneBytes").toFloat() / total else null,
+            paused = s.optBoolean("paused") || state in setOf("cancelled", "interrupted", "done"),
+            failed = state == "failed",
+        )
+    }
+
+    /** The update card: what was found, the download's progress, and the next step. */
+    private fun updateUi(): UpdateUi {
         Updater.pendingConfirm?.let {
             Updater.pendingConfirm = null
             startActivity(it)
         }
         val s = Updater.state
-        if (s === shownUpdate && s !is Updater.State.Downloading) return
         val first = shownUpdate
         shownUpdate = s
-        fun buttons(primary: String?, onPrimary: () -> Unit, secondary: String? = null, onSecondary: () -> Unit = {}) {
-            updatePrimary.visibility = if (primary == null) View.GONE else View.VISIBLE
-            updatePrimary.text = primary
-            updatePrimary.setOnClickListener { onPrimary() }
-            updateSecondary.visibility = if (secondary == null) View.GONE else View.VISIBLE
-            updateSecondary.text = secondary
-            updateSecondary.setOnClickListener { onSecondary() }
-        }
-        updateRow.visibility = View.VISIBLE
-        updateBar.visibility = View.GONE
-        when (s) {
-            is Updater.State.Idle -> updateRow.visibility = View.GONE
-            is Updater.State.Checking -> {
-                updateText.text = "Checking for updates"
-                buttons(null, {})
-            }
+        return when (s) {
+            is Updater.State.Idle -> UpdateUi.Hidden
+            is Updater.State.Checking -> UpdateUi.Checking
             is Updater.State.UpToDate -> {
-                updateRow.visibility = View.GONE
-                if (s.manual && first !is Updater.State.UpToDate) {
+                if (s.manual && first !== s) {
                     Toast.makeText(this, "vphone ${BuildConfig.VERSION_NAME} is the newest release", Toast.LENGTH_SHORT).show()
                 }
+                UpdateUi.Hidden
             }
-            is Updater.State.Available -> {
-                updateText.text = "vphone ${s.release.version} is available (${s.release.size / MIB} MB)"
-                buttons("Download and install", { Updater.download(this, s.release) }, "What's new", { notes(s.release) })
-            }
-            is Updater.State.Downloading -> {
-                updateBar.visibility = View.VISIBLE
-                updateBar.progress = if (s.total > 0) (1000 * s.done / s.total).toInt() else 0
-                val left = if (s.bytesPerSec > 0 && s.total > s.done) ", ${(s.total - s.done) / s.bytesPerSec} s left" else ""
-                updateText.text = "Downloading ${s.release.version}: ${s.done / MIB} of ${s.total / MIB} MB, " +
-                    "${s.bytesPerSec / MIB} MB/s$left"
-                if (first !is Updater.State.Downloading) buttons("Cancel", { Updater.cancel() })
-            }
-            is Updater.State.Ready -> {
-                updateText.text = "vphone ${s.release.version} is downloaded"
-                buttons("Install", { askInstall(s.release, s.apk) }, "What's new", { notes(s.release) })
-            }
-            is Updater.State.Installing -> {
-                updateText.text = "Installing ${s.release.version}: the app restarts when it is done"
-                buttons(null, {})
-            }
+            is Updater.State.Available -> UpdateUi.Available(s.release.version, s.release.size / MIB)
+            is Updater.State.Downloading -> UpdateUi.Downloading(s.release.version, s.done, s.total, s.bytesPerSec)
+            is Updater.State.Ready -> UpdateUi.Ready(s.release.version)
+            is Updater.State.Installing -> UpdateUi.Installing(s.release.version)
+            is Updater.State.Failed -> UpdateUi.Failed(s.message, s.release != null)
+        }
+    }
+
+    /** The update card's main button, for the state the updater is in. */
+    private fun updatePrimary() {
+        when (val s = Updater.state) {
+            is Updater.State.Available -> Updater.download(this, s.release)
+            is Updater.State.Ready -> askInstall(s.release, s.apk)
             is Updater.State.Failed -> {
-                updateText.text = s.message
-                updateText.setTextIsSelectable(true)
                 val r = s.release
-                if (r != null) {
-                    buttons("Download", { Updater.download(this, r) }, "Copy error", { App.copy(this, s.message) })
-                } else {
-                    buttons("Try again", { Updater.check(this, manual = true) }, "Copy error", { App.copy(this, s.message) })
-                }
+                if (r != null) Updater.download(this, r) else Updater.check(this, manual = true)
             }
+            else -> Unit
         }
     }
 
     private fun notes(release: Updater.Release) {
-        AlertDialog.Builder(this)
-            .setTitle("vphone ${release.version}")
-            .setMessage(release.notes.ifEmpty { "No notes." })
-            .setPositiveButton("Close", null)
-            .setNeutralButton("Open on GitHub") { _, _ -> startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.page))) }
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "vphone ${release.version}",
+                release.notes.ifEmpty { "No notes." },
+                confirm = DialogAction("Close"),
+                neutral = DialogAction("Open on GitHub") { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.page))) },
+            ),
+        )
     }
 
     /** Installing replaces the app, which ends whatever its processes are running. */
     private fun askInstall(release: Updater.Release, apk: java.io.File) {
         if (!Updater.canInstall(this)) {
-            AlertDialog.Builder(this)
-                .setTitle("Allow vphone to install updates")
-                .setMessage("Android asks once: turn on \"Allow from this source\" for vphone, come back, and tap Install again.")
-                .setPositiveButton("Open the setting") { _, _ ->
-                    startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
+            dialogs.show(
+                DialogSpec(
+                    "Allow vphone to install updates",
+                    "Android asks once: turn on \"Allow from this source\" for vphone, come back, and tap Install again.",
+                    confirm = DialogAction("Open the setting") {
+                        startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+                    },
+                    dismiss = DialogAction("Cancel"),
+                ),
+            )
             return
         }
         val phase = App.state().getString("phase")
-        val vmUp = phase in setOf("preparing", "booting", "unlocking", "running", "stopping")
+        val vmUp = phase in UP
         val creating = Native.createPending()
         val warning = when {
             vmUp -> "${App.state().optString("vm")} is running. Installing ends it at once, without iOS's shutdown."
@@ -613,217 +623,61 @@ class MainActivity : Activity() {
             Updater.install(this, release, apk)
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("Install vphone ${release.version}?")
-            .setMessage(warning)
-            .setPositiveButton("Install") { _, _ -> Updater.install(this, release, apk) }
-            .setNegativeButton("Later", null)
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Install vphone ${release.version}?",
+                warning,
+                confirm = DialogAction("Install") { Updater.install(this, release, apk) },
+                dismiss = DialogAction("Later"),
+            ),
+        )
     }
 
+    /** Reads the VMs again; [refresh] adds what each is doing. */
     private fun showVms() {
-        list.removeAllViews()
         val vms = JSONArray(Native.listVms())
-        if (vms.length() == 0) {
-            list.addView(TextView(this).apply {
-                setPadding(0, 32, 0, 0)
-                text = "No VMs yet. Create one, import a VM folder, or push one with adb to:\n${getExternalFilesDir(null)}/vms/<name>/"
-            })
+        listed = (0 until vms.length()).map { vms.getJSONObject(it) }.map { vm ->
+            val problems = vm.getJSONArray("problems")
+            val config = vm.getJSONObject("config")
+            VmCardUi(
+                name = vm.getString("name"),
+                problems = (0 until problems.length()).map { problems.getString(it) },
+                width = vm.optInt("width"),
+                height = vm.optInt("height"),
+                vcpus = config.getInt("vcpus"),
+                ramMib = config.getInt("ramMib"),
+                diskBytes = vm.optLong("diskBytes"),
+            )
         }
-        for (i in 0 until vms.length()) list.addView(row(vms.getJSONObject(i)))
+        if (ui.vmsPath.isNotEmpty()) refresh()
     }
 
-    private fun row(vm: JSONObject): View {
-        val name = vm.getString("name")
-        val problems = vm.getJSONArray("problems")
-        val config = vm.getJSONObject("config")
-        val detail = TextView(this).apply {
-            text = if (problems.length() > 0) {
-                (0 until problems.length()).joinToString("\n") { problems.getString(it) }
-            } else {
-                "${vm.getInt("width")}x${vm.getInt("height")}, ${config.getInt("vcpus")} vCPUs, " +
-                    "${config.getInt("ramMib")} MiB RAM, disk ${vm.getLong("diskBytes") / (1024 * MIB)} GiB"
+    /**
+     * A VM's log: the live one while it runs, the wizard's while it is made, and otherwise the
+     * newest one in its folder, which the storage scan finds.
+     */
+    private fun openLog(vm: VmCardUi) {
+        when (vm.status) {
+            is VmStatus.Running -> VmLogActivity.open(this)
+            is VmStatus.Creating -> CreateLogActivity.open(this, vm.name)
+            else -> worker.execute {
+                val path = runCatching {
+                    val all = JSONObject(StorageNative.scan()).getJSONArray("vms")
+                    (0 until all.length()).map { all.getJSONObject(it) }
+                        .firstOrNull { it.optString("name") == vm.name }?.optString("log").orEmpty()
+                }.getOrDefault("")
+                handler.post {
+                    if (isDestroyed) return@post
+                    if (path.isEmpty()) ask("No log yet", "${vm.name} has not written a log on this phone.") else VmLogActivity.open(this, path)
+                }
             }
         }
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 32, 0, 0)
-            addView(TextView(this@MainActivity).apply {
-                text = name
-                textSize = 20f
-            })
-            addView(detail)
-            addView(LinearLayout(this@MainActivity).apply {
-                addView(Button(this@MainActivity).apply {
-                    text = "Boot"
-                    isAllCaps = false
-                    isEnabled = problems.length() == 0
-                    setOnClickListener { tryBoot(name) }
-                })
-                addView(Button(this@MainActivity).apply {
-                    text = "Send"
-                    isAllCaps = false
-                    isEnabled = problems.length() == 0
-                    setOnClickListener { askSend(name) }
-                })
-                addView(Button(this@MainActivity).apply {
-                    text = "Settings"
-                    isAllCaps = false
-                    setOnClickListener { settings(name, config) }
-                })
-            })
-        }
-    }
-
-    private fun settings(name: String, config: JSONObject) {
-        fun number(label: String, value: Int) = EditText(this).apply {
-            hint = label
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(value.toString())
-        }
-        fun labelled(parent: LinearLayout, label: String, field: View) {
-            parent.addView(TextView(this).apply { text = label })
-            parent.addView(field)
-        }
-        val vcpus = number("vCPUs", config.getInt("vcpus"))
-        val ram = number("RAM (MiB)", config.getInt("ramMib"))
-        val tb = number("Code cache (MiB)", config.getInt("tbMib"))
-        val hints = CheckBox(this).apply {
-            text = "Performance hints (tell Android how busy the emulated CPUs are)"
-            isChecked = config.getBoolean("performanceHints")
-        }
-        val performanceValues = listOf("max", "balanced")
-        val performance = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                listOf("Max (highest CPU clocks; warmer, more battery)", "Balanced (cooler, slower)"),
-            )
-            setSelection(performanceValues.indexOf(config.optString("performance", "max")).coerceAtLeast(0))
-        }
-        val refreshValues = listOf(120, 60)
-        val refresh = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                listOf("120 Hz", "60 Hz"),
-            )
-            setSelection(refreshValues.indexOf(config.optInt("refreshHz", 120)).coerceAtLeast(0))
-        }
-        // crate::services::Level, in the order of the labels.
-        val servicesValues = listOf("unchanged", "trimmed", "fewest")
-        val services = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                listOf(
-                    "As they are",
-                    "Trimmed (about 138 off: Siri, iCloud sync, analytics, Journal...)",
-                    "Fewest (experimental: also no widgets, no AirDrop)",
-                ),
-            )
-            setSelection(servicesValues.indexOf(config.optString("services", "unchanged")).coerceAtLeast(0))
-        }
-        val network = CheckBox(this).apply {
-            text = "Network (internet for iOS through this phone's connection; IPv4 only)"
-            isChecked = config.optBoolean("network", true)
-        }
-        val sound = CheckBox(this).apply {
-            text = "Sound (iOS plays through this phone's speaker or headphones; no microphone)"
-            isChecked = config.optBoolean("sound", true)
-        }
-        val display = CheckBox(this).apply {
-            text = "Show the screen (off: iOS runs with nothing drawn)"
-            isChecked = config.optBoolean("display", true)
-        }
-        val compression = CheckBox(this).apply {
-            text = "GPU image compression (UBWC) for the driver's own images. Faster where it works; " +
-                "turn it off if the picture is wrong"
-            isChecked = config.optBoolean("gpuCompression", false)
-        }
-        // The values the driver reads (TU_ANDROID_SWAPCHAIN_LAYOUT), in the order of the labels.
-        val layoutValues = listOf("auto", "linear", "ubwc")
-        val swapchainLayout = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                listOf("Auto (as gralloc says, else linear)", "Linear", "Compressed (UBWC)"),
-            )
-            setSelection(layoutValues.indexOf(config.optString("swapchainLayout", "auto")).coerceAtLeast(0))
-        }
-        val softwareDisplay = CheckBox(this).apply {
-            text = "Draw the screen on the CPU (slower; right whatever the GPU driver does with the " +
-                "screen's buffers)"
-            isChecked = config.optBoolean("softwareDisplay", false)
-        }
-        val diagnostics = CheckBox(this).apply {
-            text = "GPU diagnostics: image layouts in the log, and pictures of the guest's screen " +
-                "in the log screen's Share"
-            isChecked = config.optBoolean("gpuDiagnostics", false)
-        }
-        val form = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 24, 48, 0)
-        }
-        labelled(form, "vCPUs", vcpus)
-        labelled(form, "RAM (MiB)", ram)
-        labelled(form, "Code cache (MiB)", tb)
-        labelled(form, "Performance", performance)
-        form.addView(hints)
-        form.addView(network)
-        form.addView(sound)
-        labelled(
-            form,
-            "iOS background services. Fewer leave more of the emulated CPUs to the screen. A change is " +
-                "applied at the VM's next start and takes effect at the start after that",
-            services,
-        )
-        labelled(form, "Refresh rate (iOS's display mode, and the rate asked of this phone's screen)", refresh)
-        form.addView(display)
-        form.addView(compression)
-        labelled(
-            form,
-            "Screen buffer layout. If the picture is smeared into bands or dashes, try the other two",
-            swapchainLayout,
-        )
-        form.addView(softwareDisplay)
-        form.addView(diagnostics)
-        AlertDialog.Builder(this)
-            .setTitle(name)
-            .setView(ScrollView(this).apply { addView(form) })
-            .setPositiveButton("Save") { _, _ ->
-                val saved = JSONObject()
-                    .put("vcpus", vcpus.text.toString().toIntOrNull() ?: 0)
-                    .put("ramMib", ram.text.toString().toIntOrNull() ?: 0)
-                    .put("tbMib", tb.text.toString().toIntOrNull() ?: 0)
-                    .put("version", config.optInt("version", 2))
-                    .put("performance", performanceValues[performance.selectedItemPosition.coerceIn(0, 1)])
-                    .put("refreshHz", refreshValues[refresh.selectedItemPosition.coerceIn(0, 1)])
-                    .put("performanceHints", hints.isChecked)
-                    .put("services", servicesValues[services.selectedItemPosition.coerceIn(0, 2)])
-                    .put("network", network.isChecked)
-                    .put("sound", sound.isChecked)
-                    .put("display", display.isChecked)
-                    .put("gpuCompression", compression.isChecked)
-                    .put("gpuDiagnostics", diagnostics.isChecked)
-                    .put("softwareDisplay", softwareDisplay.isChecked)
-                    .put("swapchainLayout", layoutValues[swapchainLayout.selectedItemPosition.coerceIn(0, 2)])
-                val error = Native.saveVmConfig(name, saved.toString())
-                if (error.isNotEmpty()) Toast.makeText(this, error, Toast.LENGTH_LONG).show()
-                showVms()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
     }
 
     private fun tryBoot(name: String) {
         val creating = Native.createPending()
         if (creating.isNotEmpty() && creating != name) {
-            AlertDialog.Builder(this)
-                .setTitle("A VM is being created")
-                .setMessage("$creating is still being made, and only one VM can run at a time. Finish or delete it first.")
-                .setPositiveButton("OK", null)
-                .show()
+            ask("A VM is being created", "$creating is still being made, and only one VM can run at a time. Finish or delete it first.")
             return
         }
         if (App.state().optBoolean("needsRestart")) {
@@ -833,21 +687,19 @@ class MainActivity : Activity() {
         val report = JSONObject(Native.preflight(name))
         val errors = report.getJSONArray("errors")
         if (errors.length() > 0) {
-            AlertDialog.Builder(this)
-                .setTitle("$name cannot start")
-                .setMessage((0 until errors.length()).joinToString("\n\n") { errors.getString(it) })
-                .setPositiveButton("OK", null)
-                .show()
+            fail("$name cannot start", (0 until errors.length()).joinToString("\n\n") { errors.getString(it) })
             return
         }
         val warnings = report.getJSONArray("warnings")
         if (warnings.length() > 0) {
-            AlertDialog.Builder(this)
-                .setTitle("Start $name?")
-                .setMessage((0 until warnings.length()).joinToString("\n\n") { warnings.getString(it) })
-                .setPositiveButton("Start") { _, _ -> askBatteryThenBoot(name) }
-                .setNegativeButton("Cancel", null)
-                .show()
+            dialogs.show(
+                DialogSpec(
+                    "Start $name?",
+                    (0 until warnings.length()).joinToString("\n\n") { warnings.getString(it) },
+                    confirm = DialogAction("Start") { askBatteryThenBoot(name) },
+                    dismiss = DialogAction("Cancel"),
+                ),
+            )
         } else {
             askBatteryThenBoot(name)
         }
@@ -865,15 +717,17 @@ class MainActivity : Activity() {
             return
         }
         prefs.edit().putBoolean("askedBattery", true).apply()
-        AlertDialog.Builder(this)
-            .setTitle("Keep the VM running in the background?")
-            .setMessage("This phone's battery manager can stop the VM when the app is not on screen. Allow vphone to run unrestricted to prevent that.")
-            .setPositiveButton("Allow") { _, _ ->
-                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
-                boot(name)
-            }
-            .setNegativeButton("Not now") { _, _ -> boot(name) }
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Keep the VM running in the background?",
+                "This phone's battery manager can stop the VM when the app is not on screen. Allow vphone to run unrestricted to prevent that.",
+                confirm = DialogAction("Allow") {
+                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                    boot(name)
+                },
+                dismiss = DialogAction("Not now") { boot(name) },
+            ),
+        )
     }
 
     private fun boot(name: String) {
@@ -907,5 +761,8 @@ class MainActivity : Activity() {
         private const val PICK_VM_FILE = 3
         private const val SAVE_VM_FILE = 4
         private const val MIB = 1024L * 1024
+        private val UP = setOf("preparing", "booting", "unlocking", "running", "stopping")
+        /** The phases whose time since the start is shown. */
+        private val TIMED = setOf("booting", "unlocking", "running", "stopping")
     }
 }

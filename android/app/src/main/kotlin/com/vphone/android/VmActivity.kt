@@ -1,7 +1,5 @@
 package com.vphone.android
 
-import android.app.Activity
-import android.app.AlertDialog
 import android.app.GameManager
 import android.app.GameState
 import android.content.pm.ApplicationInfo
@@ -9,6 +7,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
@@ -25,30 +24,61 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedDispatcher
+import androidx.activity.ComponentActivity
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.ComposeView
+import com.vphone.android.ui.AppDialog
+import com.vphone.android.ui.ControlItem
+import com.vphone.android.ui.DialogAction
+import com.vphone.android.ui.DialogHost
+import com.vphone.android.ui.DialogSpec
+import com.vphone.android.ui.VIcons
+import com.vphone.android.ui.VmBottomBar
+import com.vphone.android.ui.VmControlsMenu
+import com.vphone.android.ui.VmEndPanel
+import com.vphone.android.ui.VphoneTheme
 import org.json.JSONObject
 
 /**
  * The guest's screen, full-screen in portrait. Home, Lock and the rest are behind a floating
  * button, or a bar underneath for those who choose it; Back opens the same menu.
+ *
+ * The guest's picture is a SurfaceView in plain framework layouts, and its touches go straight
+ * from that view to the native side. What is drawn with Compose is beside or over it only when it
+ * is wanted: the bar sits under the picture, and [chrome] (the menu, the end of a run, a dialog)
+ * is in the layout only while one of them shows.
  */
-class VmActivity : Activity() {
+class VmActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var area: FrameLayout
     private lateinit var surface: SurfaceView
     private lateinit var status: TextView
-    private lateinit var endPanel: ScrollView
-    private lateinit var endText: TextView
-    private lateinit var bar: LinearLayout
+    private lateinit var bar: ComposeView
     private lateinit var floating: FloatingButton
-    private lateinit var menu: ControlsMenu
+    private lateinit var chrome: ComposeView
     private lateinit var root: FrameLayout
+    private val dialogs = DialogHost()
+    private var menuOpen by mutableStateOf(false)
+    private var menuHeading by mutableStateOf("")
+    private var menuHint = ""
+    private var menuItems: List<ControlItem> = emptyList()
+    /** The run is over: its last words are shown in place of the picture. */
+    private var ended by mutableStateOf(false)
+    private var endTitle by mutableStateOf("")
+    private var endMessage by mutableStateOf("")
     private var guestWidth = 0
     private var guestHeight = 0
     private var trackedPointer = -1
@@ -162,44 +192,72 @@ class VmActivity : Activity() {
             holder.addCallback(surfaceCallback)
             setOnTouchListener { _, event -> onTouch(event) }
         }
+        val dp = resources.displayMetrics.density
+        // The phone's own colours, dark: this screen is black around the guest's picture.
+        val scheme = dynamicDarkColorScheme(this)
         status = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setBackgroundColor(0xB0000000.toInt())
-            setPadding(24, 12, 24, 12)
+            setTextColor(scheme.onSurface.toArgb())
+            background = GradientDrawable().apply {
+                cornerRadius = 24 * dp
+                setColor(scheme.surfaceContainerHigh.copy(alpha = 0.85f).toArgb())
+            }
+            setPadding((16 * dp).toInt(), (10 * dp).toInt(), (16 * dp).toInt(), (10 * dp).toInt())
+            minHeight = (48 * dp).toInt()
             gravity = Gravity.CENTER
             setOnClickListener { VmLogActivity.open(this@VmActivity) }
-        }
-        endText = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setPadding(48, 96, 48, 24)
-        }
-        endPanel = ScrollView(this).apply {
-            setBackgroundColor(Color.BLACK)
-            visibility = View.GONE
-            addView(LinearLayout(this@VmActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(endText)
-                addView(button("Show the log") { VmLogActivity.open(this@VmActivity, App.state().optString("logPath")) })
-                addView(button("Back to VMs") { leave() })
-            })
         }
         area = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(surface, FrameLayout.LayoutParams(0, 0))
-            addView(status, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(endPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(
+                status,
+                FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+                    .apply { topMargin = (8 * dp).toInt() },
+            )
             addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layoutImage() }
         }
-        bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.BLACK)
-            val weight = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
-            addView(button("Home") { Native.home() }, weight)
-            addView(button("Lock") { Native.lock() }, weight)
-            addView(button("More") { openMenu() }, weight)
+        bar = ComposeView(this).apply {
+            setContent {
+                VphoneTheme(darkTheme = true) {
+                    VmBottomBar(onHome = { Native.home() }, onLock = { Native.lock() }, onMore = { openMenu() })
+                }
+            }
         }
-        floating = FloatingButton(this, onTap = { openMenu() }, onHold = { Native.home() })
-        menu = ControlsMenu(this)
+        floating = FloatingButton(
+            this,
+            container = scheme.primaryContainer.toArgb(),
+            content = scheme.onPrimaryContainer.toArgb(),
+            onTap = { openMenu() },
+            onHold = { Native.home() },
+        )
+        chrome = ComposeView(this).apply {
+            visibility = View.GONE
+            setContent {
+                VphoneTheme(darkTheme = true) {
+                    if (ended) {
+                        VmEndPanel(
+                            title = endTitle,
+                            message = endMessage,
+                            onLog = { VmLogActivity.open(this@VmActivity, App.state().optString("logPath")) },
+                            onLeave = { leave() },
+                            onCopy = { App.copy(this@VmActivity, endMessage) },
+                        )
+                    } else if (menuOpen) {
+                        VmControlsMenu(menuHeading, menuHint, menuItems, onDismiss = { closeMenu() })
+                    }
+                    dialogs.current?.let { spec ->
+                        AppDialog(
+                            spec,
+                            onCopy = { App.copy(this@VmActivity, it) },
+                            onDismiss = {
+                                dialogs.current = null
+                                applyControls()
+                            },
+                        )
+                    }
+                }
+            }
+        }
         val screen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
@@ -210,7 +268,7 @@ class VmActivity : Activity() {
             setBackgroundColor(Color.BLACK)
             addView(screen, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(floating, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(menu, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(chrome, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
                 if (r - l != or - ol || b - t != ob - ot) floating.place(r - l, b - t)
             }
@@ -224,9 +282,19 @@ class VmActivity : Activity() {
     private val prefs get() = getSharedPreferences("ui", MODE_PRIVATE)
     private val useBar get() = prefs.getString(KEY_CONTROLS, "float") == "bar"
 
+    /**
+     * Which controls are in the layout. [chrome] is gone whenever it has nothing to show, so that
+     * no view of it is between a finger and the guest's picture.
+     */
     private fun applyControls() {
         bar.visibility = if (useBar) View.VISIBLE else View.GONE
-        floating.visibility = if (useBar || endPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        floating.visibility = if (useBar || ended) View.GONE else View.VISIBLE
+        chrome.visibility = if (menuOpen || ended || dialogs.current != null) View.VISIBLE else View.GONE
+    }
+
+    private fun closeMenu() {
+        menuOpen = false
+        applyControls()
     }
 
     private fun heading(): String {
@@ -239,30 +307,27 @@ class VmActivity : Activity() {
 
     private fun openMenu() {
         val bar = useBar
-        menu.setItems(listOf(
-            ControlsMenu.Item("🏠", "Home") { Native.home() },
-            ControlsMenu.Item("🔒", "Lock") { Native.lock() },
-            ControlsMenu.Item("📄", "Logs") { VmLogActivity.open(this) },
-            ControlsMenu.Item("↩️", "VM list") { toVmList() },
-            ControlsMenu.Item("⏹️", "Shut down") { askStop() },
-            ControlsMenu.Item(if (bar) "🔘" else "▁", if (bar) "Use button" else "Use bar") {
+        menuItems = listOf(
+            ControlItem(Icons.Filled.Home, "Home") { Native.home() },
+            ControlItem(Icons.Filled.Lock, "Lock") { Native.lock() },
+            ControlItem(VIcons.Log, "Logs") { VmLogActivity.open(this) },
+            ControlItem(Icons.AutoMirrored.Filled.List, "VM list") { toVmList() },
+            ControlItem(VIcons.Power, "Shut down", danger = true) { askStop() },
+            ControlItem(if (bar) VIcons.Circle else VIcons.Bar, if (bar) "Use button" else "Use bar") {
                 prefs.edit().putString(KEY_CONTROLS, if (bar) "float" else "bar").apply()
                 applyControls()
             },
-        ))
-        menu.open(heading(), if (bar) "" else "Hold the button for Home. Drag it anywhere.")
+        )
+        menuHeading = heading()
+        menuHint = if (bar) "" else "Hold the button for Home. Drag it anywhere."
+        menuOpen = true
+        applyControls()
     }
 
     /** The VM keeps running; the list's "Return to" brings this screen back. */
     private fun toVmList() {
         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP))
         finish()
-    }
-
-    private fun button(label: String, action: () -> Unit) = Button(this).apply {
-        text = label
-        isAllCaps = false
-        setOnClickListener { action() }
     }
 
     override fun onStart() {
@@ -303,25 +368,21 @@ class VmActivity : Activity() {
         val phase = state.getString("phase")
         val message = state.optString("message")
         val bootError = VmService.lastBootError
-        val ended = phase in setOf("exited", "failed") || (phase == "idle" && bootError != null)
-        if (menu.isOpen) menu.setHeading(heading())
-        if (ended) {
+        val over = phase in setOf("exited", "failed") || (phase == "idle" && bootError != null)
+        if (menuOpen) menuHeading = heading()
+        if (over) {
             status.visibility = View.GONE
-            menu.close()
-            if (endPanel.visibility != View.VISIBLE) {
-                endPanel.visibility = View.VISIBLE
+            endTitle = if (bootError != null || phase == "failed") "The VM could not start" else "The VM stopped"
+            endMessage = bootError ?: message
+            if (!ended || menuOpen) {
+                ended = true
+                menuOpen = false
                 applyControls()
-            }
-            endText.text = when {
-                bootError != null -> bootError
-                phase == "failed" -> "The VM could not start.\n\n$message"
-                message.isNotEmpty() -> "The VM stopped.\n\n$message"
-                else -> "The VM stopped."
             }
             return
         }
-        if (endPanel.visibility == View.VISIBLE) {
-            endPanel.visibility = View.GONE
+        if (ended) {
+            ended = false
             applyControls()
         }
         if (phase == "running" && message.isEmpty()) {
@@ -386,19 +447,22 @@ class VmActivity : Activity() {
     }
 
     private fun askStop() {
-        AlertDialog.Builder(this)
-            .setTitle("Shut down the VM?")
-            .setMessage("iOS shuts down as it does on a phone.")
-            .setPositiveButton("Shut down") { _, _ -> Native.stop() }
-            .setNegativeButton("Cancel", null)
-            .show()
+        dialogs.show(
+            DialogSpec(
+                "Shut down the VM?",
+                "iOS shuts down as it does on a phone.",
+                confirm = DialogAction("Shut down") { Native.stop() },
+                dismiss = DialogAction("Cancel"),
+            ),
+        )
+        applyControls()
     }
 
     /** Back opens the menu, whose tiles leave or shut down: never one swipe that ends the VM. */
     private fun onBack() {
         when {
-            endPanel.visibility == View.VISIBLE -> leave()
-            menu.isOpen -> menu.close()
+            ended -> leave()
+            menuOpen -> closeMenu()
             else -> openMenu()
         }
     }

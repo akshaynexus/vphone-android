@@ -37,7 +37,8 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.Vphone">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -71,29 +72,35 @@
             android:exported="false"
             android:launchMode="singleTask"
             android:screenOrientation="portrait"
-            android:theme="@style/Theme.Vphone.Create" />
+            android:theme="@style/Theme.Vphone" />
 
         <!-- The VM's screen during creation; follows rotation, its Surface crosses to :createvm. -->
         <activity
             android:name=".CreateVmScreen"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"
             android:exported="false"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+            android:theme="@style/Theme.Vphone" />
 
         <activity
             android:name=".CreateLogActivity"
             android:exported="false"
-            android:theme="@style/Theme.Vphone.Create" />
+            android:theme="@style/Theme.Vphone" />
 
         <activity
             android:name=".VmLogActivity"
             android:exported="false"
-            android:theme="@style/Theme.Vphone.Create" />
+            android:theme="@style/Theme.Vphone" />
+
+        <!-- One VM's settings, opened from its card in the list. -->
+        <activity
+            android:name=".VmSettingsActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Vphone" />
 
         <activity
             android:name=".StorageActivity"
             android:exported="false"
-            android:theme="@style/Theme.Vphone.Create" />
+            android:theme="@style/Theme.Vphone" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

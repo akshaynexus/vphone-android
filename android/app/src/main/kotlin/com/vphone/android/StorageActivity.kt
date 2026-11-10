@@ -1,29 +1,25 @@
 package com.vphone.android
 
-import android.annotation.SuppressLint
-import android.content.Context
-import android.content.res.ColorStateList
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.Editable
-import android.text.InputType
-import android.text.TextWatcher
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import com.google.android.material.button.MaterialButton
-import com.google.android.material.card.MaterialCardView
-import com.google.android.material.color.MaterialColors
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.progressindicator.LinearProgressIndicator
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.vphone.android.ui.AppDialog
+import com.vphone.android.ui.DialogAction
+import com.vphone.android.ui.DialogHost
+import com.vphone.android.ui.DialogSpec
+import com.vphone.android.ui.ProgressUi
+import com.vphone.android.ui.StorageButton
+import com.vphone.android.ui.StorageRow
+import com.vphone.android.ui.StorageScreen
+import com.vphone.android.ui.StorageSection
+import com.vphone.android.ui.StorageUi
+import com.vphone.android.ui.VphoneTheme
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -43,22 +39,18 @@ object StorageNative {
 }
 
 /** What the app keeps on the phone, and giving it back: VMs, firmware, leftovers. */
-class StorageActivity : AppCompatActivity() {
+class StorageActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
-    private lateinit var summary: TextView
-    private lateinit var summaryBar: LinearProgressIndicator
-    private lateinit var progressCard: View
-    private lateinit var progressTitle: TextView
-    private lateinit var progressDetail: TextView
-    private lateinit var progressBar: LinearProgressIndicator
-    private lateinit var vmSection: LinearLayout
-    private lateinit var firmwareSection: LinearLayout
-    private lateinit var leftoverSection: LinearLayout
-    private lateinit var resetSection: LinearLayout
-    private val actions = ArrayList<Pair<Button, Boolean>>()
-    private var running = false
+    private val dialogs = DialogHost()
+
+    /** The last measurement as the screen shows it; [busy] and [progress] are laid over it. */
+    private var measured by mutableStateOf(StorageUi())
+    private var progress by mutableStateOf<ProgressUi?>(null)
+    private var running by mutableStateOf(false)
     private var scanning = false
+    /** A VM the list's Delete sent here: its deletion is offered once the first measurement is back. */
+    private var pendingDelete = ""
 
     private val poll = object : Runnable {
         override fun run() {
@@ -68,37 +60,21 @@ class StorageActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        summary = body()
-        summaryBar = LinearProgressIndicator(this).apply {
-            max = 1000
-            setPadding(0, dp(8), 0, 0)
+        if (savedInstanceState == null) pendingDelete = intent.getStringExtra(EXTRA_DELETE).orEmpty()
+        setContent {
+            VphoneTheme {
+                val m = measured
+                StorageScreen(
+                    StorageUi(m.summary, m.used, m.sections, m.resetText, m.reset, progress, running),
+                    onBack = ::finish,
+                )
+                dialogs.current?.let { spec ->
+                    AppDialog(spec, onCopy = { App.copy(this, it) }, onDismiss = { dialogs.current = null })
+                }
+            }
         }
-        progressTitle = text(com.google.android.material.R.style.TextAppearance_Material3_TitleMedium)
-        progressDetail = body()
-        progressBar = LinearProgressIndicator(this).apply {
-            max = 1000
-            setPadding(0, dp(8), 0, 0)
-        }
-        progressCard = card(listOf(progressTitle, progressDetail, progressBar)).apply { visibility = View.GONE }
-        vmSection = column()
-        firmwareSection = column()
-        leftoverSection = column()
-        resetSection = column()
-        val content = column().apply {
-            setPadding(dp(20), dp(20), dp(20), dp(20))
-            addView(text(com.google.android.material.R.style.TextAppearance_Material3_HeadlineMedium).apply { text = "Storage" })
-            addView(card(listOf(summary, summaryBar)))
-            addView(progressCard)
-            addView(vmSection)
-            addView(firmwareSection)
-            addView(leftoverSection)
-            addView(resetSection)
-        }
-        val scroll = ScrollView(this).apply { addView(content) }
-        setContentView(scroll)
-        App.fitSystemBars(scroll)
-        summary.text = "Measuring…"
     }
 
     override fun onStart() {
@@ -133,60 +109,65 @@ class StorageActivity : AppCompatActivity() {
         }
     }
 
-    @SuppressLint("SetTextI18n")
     private fun show(s: JSONObject) {
-        actions.clear()
-        summary.text = "Phone: ${s.getString("freeSize")} free of ${s.getString("totalSize")}\n" +
-            "This app uses ${s.getString("appSize")}: VMs ${s.getString("vmsSize")}, " +
-            "firmware ${s.getString("firmwareSize")}, leftovers ${s.getString("leftoversSize")}"
         val total = s.getLong("totalBytes")
-        summaryBar.progress = if (total > 0) (1000 * (total - s.getLong("freeBytes")) / total).toInt() else 0
-
-        vmSection.removeAllViews()
-        vmSection.addView(heading("Virtual machines"))
         val vms = objects(s.getJSONArray("vms"))
-        if (vms.isEmpty()) vmSection.addView(body().apply { text = "No VMs on this phone." })
-        vms.forEach { vmSection.addView(vmRow(it)) }
-
-        firmwareSection.removeAllViews()
-        firmwareSection.addView(heading("Firmware downloads"))
         val firmware = objects(s.getJSONArray("firmware"))
-        if (firmware.isEmpty()) {
-            firmwareSection.addView(body().apply { text = "The firmware cache is empty." })
-        } else {
-            firmwareSection.addView(wideAction("Delete all firmware", op("deleteAllFirmware"), firmware.any { it.optString("blocked").isEmpty() }))
-        }
-        firmware.forEach { firmwareSection.addView(firmwareRow(it)) }
-
-        leftoverSection.removeAllViews()
-        leftoverSection.addView(heading("Leftovers"))
         val processes = objects(s.getJSONArray("processes"))
+        val leftovers = objects(s.getJSONArray("leftovers"))
+        val leftoverRows = ArrayList<StorageRow>()
         if (processes.isNotEmpty()) {
             val names = processes.joinToString(", ") { "${it.getString("name")} (${it.getInt("pid")})" }
-            leftoverSection.addView(
-                row(
-                    "Helpers from a run that is over",
-                    "Still alive: $names. Stopping them only ends this app's own processes.",
-                    s.optString("processesBlocked"),
-                    actionsRow(action("Stop them", op("stopProcesses"), s.optString("processesBlocked").isEmpty())),
-                ),
+            leftoverRows += StorageRow(
+                "Helpers from a run that is over",
+                "Still alive: $names. Stopping them only ends this app's own processes.",
+                s.optString("processesBlocked"),
+                listOf(action("Stop them", op("stopProcesses"), s.optString("processesBlocked").isEmpty())),
             )
         }
-        val leftovers = objects(s.getJSONArray("leftovers"))
-        if (leftovers.isEmpty() && processes.isEmpty()) {
-            leftoverSection.addView(body().apply { text = "Nothing is left over." })
+        leftovers.forEach { leftoverRows += leftoverRow(it) }
+        val resetBlocked = s.optString("resetBlocked")
+        measured = StorageUi(
+            summary = "Phone: ${s.getString("freeSize")} free of ${s.getString("totalSize")}\n" +
+                "This app uses ${s.getString("appSize")}: VMs ${s.getString("vmsSize")}, " +
+                "firmware ${s.getString("firmwareSize")}, leftovers ${s.getString("leftoversSize")}",
+            used = if (total > 0) (total - s.getLong("freeBytes")).toFloat() / total else 0f,
+            sections = listOf(
+                StorageSection("Virtual machines", "No VMs on this phone.", vms.map(::vmRow)),
+                StorageSection(
+                    "Firmware downloads",
+                    "The firmware cache is empty.",
+                    firmware.map(::firmwareRow),
+                    if (firmware.isEmpty()) null else action("Delete all firmware", op("deleteAllFirmware"), firmware.any { it.optString("blocked").isEmpty() }, danger = true),
+                ),
+                StorageSection(
+                    "Leftovers",
+                    "Nothing is left over.",
+                    leftoverRows,
+                    if (leftovers.isEmpty()) null else action("Clear all leftovers", op("clearAllLeftovers"), leftovers.any { it.optString("blocked").isEmpty() }, danger = true),
+                ),
+            ),
+            resetText = if (resetBlocked.isEmpty()) {
+                "Removes every VM, the firmware cache and all leftovers (${s.getString("resetSize")} in total), " +
+                    "and returns the app to its first-run state."
+            } else {
+                "Not available now: $resetBlocked"
+            },
+            reset = action("Reset everything…", op("resetEverything"), resetBlocked.isEmpty(), danger = true),
+        )
+        if (pendingDelete.isNotEmpty()) {
+            val name = pendingDelete
+            pendingDelete = ""
+            val vm = vms.firstOrNull { it.getString("name") == name }
+            when {
+                vm == null -> showFailure("Cannot delete $name", "$name is not among the VMs on this phone.")
+                vm.optBoolean("external") -> showFailure("Cannot delete $name", "$name is outside the app's own storage, and the app does not remove it.")
+                else -> confirm(op("deleteVm", name))
+            }
         }
-        if (leftovers.isNotEmpty()) {
-            leftoverSection.addView(wideAction("Clear all leftovers", op("clearAllLeftovers"), leftovers.any { it.optString("blocked").isEmpty() }))
-        }
-        leftovers.forEach { leftoverSection.addView(leftoverRow(it)) }
-
-        resetSection.removeAllViews()
-        resetSection.addView(resetCard(s))
-        applyEnabled()
     }
 
-    private fun vmRow(vm: JSONObject): View {
+    private fun vmRow(vm: JSONObject): StorageRow {
         val name = vm.getString("name")
         val blocked = vm.optString("blocked")
         val device = listOf(vm.optString("device"), vm.optString("ios").let { if (it.isEmpty()) "" else "iOS $it" })
@@ -196,64 +177,52 @@ class StorageActivity : AppCompatActivity() {
             appendLine(vm.getString("stateText"))
             append("${vm.getString("size")} on disk, ${vm.getString("logSize")} of it logs")
         }
-        val rows = column()
+        val buttons = ArrayList<StorageButton>()
         val logPath = vm.optString("log")
-        if (logPath.isNotEmpty()) {
-            rows.addView(actionsRow(plainButton("View log") { App.showLog(this, logPath) }))
-        }
-        if (vm.optBoolean("external")) return row(name, detail, blocked, rows)
-        rows.addView(
-            actionsRow(
-                action("Clear logs", op("clearVmLogs", name), blocked.isEmpty()),
-                action("Reset", op("resetVm", name), vm.optString("resetBlocked").isEmpty()),
-                action("Delete", op("deleteVm", name), blocked.isEmpty(), danger = true),
-            ),
-        )
+        if (logPath.isNotEmpty()) buttons += StorageButton("View log", true) { showLog(logPath) }
+        if (vm.optBoolean("external")) return StorageRow(name, detail, blocked, buttons)
+        buttons += action("Clear logs", op("clearVmLogs", name), blocked.isEmpty())
+        buttons += action("Reset", op("resetVm", name), vm.optString("resetBlocked").isEmpty())
+        buttons += action("Delete", op("deleteVm", name), blocked.isEmpty(), danger = true)
         val note = blocked.ifEmpty { vm.optString("resetBlocked").let { if (it.isEmpty()) "" else "Reset: $it" } }
-        return row(name, detail, note, rows)
+        return StorageRow(name, detail, note, buttons)
     }
 
-    private fun firmwareRow(f: JSONObject): View {
+    private fun firmwareRow(f: JSONObject): StorageRow {
         val detail = buildString {
             append(f.getString("size"))
             if (f.optBoolean("partial")) append(", partial")
             f.optString("note").let { if (it.isNotEmpty()) append("\n$it") }
         }
         val blocked = f.optString("blocked")
-        return row(
+        return StorageRow(
             f.getString("name"),
             detail,
             blocked,
-            actionsRow(action("Delete", op("deleteFirmware", f.getString("name")), blocked.isEmpty(), danger = true)),
+            listOf(action("Delete", op("deleteFirmware", f.getString("name")), blocked.isEmpty(), danger = true)),
         )
     }
 
-    private fun leftoverRow(l: JSONObject): View {
+    private fun leftoverRow(l: JSONObject): StorageRow {
         val blocked = l.optString("blocked")
-        return row(
+        return StorageRow(
             l.getString("title"),
             "${l.getString("size")}. ${l.optString("detail")}",
             blocked,
-            actionsRow(action("Clear", op("clearLeftover", l.getString("id")), blocked.isEmpty())),
+            listOf(action("Clear", op("clearLeftover", l.getString("id")), blocked.isEmpty())),
         )
     }
 
-    private fun resetCard(s: JSONObject): View {
-        val blocked = s.optString("resetBlocked")
-        val button = action("Reset everything…", op("resetEverything"), blocked.isEmpty(), danger = true)
-        val error = MaterialColors.getColor(summary, androidx.appcompat.R.attr.colorError)
-        val message = text(com.google.android.material.R.style.TextAppearance_Material3_BodyMedium).apply {
-            text = if (blocked.isEmpty()) {
-                "Removes every VM, the firmware cache and all leftovers (${s.getString("resetSize")} in total), " +
-                    "and returns the app to its first-run state."
-            } else {
-                "Not available now: $blocked"
+    /** The end of a log, whole and copyable. */
+    private fun showLog(path: String) {
+        worker.execute {
+            val log = Native.logTail(path, 32768).ifEmpty { "(the log is empty)" }
+            handler.post {
+                if (isDestroyed) return@post
+                dialogs.show(
+                    DialogSpec(path.substringAfterLast('/'), log, confirm = DialogAction("Close"), copyText = log, monospace = true),
+                )
             }
-            setTextColor(error)
-        }
-        return column().apply {
-            setPadding(0, dp(28), 0, 0)
-            addView(card(listOf(heading("Reset everything").apply { setTextColor(error) }, message, button), strokeColor = error))
         }
     }
 
@@ -262,69 +231,40 @@ class StorageActivity : AppCompatActivity() {
     private fun op(name: String, target: String = ""): JSONObject =
         JSONObject().put("op", name).put("name", target)
 
+    private fun action(label: String, op: JSONObject, enabled: Boolean, danger: Boolean = false) =
+        StorageButton(label, enabled, danger) { confirm(op) }
+
     /** Measured again for the confirmation, so what it states is what is on disk now. */
     private fun confirm(op: JSONObject) {
         if (running) return
         running = true
-        applyEnabled()
         worker.execute {
             val plan = runCatching { JSONObject(StorageNative.plan(op.toString())) }
             handler.post {
                 running = false
-                applyEnabled()
                 if (isDestroyed) return@post
                 plan.onSuccess { showPlan(op, it) }.onFailure { showFailure("Could not prepare this", it.toString()) }
             }
         }
     }
 
+    /** A plan with a word to type is the last gate before erasing everything. */
     private fun showPlan(op: JSONObject, plan: JSONObject) {
         val blocked = plan.optString("blocked")
         if (blocked.isNotEmpty()) {
             showFailure(plan.getString("title"), blocked)
             return
         }
-        val word = plan.optString("confirmWord")
         val message = plan.getString("text") + if (plan.optLong("bytes") > 0) "\n\nThis frees about ${plan.getString("size")}." else ""
-        if (word.isEmpty()) {
-            MaterialAlertDialogBuilder(this)
-                .setTitle(plan.getString("title"))
-                .setMessage(message)
-                .setPositiveButton(plan.getString("action")) { _, _ -> begin(op) }
-                .setNegativeButton("Cancel", null)
-                .show()
-            return
-        }
-        confirmByWord(op, plan.getString("title"), message, plan.getString("action"), word)
-    }
-
-    /** The last gate before erasing everything: the person types the word. */
-    private fun confirmByWord(op: JSONObject, title: String, message: String, action: String, word: String) {
-        val field = EditText(this).apply {
-            hint = "Type $word"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
-        }
-        val form = column().apply {
-            setPadding(dp(24), dp(8), dp(24), 0)
-            addView(body().apply { text = message })
-            addView(TextView(context).apply { text = "\nType $word to continue." })
-            addView(field)
-        }
-        val dialog: AlertDialog = MaterialAlertDialogBuilder(this)
-            .setTitle(title)
-            .setView(ScrollView(this).apply { addView(form) })
-            .setPositiveButton(action) { _, _ -> begin(op) }
-            .setNegativeButton("Cancel", null)
-            .show()
-        val go = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
-        go.isEnabled = false
-        field.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
-            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
-            override fun afterTextChanged(s: Editable?) {
-                go.isEnabled = s?.toString() == word
-            }
-        })
+        dialogs.show(
+            DialogSpec(
+                plan.getString("title"),
+                message,
+                confirm = DialogAction(plan.getString("action")) { begin(op) },
+                dismiss = DialogAction("Cancel"),
+                typeWord = plan.optString("confirmWord"),
+            ),
+        )
     }
 
     private fun begin(op: JSONObject) {
@@ -338,32 +278,24 @@ class StorageActivity : AppCompatActivity() {
     private fun follow() {
         val p = runCatching { JSONObject(StorageNative.progress()) }.getOrNull() ?: return
         val active = p.optBoolean("active")
-        if (active != running) {
-            running = active
-            applyEnabled()
-        }
-        progressCard.visibility = if (active) View.VISIBLE else View.GONE
-        if (active) {
-            progressTitle.text = p.optString("title")
+        if (active != running) running = active
+        progress = if (active) {
             val total = p.optLong("totalBytes")
             val done = p.optLong("doneBytes")
-            progressBar.isIndeterminate = total <= 0
-            if (total > 0) progressBar.setProgressCompat(((1000 * done) / total).toInt().coerceAtMost(1000), true)
-            progressDetail.text = buildString {
-                if (total > 0) append("${gib(done)} of ${gib(total)}. ")
-                append(p.optString("current"))
-            }
+            ProgressUi(
+                title = p.optString("title"),
+                detail = p.optString("current"),
+                fraction = if (total > 0) (done.toFloat() / total).coerceAtMost(1f) else null,
+                stats = if (total > 0) listOf("${gib(done)} of ${gib(total)}") else emptyList(),
+            )
+        } else {
+            null
         }
         val result = p.optJSONObject("result") ?: return
         StorageNative.takeResult()
         running = false
-        applyEnabled()
         showResult(result)
         refresh()
-    }
-
-    private fun applyEnabled() {
-        actions.forEach { (button, allowed) -> button.isEnabled = allowed && !running }
     }
 
     private fun gib(bytes: Long): String = String.format(java.util.Locale.US, "%.2f GB", bytes / (1024.0 * 1024 * 1024))
@@ -376,102 +308,17 @@ class StorageActivity : AppCompatActivity() {
             r.optBoolean("attempted") -> "Finished with problems"
             else -> "Nothing was removed"
         }
-        showReport(title, report)
+        dialogs.show(DialogSpec(title, report, confirm = DialogAction("Close"), copyText = report, isError = !r.optBoolean("ok")))
     }
 
-    private fun showFailure(title: String, details: String) = showReport(title, details)
-
-    private fun showReport(title: String, text: String) {
-        val view = TextView(this).apply {
-            setPadding(dp(24), dp(8), dp(24), 0)
-            setTextIsSelectable(true)
-            this.text = text
-        }
-        MaterialAlertDialogBuilder(this)
-            .setTitle(title)
-            .setView(ScrollView(this).apply { addView(view) })
-            .setNeutralButton("Copy") { _, _ -> App.copy(this, text) }
-            .setPositiveButton("Close", null)
-            .show()
-    }
-
-    // ------------------------------------------------------------------ building rows
+    private fun showFailure(title: String, details: String) =
+        dialogs.show(DialogSpec(title, details, confirm = DialogAction("Close"), copyText = details, isError = true))
 
     private fun objects(a: JSONArray): List<JSONObject> = (0 until a.length()).map { a.getJSONObject(it) }
 
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-
-    private fun column(context: Context = this): LinearLayout = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-
-    private fun text(style: Int): TextView = TextView(this).apply { setTextAppearance(style) }
-
-    private fun body(): TextView = text(com.google.android.material.R.style.TextAppearance_Material3_BodyMedium)
-
-    private fun heading(label: String): TextView =
-        text(com.google.android.material.R.style.TextAppearance_Material3_TitleMedium).apply {
-            setPadding(0, dp(20), 0, dp(4))
-            text = label
-        }
-
-    private fun action(label: String, op: JSONObject, enabled: Boolean, danger: Boolean = false): Button {
-        val button = plainButton(label) { confirm(op) }
-        if (danger) {
-            val error = MaterialColors.getColor(summary, androidx.appcompat.R.attr.colorError)
-            val off = MaterialColors.compositeARGBWithAlpha(MaterialColors.getColor(summary, com.google.android.material.R.attr.colorOnSurface), 97)
-            (button as MaterialButton).setTextColor(
-                ColorStateList(arrayOf(intArrayOf(android.R.attr.state_enabled), intArrayOf()), intArrayOf(error, off)),
-            )
-        }
-        actions += button to enabled
-        return button
-    }
-
-    private fun plainButton(label: String, onTap: () -> Unit): Button =
-        MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
-            text = label
-            isAllCaps = false
-            setPadding(dp(8), 0, dp(8), 0)
-            minWidth = dp(48)
-            setOnClickListener { onTap() }
-        }
-
-    private fun wideAction(label: String, op: JSONObject, enabled: Boolean): View =
-        actionsRow(action(label, op, enabled, danger = true))
-
-    private fun actionsRow(vararg buttons: View): View = LinearLayout(this).apply {
-        gravity = Gravity.END
-        buttons.forEach { addView(it, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)) }
-    }
-
-    private fun row(title: String, detail: String, blocked: String, buttons: View): View {
-        val views = ArrayList<View>()
-        views += text(com.google.android.material.R.style.TextAppearance_Material3_TitleSmall).apply { text = title }
-        views += body().apply { text = detail }
-        if (blocked.isNotEmpty()) {
-            views += text(com.google.android.material.R.style.TextAppearance_Material3_BodySmall).apply {
-                text = blocked
-                setTextColor(MaterialColors.getColor(summary, androidx.appcompat.R.attr.colorError))
-            }
-        }
-        views += buttons
-        return card(views)
-    }
-
-    private fun card(children: List<View>, strokeColor: Int? = null): View {
-        val inner = column().apply {
-            setPadding(dp(16), dp(12), dp(16), dp(8))
-            children.forEach { addView(it) }
-        }
-        return MaterialCardView(this, null, com.google.android.material.R.attr.materialCardViewOutlinedStyle).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(10)
-            }
-            strokeColor?.let { setStrokeColor(it) }
-            addView(inner)
-        }
-    }
-
-    private companion object {
-        const val POLL_MS = 400L
+    companion object {
+        /** A VM's name: its deletion is planned and offered as soon as the screen has measured. */
+        const val EXTRA_DELETE = "delete"
+        private const val POLL_MS = 400L
     }
 }

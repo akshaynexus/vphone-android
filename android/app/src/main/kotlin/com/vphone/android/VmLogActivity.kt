@@ -2,20 +2,20 @@ package com.vphone.android
 
 import android.app.Activity
 import android.content.Intent
-import android.graphics.Color
-import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
-import android.view.View
-import android.view.ViewGroup
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
+import com.vphone.android.ui.VmLogScreen
+import com.vphone.android.ui.VphoneTheme
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.Executors
@@ -26,16 +26,13 @@ import java.util.concurrent.Executors
  * driver's messages, and with the VM's GPU diagnostics on, pictures of the surface behind the
  * frame on screen ([FrameDumps]).
  */
-class VmLogActivity : Activity() {
+class VmLogActivity : ComponentActivity() {
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
-    private lateinit var scroll: ScrollView
-    private lateinit var text: TextView
-    private lateinit var heading: TextView
-    private lateinit var followButton: Button
     private var path = ""
-    private var shown = ""
-    private var following = true
+    private var heading by mutableStateOf("")
+    private var shown by mutableStateOf("")
+    private var following by mutableStateOf(true)
 
     private val poll = object : Runnable {
         override fun run() {
@@ -45,54 +42,22 @@ class VmLogActivity : Activity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         path = intent.getStringExtra(EXTRA_PATH).orEmpty().ifEmpty { App.state().optString("logPath") }
-        heading = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            setPadding(8, 8, 8, 8)
-        }
-        text = TextView(this).apply {
-            typeface = Typeface.MONOSPACE
-            textSize = 10f
-            setTextColor(0xFFE0E0E0.toInt())
-            setTextIsSelectable(true)
-            setPadding(8, 8, 8, 8)
-        }
-        scroll = ScrollView(this).apply {
-            addView(text)
-            setOnScrollChangeListener { v, _, y, _, _ ->
-                val bottom = (v as ScrollView).getChildAt(0).height - v.height
-                val atEnd = y >= bottom - 48
-                if (atEnd != following) {
-                    following = atEnd
-                    followButton.visibility = if (following) View.GONE else View.VISIBLE
-                }
+        setContent {
+            VphoneTheme {
+                VmLogScreen(
+                    heading = heading,
+                    log = shown,
+                    following = following,
+                    onFollow = { following = it },
+                    onCopy = { App.copy(this, shown) },
+                    onShare = ::share,
+                    onBack = ::finish,
+                )
             }
         }
-        followButton = button("Jump to the end") {
-            following = true
-            followButton.visibility = View.GONE
-            scrollToEnd()
-        }.apply { visibility = View.GONE }
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            val weight = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addView(button("Copy") { App.copy(this@VmLogActivity, shown) }, weight)
-            addView(button("Share") { share() }, weight)
-            addView(button("Back") { finish() }, weight)
-        }
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
-            setPadding(16, 16, 16, 16)
-            addView(heading)
-            addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(followButton)
-            addView(actions)
-        }
-        App.fitSystemBars(root)
-        setContentView(root)
     }
 
     override fun onStart() {
@@ -110,20 +75,14 @@ class VmLogActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun button(label: String, action: () -> Unit) = Button(this).apply {
-        text = label
-        isAllCaps = false
-        setOnClickListener { action() }
-    }
-
     private fun load() {
         if (path.isEmpty()) {
-            heading.text = "No VM has run since the app started"
+            heading = "No VM has run since the app started"
             return
         }
         worker.execute {
             val log = Native.logTail(path, SHOWN_BYTES).ifEmpty { "(the log is empty)" }
-            main.post { show(log) }
+            main.post { if (!isDestroyed) show(log) }
         }
     }
 
@@ -131,16 +90,17 @@ class VmLogActivity : Activity() {
         val state = App.state()
         val phase = state.optString("phase")
         val started = state.optLong("startedMs")
-        val elapsed = if (started > 0 && phase in UP) " for ${clock((System.currentTimeMillis() - started) / 1000)}" else ""
-        heading.text = "${state.optString("vm").ifEmpty { File(path).parentFile?.name.orEmpty() }}: " +
-            "${VmService.phaseText(phase)}$elapsed"
+        val folder = File(path).parentFile?.name.orEmpty()
+        // A log that is not the VM's in this process says whose file it is, not a phase.
+        heading = if (state.optString("logPath") == path || state.optString("vm") == folder) {
+            val elapsed = if (started > 0 && phase in UP) " for ${clock((System.currentTimeMillis() - started) / 1000)}" else ""
+            "${state.optString("vm").ifEmpty { folder }}: ${VmService.phaseText(phase)}$elapsed"
+        } else {
+            "$folder: ${File(path).name}"
+        }
         if (log == shown || !following && shown.isNotEmpty()) return
         shown = log
-        text.text = log
-        if (following) scrollToEnd()
     }
-
-    private fun scrollToEnd() = scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
 
     private fun share() {
         val dir = File(cacheDir, "shared-logs").apply { mkdirs() }
