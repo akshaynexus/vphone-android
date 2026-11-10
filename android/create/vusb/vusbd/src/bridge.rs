@@ -486,6 +486,12 @@ impl Bridge {
         {
             return LIBUSB_ERROR_BUSY;
         }
+        // Configuration 0, or the one the guest already has, is answered here: opening a device
+        // can cycle 0 -> 1, and recovery-mode iBoot panics on that cycle. The guest keeps its
+        // configuration either way.
+        if value == 0 || value == *device.active_config.lock().unwrap() {
+            return 0;
+        }
         match self.link.control(&setup(0, 9, u16::from(value), 0, 0), &[], None) {
             Ok(_) => {
                 *device.active_config.lock().unwrap() = value;

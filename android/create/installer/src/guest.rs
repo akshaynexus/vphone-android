@@ -328,15 +328,28 @@ const JOB_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </dict></plist>
 "#;
 
-fn make_root_writable(host: &dyn Host) -> Result<()> {
+/// Whether `/` took a write in the end. launchd runs the remount job when it gets to it, which
+/// under emulation can be long after it was loaded: `/` is asked for a write every two seconds for
+/// two minutes, as guest-1x-logo.py does, instead of being given a fixed ten seconds.
+fn make_root_writable(host: &dyn Host) -> Result<bool> {
+    const PROBE: &str = "/System/Library/PrivateFrameworks/ProgressUI.framework/.vphone-linux-rw-probe";
     rpc(host, "files.write", json!({"path": JOB, "content": JOB_PLIST}))?;
     let loaded = rpc(host, "services.load", json!({"paths": [JOB]}));
+    let mut writable = false;
     if loaded.is_ok() {
-        std::thread::sleep(Duration::from_secs(10));
+        for _ in 0..60 {
+            crate::progress::check_cancel(host)?;
+            std::thread::sleep(Duration::from_secs(2));
+            if rpc(host, "files.write", json!({"path": PROBE, "content": ""})).is_ok() {
+                let _ = rpc(host, "files.remove", json!({"path": PROBE}));
+                writable = true;
+                break;
+            }
+        }
     }
     let _ = rpc(host, "services.unload", json!({"paths": [JOB], "force": true}));
     let _ = rpc(host, "files.remove", json!({"path": JOB}));
-    loaded.map(|_| ())
+    loaded.map(|_| writable)
 }
 
 /// `guest-1x-logo.py`: write a 1x boot logo beside each @2x one. Returns how many.
@@ -353,7 +366,11 @@ pub fn write_1x_logos(host: &dyn Host) -> Result<usize> {
     if want.is_empty() {
         return Ok(0);
     }
-    make_root_writable(host)?;
+    if !make_root_writable(host)? {
+        // Cosmetic: without the 1x images the boot screen stays black until the lock screen.
+        host.log("warning: / stayed read-only, so no 1x boot logo was written");
+        return Ok(0);
+    }
     let mut done = 0;
     for name in want {
         let data = files_read(host, &format!("{LOGO_DIR}/{name}"))?;

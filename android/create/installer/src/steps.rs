@@ -563,9 +563,19 @@ pub struct CfwParams<'a> {
     pub log: &'a Path,
 }
 
+/// A stream to the guest's SSH port. With the VM's ECID, only its own device is taken: one whose
+/// serial carries that ECID, or the sole device when its serial carries none (the SSH ramdisk).
+fn connect_ssh(socket: &Path, timeout: Duration, ecid: Option<u64>) -> Result<std::os::unix::net::UnixStream> {
+    match ecid {
+        Some(ecid) => vusb_portfwd::connect_ecid(socket, 22, timeout, ecid),
+        None => vusb_portfwd::connect(socket, 22, timeout),
+    }
+    .map_err(|e| Error::Ssh(format!("usbmux: {e}")))
+}
+
 /// Until the ramdisk's SSH answers: `connect` blocks until the device's port accepts, so nothing
 /// here sleeps but the short gap after an attempt that failed straight away.
-fn ssh_wait(host: &dyn Host, log: &Path) -> Result<GuestSsh> {
+fn ssh_wait(host: &dyn Host, log: &Path, ecid: Option<u64>) -> Result<GuestSsh> {
     const NOTE_EVERY: Duration = Duration::from_secs(5 * 60);
     let socket = host.usbmux_socket();
     let mut last = String::new();
@@ -578,8 +588,7 @@ fn ssh_wait(host: &dyn Host, log: &Path) -> Result<GuestSsh> {
         }
         let began = crate::active::ActiveInstant::now();
         let attempt = (|| -> Result<GuestSsh> {
-            let stream = vusb_portfwd::connect(&socket, 22, Duration::from_secs(30))
-                .map_err(|e| Error::Ssh(format!("usbmux: {e}")))?;
+            let stream = connect_ssh(&socket, Duration::from_secs(30), ecid)?;
             let ssh = GuestSsh::connect(Connect::ramdisk(Target::Connected(stream)))?;
             ssh.exec("id", Some(Duration::from_secs(30)))?.check("id")?;
             Ok(ssh)
@@ -649,7 +658,7 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         ];
         let helper = host.spawn_helper(CLI, &args, &env, &boot_log).map_err(Error::msg)?;
         host.log(&format!("waiting for the SSH ramdisk (log: {})", boot_log.display()));
-        let ssh = ssh_wait(host, &boot_log);
+        let ssh = ssh_wait(host, &boot_log, Some(params.ecid));
         helper.stop();
         let ssh = ssh?;
         ssh.exec(GIGALOCKER_SH, Some(Duration::from_secs(300)))?.check("gigalocker")?;
@@ -659,8 +668,9 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         // process a connection, and the slowest part of the path. Three leave the guest's other
         // vCPUs to its tar and its filesystem.
         let mux = host.usbmux_socket();
+        let ecid_value = params.ecid;
         let open = move || -> Result<GuestSsh> {
-            let stream = vusb_portfwd::connect(&mux, 22, Duration::from_secs(60)).map_err(|e| Error::Ssh(format!("usbmux: {e}")))?;
+            let stream = connect_ssh(&mux, Duration::from_secs(60), Some(ecid_value))?;
             GuestSsh::connect(Connect::ramdisk(Target::Connected(stream)))
         };
         let context = InstallContext {
@@ -972,7 +982,7 @@ mod tests {
         let (dir, log) = setup("");
         let host = FakeHost::new(false, dir.path().join("no-usbmux"));
         let start = Instant::now();
-        let err = ssh_wait(&host, &log).err().expect("no VM, no SSH").to_string();
+        let err = ssh_wait(&host, &log, None).err().expect("no VM, no SSH").to_string();
         assert!(start.elapsed() < Duration::from_secs(5), "it did not wait");
         assert!(err.contains("the VM stopped while waiting for the SSH ramdisk"), "{err}");
         assert!(err.contains("HOW THE VM ENDED"), "{err}");

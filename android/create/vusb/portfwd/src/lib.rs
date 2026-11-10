@@ -156,6 +156,82 @@ pub fn connect(usbmuxd_socket: &Path, device_port: u16, timeout: Duration) -> io
     }
 }
 
+/// The ECID a device's usbmux serial carries, in the forms the VM's stages use: sixteen hex
+/// digits, with `0x`, or after the eight of a chip id (`0000FE01-0123456789ABCDEF`). The stock SSH
+/// ramdisk's build-date serial has none.
+pub fn serial_ecid(serial: &str) -> Option<u64> {
+    let s = serial.trim().to_ascii_uppercase();
+    let hex16 = |t: &str| (t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u64::from_str_radix(t, 16).ok()).flatten();
+    if let Some(rest) = s.strip_prefix("0X") {
+        return hex16(rest);
+    }
+    if s.len() == 16 {
+        return hex16(&s);
+    }
+    let chip = |t: &str| t.len() == 8 && t.bytes().all(|b| b.is_ascii_hexdigit());
+    match s.len() {
+        24 if chip(&s[..8]) => hex16(&s[8..]),
+        25 if chip(&s[..8]) && s.as_bytes()[8] == b'-' => hex16(&s[9..]),
+        _ => None,
+    }
+}
+
+/// The device of `ecid` among `devices`: the one whose serial carries it, or a sole device whose
+/// serial carries none (the SSH ramdisk). Anything else is an error, never a guess: with an ECID
+/// asked for, a device of another VM must not be taken for this one.
+pub fn pick_device(devices: &[Device], ecid: u64) -> Result<&Device, String> {
+    let matches: Vec<&Device> = devices.iter().filter(|d| serial_ecid(&d.serial) == Some(ecid)).collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] if devices.len() == 1 && serial_ecid(&devices[0].serial).is_none() => Ok(&devices[0]),
+        [] => Err(format!("ECID 0x{ecid:016X} matches none of the {} usbmux devices", devices.len())),
+        _ => Err(format!("ECID 0x{ecid:016X} matches more than one usbmux device")),
+    }
+}
+
+/// The devices usbmuxd has now: it lists them on LISTEN, and `settle` without another event ends
+/// the list.
+pub fn list_devices(usbmuxd_socket: &Path, settle: Duration) -> io::Result<Vec<Device>> {
+    let mut s = UnixStream::connect(usbmuxd_socket)?;
+    s.set_read_timeout(Some(settle.max(Duration::from_millis(1))))?;
+    send_header(&mut s, MESSAGE_LISTEN, 1, &[])?;
+    expect_ok(&mut s, "LISTEN")?;
+    let mut devices: Vec<Device> = Vec::new();
+    loop {
+        match read_message(&mut s) {
+            Ok((MESSAGE_DEVICE_ADD, _, body)) => devices.extend(parse_device(&body)),
+            Ok((MESSAGE_DEVICE_REMOVE, _, body)) if body.len() >= 4 => {
+                let id = u32::from_le_bytes(body[..4].try_into().unwrap());
+                devices.retain(|d| d.id != id);
+            }
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => return Ok(devices),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// As [`connect`], to the device of `ecid` (see [`pick_device`]). No device yet is waited for; a
+/// device that is there and is not this VM's is an error at once.
+pub fn connect_ecid(usbmuxd_socket: &Path, device_port: u16, timeout: Duration, ecid: u64) -> io::Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let attempt = list_devices(usbmuxd_socket, Duration::from_millis(300)).and_then(|devices| {
+            if devices.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no usbmux device yet"));
+            }
+            let device = pick_device(&devices, ecid).map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))?;
+            connect_device(usbmuxd_socket, device.id, device_port)
+        });
+        match attempt {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(e),
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn copy_shutdown(mut from: impl Read, mut to: impl Write, on_done: impl FnOnce()) {
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -257,4 +333,38 @@ pub fn forward(usbmuxd_socket: &Path, listen: &Listen, device_port: u16) -> io::
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ecid_tests {
+    use super::*;
+
+    fn device(id: u32, serial: &str) -> Device {
+        Device { id, product_id: 0x1281, serial: serial.into(), location: 0 }
+    }
+
+    #[test]
+    fn a_serial_s_ecid_is_read_in_each_form_the_stages_use() {
+        const E: u64 = 0x36CE_A734_EBD7_E663;
+        for serial in ["36CEA734EBD7E663", "0x36cea734ebd7e663", "0000FE01-36CEA734EBD7E663", "0000FE0136CEA734EBD7E663"] {
+            assert_eq!(serial_ecid(serial), Some(E), "{serial}");
+        }
+        for serial in ["", "Sep 22 2022", "36CEA734EBD7E66", "0000FE01_36CEA734EBD7E663", "ZZCEA734EBD7E663"] {
+            assert_eq!(serial_ecid(serial), None, "{serial}");
+        }
+    }
+
+    #[test]
+    fn only_this_vm_s_device_is_picked() {
+        const E: u64 = 0x36CE_A734_EBD7_E663;
+        let mine = device(2, "0000FE01-36CEA734EBD7E663");
+        let other = device(3, "0000FE01-0000000000000001");
+        let ramdisk = device(4, "Sep 22 2022");
+        assert_eq!(pick_device(&[other.clone(), mine.clone()], E).unwrap().id, 2);
+        assert_eq!(pick_device(&[ramdisk.clone()], E).unwrap().id, 4, "a sole device without an ECID in its serial");
+        assert!(pick_device(&[other.clone()], E).is_err(), "another VM's device is not taken");
+        assert!(pick_device(&[ramdisk.clone(), other], E).is_err(), "not sole: no guess");
+        assert!(pick_device(&[mine.clone(), mine], E).is_err());
+        assert!(pick_device(&[], E).is_err());
+    }
 }
