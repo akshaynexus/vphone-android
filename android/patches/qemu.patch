@@ -209,15 +209,16 @@ index 97ee78299bf7566a1c0c808dc7bbca7eaad82102..f967680fc16ffa1b007db3787a268f4a
  
      filename = g_strdup_printf("%s/vl.XXXXXX", tmpdir);
 diff --git a/host/include/aarch64/host/cpuinfo.h b/host/include/aarch64/host/cpuinfo.h
-index fe671534e40fa0198a42a08e69af4c6054f09be3..6af9b4e0d3b3799aba292aca8de52b6e61c04dd0 100644
+index fe671534e40fa0198a42a08e69af4c6054f09be3..2e2e6c5b40726fe606b33e86c91bc3910c4757aa 100644
 --- a/host/include/aarch64/host/cpuinfo.h
 +++ b/host/include/aarch64/host/cpuinfo.h
-@@ -12,6 +12,8 @@
+@@ -12,6 +12,9 @@
  #define CPUINFO_AES             (1u << 3)
  #define CPUINFO_PMULL           (1u << 4)
  #define CPUINFO_BTI             (1u << 5)
 +#define CPUINFO_SHA2            (1u << 6)
 +#define CPUINFO_SHA512          (1u << 7)
++#define CPUINFO_SHA1            (1u << 8)
  
  /* Initialized with a constructor. */
  extern unsigned cpuinfo;
@@ -1230,6 +1231,55 @@ index 0000000000000000000000000000000000000000..2be384995bd9149a1d49fa88b041b587
 +}
 +
 +type_init(vsock_uds_register_types)
+diff --git a/hw/vmapple/vusb-pci.c b/hw/vmapple/vusb-pci.c
+index ebadef6b9894e63de079b813ecf6d4971c963665..1a5a3969038bcaaddfe8e666e46ba6eb5c009169 100644
+--- a/hw/vmapple/vusb-pci.c
++++ b/hw/vmapple/vusb-pci.c
+@@ -72,7 +72,7 @@ static void vusb_pci_handle_to_host(VirtIODevice *vdev, VirtQueue *vq)
+     VUSBVirtIODevice *s = VMAPPLE_VUSB_DEVICE(vdev);
+     VirtQueueElement *elem;
+ 
+-    if (!s->active) {
++    if (!s->active || !vdev->vm_running) {
+         return;
+     }
+ 
+@@ -113,7 +113,8 @@ static void vusb_pci_handle_to_guest(VUSBVirtIODevice *s)
+     VirtQueueElement *elem;
+     bool notified = false;
+ 
+-    if (!s->active) {
++    /* A stopped VM takes nothing: what the host sends waits for it to run. */
++    if (!s->active || !vdev->vm_running) {
+         return;
+     }
+ 
+@@ -193,7 +194,14 @@ static void vusb_pci_kick(void *opaque)
+ static int vusb_pci_set_status(VirtIODevice *vdev, uint8_t status)
+ {
+     VUSBVirtIODevice *s = VMAPPLE_VUSB_DEVICE(vdev);
+-    bool active = virtio_device_should_start(vdev, status);
++    /*
++     * Whether the guest's driver has the device, not whether the VM is
++     * running: this is also called when the VM is stopped and continued
++     * (a pause), with the driver's status unchanged. Taking a stop for the
++     * driver letting go made every continue a driver reset, which unplugs
++     * the device on the host and ends the restore that was using it.
++     */
++    bool active = virtio_device_started(vdev, status);
+ 
+     trace_vusb_pci_status(status, active);
+     if (active != s->active) {
+@@ -201,7 +209,8 @@ static int vusb_pci_set_status(VirtIODevice *vdev, uint8_t status)
+         vusb_alt_activate(s->vusb, active);
+     }
+ 
+-    if (active) {
++    /* On a continue this delivers what arrived while the VM was stopped. */
++    if (active && vdev->vm_running) {
+         vusb_pci_handle_to_host(vdev, s->to_host);
+         vusb_pci_handle_to_guest(s);
+     }
 diff --git a/hw/vmapple/vusb.c b/hw/vmapple/vusb.c
 index 9698e3e12e5d58fb7d9a9002c70faf19139f1321..ec8abb813e8c9302040d500c07da194f112cbc85 100644
 --- a/hw/vmapple/vusb.c
@@ -2030,7 +2080,7 @@ index 86006123076d51be4de1099ebbdd474ed8b2edd9..82845176f6c8ec9d95232c20dd9eea81
  
  static void memory_region_set_ram_ptr(MemoryRegion *mr, uint64_t size,
 diff --git a/target/arm/tcg/crypto_helper.c b/target/arm/tcg/crypto_helper.c
-index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48278e3cbe 100644
+index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..7a50e75b806bf49469dcff8223b73ecc834dee59 100644
 --- a/target/arm/tcg/crypto_helper.c
 +++ b/target/arm/tcg/crypto_helper.c
 @@ -16,6 +16,10 @@
@@ -2044,7 +2094,89 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
  
  #define HELPER_H "tcg/helper.h"
  #include "exec/helper-proto.h.inc"
-@@ -298,6 +302,13 @@ static uint32_t s1(uint32_t x)
+@@ -170,6 +174,13 @@ static uint32_t maj(uint32_t x, uint32_t y, uint32_t z)
+ 
+ void HELPER(crypto_sha1su0)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA1)) {
++        host_sha1su0(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *d = vd, *n = vn, *m = vm;
+     uint64_t d0, d1;
+ 
+@@ -215,6 +226,13 @@ static uint32_t do_sha1c(union CRYPTO_STATE *d)
+ 
+ void HELPER(crypto_sha1c)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA1)) {
++        host_sha1c(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     crypto_sha1_3reg(vd, vn, vm, desc, do_sha1c);
+ }
+ 
+@@ -225,6 +243,13 @@ static uint32_t do_sha1p(union CRYPTO_STATE *d)
+ 
+ void HELPER(crypto_sha1p)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA1)) {
++        host_sha1p(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     crypto_sha1_3reg(vd, vn, vm, desc, do_sha1p);
+ }
+ 
+@@ -235,11 +260,25 @@ static uint32_t do_sha1m(union CRYPTO_STATE *d)
+ 
+ void HELPER(crypto_sha1m)(void *vd, void *vn, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA1)) {
++        host_sha1m(vd, vn, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     crypto_sha1_3reg(vd, vn, vm, desc, do_sha1m);
+ }
+ 
+ void HELPER(crypto_sha1h)(void *vd, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA1)) {
++        host_sha1h(vd, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rm = vm;
+     union CRYPTO_STATE m = { .l = { rm[0], rm[1] } };
+@@ -255,6 +294,13 @@ void HELPER(crypto_sha1h)(void *vd, void *vm, uint32_t desc)
+ 
+ void HELPER(crypto_sha1su1)(void *vd, void *vm, uint32_t desc)
+ {
++#ifdef HAVE_HOST_SHA2
++    if (likely(cpuinfo & CPUINFO_SHA1)) {
++        host_sha1su1(vd, vm);
++        clear_tail_16(vd, desc);
++        return;
++    }
++#endif
+     uint64_t *rd = vd;
+     uint64_t *rm = vm;
+     union CRYPTO_STATE d = { .l = { rd[0], rd[1] } };
+@@ -298,6 +344,13 @@ static uint32_t s1(uint32_t x)
  
  void HELPER(crypto_sha256h)(void *vd, void *vn, void *vm, uint32_t desc)
  {
@@ -2058,7 +2190,7 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rd = vd;
      uint64_t *rn = vn;
      uint64_t *rm = vm;
-@@ -333,6 +344,13 @@ void HELPER(crypto_sha256h)(void *vd, void *vn, void *vm, uint32_t desc)
+@@ -333,6 +386,13 @@ void HELPER(crypto_sha256h)(void *vd, void *vn, void *vm, uint32_t desc)
  
  void HELPER(crypto_sha256h2)(void *vd, void *vn, void *vm, uint32_t desc)
  {
@@ -2072,7 +2204,7 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rd = vd;
      uint64_t *rn = vn;
      uint64_t *rm = vm;
-@@ -360,6 +378,13 @@ void HELPER(crypto_sha256h2)(void *vd, void *vn, void *vm, uint32_t desc)
+@@ -360,6 +420,13 @@ void HELPER(crypto_sha256h2)(void *vd, void *vn, void *vm, uint32_t desc)
  
  void HELPER(crypto_sha256su0)(void *vd, void *vm, uint32_t desc)
  {
@@ -2086,7 +2218,7 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rd = vd;
      uint64_t *rm = vm;
      union CRYPTO_STATE d = { .l = { rd[0], rd[1] } };
-@@ -378,6 +403,13 @@ void HELPER(crypto_sha256su0)(void *vd, void *vm, uint32_t desc)
+@@ -378,6 +445,13 @@ void HELPER(crypto_sha256su0)(void *vd, void *vm, uint32_t desc)
  
  void HELPER(crypto_sha256su1)(void *vd, void *vn, void *vm, uint32_t desc)
  {
@@ -2100,7 +2232,7 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rd = vd;
      uint64_t *rn = vn;
      uint64_t *rm = vm;
-@@ -432,6 +464,13 @@ static uint64_t s1_512(uint64_t x)
+@@ -432,6 +506,13 @@ static uint64_t s1_512(uint64_t x)
  
  void HELPER(crypto_sha512h)(void *vd, void *vn, void *vm, uint32_t desc)
  {
@@ -2114,7 +2246,7 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rd = vd;
      uint64_t *rn = vn;
      uint64_t *rm = vm;
-@@ -449,6 +488,13 @@ void HELPER(crypto_sha512h)(void *vd, void *vn, void *vm, uint32_t desc)
+@@ -449,6 +530,13 @@ void HELPER(crypto_sha512h)(void *vd, void *vn, void *vm, uint32_t desc)
  
  void HELPER(crypto_sha512h2)(void *vd, void *vn, void *vm, uint32_t desc)
  {
@@ -2128,7 +2260,7 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rd = vd;
      uint64_t *rn = vn;
      uint64_t *rm = vm;
-@@ -466,6 +512,13 @@ void HELPER(crypto_sha512h2)(void *vd, void *vn, void *vm, uint32_t desc)
+@@ -466,6 +554,13 @@ void HELPER(crypto_sha512h2)(void *vd, void *vn, void *vm, uint32_t desc)
  
  void HELPER(crypto_sha512su0)(void *vd, void *vn, uint32_t desc)
  {
@@ -2142,7 +2274,7 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rd = vd;
      uint64_t *rn = vn;
      uint64_t d0 = rd[0];
-@@ -482,6 +535,13 @@ void HELPER(crypto_sha512su0)(void *vd, void *vn, uint32_t desc)
+@@ -482,6 +577,13 @@ void HELPER(crypto_sha512su0)(void *vd, void *vn, uint32_t desc)
  
  void HELPER(crypto_sha512su1)(void *vd, void *vn, void *vm, uint32_t desc)
  {
@@ -2158,17 +2290,19 @@ index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..273f6bb718baf5237c6bc0223995cb48
      uint64_t *rm = vm;
 diff --git a/target/arm/tcg/crypto_sha_host.h b/target/arm/tcg/crypto_sha_host.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..01f186f20827ff0a0681c18476856de4cb01c7d1
+index 0000000000000000000000000000000000000000..814314f6e9da741e190a1cf05ece8b9c3328d945
 --- /dev/null
 +++ b/target/arm/tcg/crypto_sha_host.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,114 @@
 +/*
-+ * The guest's SHA-256 and SHA-512 instructions, by the same instructions
-+ * on an AArch64 host that has them
++ * The guest's SHA-1, SHA-256 and SHA-512 instructions, by the same
++ * instructions on an AArch64 host that has them
 + *
 + * An iOS restore hashes everything it writes: on a PC, a third of the CPU
 + * time of the image write was in the C versions of these helpers. Each
-+ * guest instruction maps to the host's identical one.
++ * guest instruction maps to the host's identical one. SHA-1 is what the
++ * restore's image receiver checks every chunk with, and what SSH's
++ * hmac-sha1 uses.
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later
 + */
@@ -2181,6 +2315,8 @@ index 0000000000000000000000000000000000000000..01f186f20827ff0a0681c18476856de4
 +
 +#include <arm_neon.h>
 +
++/* clang's "sha2" feature is the ARMv8 SHA1 and SHA2 pair, as -march=+sha2 is. */
++#define HOST_SHA1 __attribute__((target("sha2")))
 +#define HOST_SHA256 __attribute__((target("sha2")))
 +#define HOST_SHA512 __attribute__((target("sha3")))
 +
@@ -2192,6 +2328,42 @@ index 0000000000000000000000000000000000000000..01f186f20827ff0a0681c18476856de4
 +static inline uint64x2_t host_q64(const void *p)
 +{
 +    return vld1q_u64(p);
++}
++
++/* SHA1C/P/M take the hash's e from the low word of n; the rest of n is ignored. */
++static inline HOST_SHA1 void host_sha1c(void *d, void *n, void *m)
++{
++    vst1q_u32(d, vsha1cq_u32(host_q32(d), vgetq_lane_u32(host_q32(n), 0),
++                             host_q32(m)));
++}
++
++static inline HOST_SHA1 void host_sha1p(void *d, void *n, void *m)
++{
++    vst1q_u32(d, vsha1pq_u32(host_q32(d), vgetq_lane_u32(host_q32(n), 0),
++                             host_q32(m)));
++}
++
++static inline HOST_SHA1 void host_sha1m(void *d, void *n, void *m)
++{
++    vst1q_u32(d, vsha1mq_u32(host_q32(d), vgetq_lane_u32(host_q32(n), 0),
++                             host_q32(m)));
++}
++
++/* SHA1H writes the rotated low word and zeroes the rest of the register. */
++static inline HOST_SHA1 void host_sha1h(void *d, void *m)
++{
++    uint32_t e = vsha1h_u32(vgetq_lane_u32(host_q32(m), 0));
++    vst1q_u32(d, vsetq_lane_u32(e, vdupq_n_u32(0), 0));
++}
++
++static inline HOST_SHA1 void host_sha1su0(void *d, void *n, void *m)
++{
++    vst1q_u32(d, vsha1su0q_u32(host_q32(d), host_q32(n), host_q32(m)));
++}
++
++static inline HOST_SHA1 void host_sha1su1(void *d, void *m)
++{
++    vst1q_u32(d, vsha1su1q_u32(host_q32(d), host_q32(m)));
 +}
 +
 +static inline HOST_SHA256 void host_sha256h(void *d, void *n, void *m)
@@ -3788,13 +3960,14 @@ index 0000000000000000000000000000000000000000..0f2fa665ef2ef572bf711d9586758f5f
 +    return self && self->caller;
 +}
 diff --git a/util/cpuinfo-aarch64.c b/util/cpuinfo-aarch64.c
-index 57468890c33800147c0af70058366e007012dcd7..4691c614b1ac130dc6f3db3c9065185d5e7d4e40 100644
+index 57468890c33800147c0af70058366e007012dcd7..46b6360a180ab5bc729ffbbba04097676bf8a54f 100644
 --- a/util/cpuinfo-aarch64.c
 +++ b/util/cpuinfo-aarch64.c
-@@ -70,6 +70,10 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
+@@ -70,6 +70,11 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
      info |= (hwcap & HWCAP_USCAT ? CPUINFO_LSE2 : 0);
      info |= (hwcap & HWCAP_AES ? CPUINFO_AES : 0);
      info |= (hwcap & HWCAP_PMULL ? CPUINFO_PMULL : 0);
++    info |= (hwcap & HWCAP_SHA1 ? CPUINFO_SHA1 : 0);
 +    info |= (hwcap & HWCAP_SHA2 ? CPUINFO_SHA2 : 0);
 +#ifdef HWCAP_SHA512
 +    info |= (hwcap & HWCAP_SHA512 ? CPUINFO_SHA512 : 0);
