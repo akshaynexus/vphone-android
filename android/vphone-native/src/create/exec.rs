@@ -106,6 +106,12 @@ impl Exec {
                 started += TICK;
             }
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                // A tool that said the restore finished has done its job, whatever it exits with.
+                if let Some((needles, _)) = &self.done_when {
+                    if finished_at.is_some() || scan(&self.log, &mut scan_from, needles) {
+                        return Ok(0);
+                    }
+                }
                 return Ok(exit_code(status));
             }
             // Ahead of `cancelled`, which may be watching the VM: a VM that goes away after the

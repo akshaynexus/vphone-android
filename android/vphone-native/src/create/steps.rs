@@ -5,7 +5,8 @@ use super::state;
 use super::vm::VmKind;
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vphone_create_steps::display::WidthPolicy;
@@ -315,11 +316,29 @@ fn run_with_vm(e: &Arc<Engine>, exec: super::exec::Exec, what: &str) -> Result<(
     }
 }
 
+/// Whether the last restore in this log reached its end. Each attempt starts with the tool's
+/// banner, and the log is removed before an attempt erases the disk.
+fn last_restore_finished(log: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(log) else {
+        return false;
+    };
+    let last = text.rfind("idevicerestore ").map_or(&text[..], |at| &text[at..]);
+    last.to_ascii_lowercase().contains("status: restore finished")
+}
+
 fn restore(e: &Arc<Engine>) -> Result<(), String> {
-    e.usb_up()?;
     e.sup.stop()?;
-    reset_targets(e)?;
     let run = e.vm.join(".runs-dfu");
+    let log = run.join("restore.log");
+    let disk = fs::metadata(e.vm.join("Disk.img")).map_or(0, |m| m.blocks() * 512);
+    // The disk of a restore that finished but ended up reported as failed: nothing to redo.
+    if disk > GIB && last_restore_finished(&log) {
+        e.append_log("the last restore finished, so its disk is kept");
+        return Ok(());
+    }
+    let _ = fs::remove_file(&log);
+    e.usb_up()?;
+    reset_targets(e)?;
     e.start_vm(VmKind::Dfu, &e.vm, &run)?;
     e.status(true, |s| s.message = "Waiting for the VM's DFU mode".into());
     probe(e, &run)?;
@@ -542,6 +561,32 @@ mod tests {
         let err = run_with_vm(&e, exec, "the restore").unwrap_err();
         assert!(err.starts_with("the VM stopped during the restore"), "{err}");
         assert!(err.contains("How the VM ended:"), "{err}");
+    }
+
+    #[test]
+    fn only_the_last_attempt_in_a_restore_log_counts() {
+        let dir = std::env::temp_dir().join(format!("vphone-last-restore-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("restore.log");
+        assert!(!last_restore_finished(&log), "no log");
+        fs::write(&log, "idevicerestore 1.1.0\nRestoring image (13)\n").unwrap();
+        assert!(!last_restore_finished(&log), "still going");
+        fs::write(&log, "idevicerestore 1.1.0\nStatus: Restore Finished\nDONE\n").unwrap();
+        assert!(last_restore_finished(&log));
+        fs::write(&log, "idevicerestore 1.1.0\nStatus: Restore Finished\nidevicerestore 1.1.0\nSending iBSS\n").unwrap();
+        assert!(!last_restore_finished(&log), "a later attempt that did not finish");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_tool_that_finished_and_exited_non_zero_is_not_a_failure() {
+        let e = engine("finished-130");
+        let mut exec = shell(&e, "t.log", "echo 'Status: Restore Finished'; exit 130");
+        exec.done_when = Some((vec!["status: restore finished".into()], Duration::from_secs(60)));
+        assert_eq!(exec.run_until(&|| false, &|| false), Ok(0));
+        let mut exec = shell(&e, "u.log", "echo nope; exit 130");
+        exec.done_when = Some((vec!["status: restore finished".into()], Duration::from_secs(60)));
+        assert_eq!(exec.run_until(&|| false, &|| false), Ok(130));
     }
 
     #[test]
