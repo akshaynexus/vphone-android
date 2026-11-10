@@ -115,3 +115,71 @@ fn ramdisk_rebuild_with_the_real_ramdisk_and_tools() {
     assert!(v.lookup("/usr/libexec/sftp-server").is_ok());
     assert!(v.lookup("/usr/bin/img4tool").is_err(), "the drop list went");
 }
+
+/// A restore tree with the real stock ramdisk and the cloudOS manifest, as `fw prepare` leaves it
+/// for a build that does not set the restore's options.
+fn tree_with_stock_ramdisk(vm: &Path) -> (PathBuf, PathBuf) {
+    let tree = vm.join("iPhone_Restore");
+    fs::create_dir_all(&tree).unwrap();
+    let ramdisk = tree.join("094-39914-031.dmg");
+    fs::copy(real().join("094-39914-031.dmg"), &ramdisk).unwrap();
+    let ipsw = repo().join("android/build/vusb/ipsw/cloudOS-26.4-23E5207q.ipsw");
+    let mut archive = zip::ZipArchive::new(fs::File::open(ipsw).unwrap()).unwrap();
+    let mut out = fs::File::create(tree.join("BuildManifest.plist")).unwrap();
+    std::io::copy(&mut archive.by_name("BuildManifest.plist").unwrap(), &mut out).unwrap();
+    (tree, ramdisk)
+}
+
+#[test]
+fn the_fast_mtree_option_is_added_once_to_a_real_ramdisk_and_the_manifest_follows() {
+    use sha2::{Digest, Sha384};
+    use vc::restore_options::{ensure_fast_mtree, FastMtree, FAST_MTREE, OPTIONS_DIR};
+    let dir = tmp();
+    let (tree, ramdisk) = tree_with_stock_ramdisk(dir.path());
+    let before = fs::metadata(&ramdisk).unwrap().len();
+
+    let first = ensure_fast_mtree(dir.path(), &Silent).unwrap();
+    assert_eq!(first, FastMtree::TurnedOn(vec![format!("{OPTIONS_DIR}/options.plist")]));
+    assert_eq!(fs::metadata(&ramdisk).unwrap().len(), before, "the image keeps its size");
+
+    // What restored_external reads: the file, as a plist with the option true.
+    let payload = dir.path().join("payload.apfs");
+    vc::im4p::extract_rdsk_payload(&ramdisk, &payload).unwrap();
+    let container = vphone_apfs::open_image(&payload).unwrap();
+    let volume = container.open_volume(&VolumeSelector::default()).unwrap();
+    let inode = volume.lookup(&format!("{OPTIONS_DIR}/options.plist")).unwrap();
+    assert_eq!((inode.mode as u32 & 0o777, inode.uid, inode.gid), (0o644, 0, 0));
+    let options = plist::Value::from_reader(std::io::Cursor::new(volume.read_file(&inode).unwrap())).unwrap();
+    assert_eq!(options.as_dictionary().unwrap()[FAST_MTREE].as_boolean(), Some(true));
+    // The rest of the ramdisk is as it was.
+    let stock = vphone_apfs::open_image(&real().join("ramdisk.apfs")).unwrap();
+    let stock = stock.open_volume(&VolumeSelector::default()).unwrap();
+    for tool in ["/usr/local/bin/restored_external", "/System/Library/Filesystems/apfs.fs/apfs_sealvolume"] {
+        let (a, b) = (volume.lookup(tool).unwrap(), stock.lookup(tool).unwrap());
+        assert_eq!(volume.read_file(&a).unwrap(), stock.read_file(&b).unwrap(), "{tool}");
+    }
+
+    // Every identity's digest is the rewritten file's, which is what the restore personalizes.
+    let digest = Sha384::digest(fs::read(&ramdisk).unwrap()).to_vec();
+    let manifest = plist::Value::from_file(tree.join("BuildManifest.plist")).unwrap();
+    let identities = manifest.as_dictionary().unwrap()["BuildIdentities"].as_array().unwrap();
+    let mut checked = 0;
+    for identity in identities {
+        // Not every identity of a cloudOS has a restore ramdisk.
+        let Some(rd) = identity.as_dictionary().unwrap()["Manifest"].as_dictionary().unwrap().get("RestoreRamDisk") else { continue };
+        assert_eq!(rd.as_dictionary().unwrap()["Digest"].as_data().unwrap(), &digest[..]);
+        checked += 1;
+    }
+    assert!(checked > 0);
+
+    // Again: nothing to do, and nothing touched.
+    let bytes = fs::read(&ramdisk).unwrap();
+    assert_eq!(ensure_fast_mtree(dir.path(), &Silent).unwrap(), FastMtree::AlreadyOn);
+    assert_eq!(fs::read(&ramdisk).unwrap(), bytes);
+    assert!(!ramdisk.with_extension("options-work").exists() && !ramdisk.with_extension("options-new").exists());
+
+    // A tree holding the SSH ramdisk is left alone and says so.
+    fs::write(format!("{}.full-restore", ramdisk.display()), b"").unwrap();
+    assert!(matches!(ensure_fast_mtree(dir.path(), &Silent).unwrap(), FastMtree::Off(_)));
+    assert_eq!(fs::read(&ramdisk).unwrap(), bytes);
+}

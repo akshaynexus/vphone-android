@@ -244,6 +244,7 @@ fn run_install(version: &str, plan: Option<plist::Value>) -> (tempfile::TempDir,
     let work = vm.join(".cfw-work");
     let log = vm.join("log.txt");
     let cx = InstallContext {
+        more: None,
         host: &host,
         vm: &vm,
         release: &release,

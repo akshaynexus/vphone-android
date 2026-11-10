@@ -18,6 +18,7 @@ apple-codesign = { version = "=0.29.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "fs"] }
 vphone-apfs = { path = "../apfs" }
 vusb-portfwd = { path = "../vusb/portfwd" }
+vusb-common = { path = "../vusb/common" }
 thiserror = "2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +26,14 @@ serde_json = "1"
 plist = "1.7"
 sha1 = "0.10"
 sha2 = "0.10"
+# AEA: the firmware images' key schedule and cipher. aes 0.9 picks the ARMv8 AES instructions
+# at run time; 0.8 needs a build flag for them.
+hmac = "0.12"
+hkdf = "0.12"
+aes = "0.9"
+ctr = "0.10"
+lzfse_rust = "0.2"
+rayon = "1.10"
 base64 = "0.22"
 hex = "0.4"
 flate2 = "1"

@@ -353,6 +353,8 @@ pub struct InstallContext<'a> {
     pub work: &'a Path,
     pub log: &'a Path,
     pub ssh: &'a GuestSsh,
+    /// More connections to the guest's SSH, for the copies of gigabytes; `None` keeps to `ssh`.
+    pub more: Option<tree::MoreLinks<'a>>,
     pub system: GuestVolume<'a>,
     pub xart: GuestVolume<'a>,
     pub preboot: GuestVolume<'a>,
@@ -808,11 +810,11 @@ impl<'a, 'c> Installer<'a, 'c> {
                 // removed as links.
                 self.cx.system.remove_item(dest)?;
                 self.cx.system.mkdir_p(dest, 0o755)?;
-                self.log(format!("[*] copying {} (tar over ssh)", dest));
                 let tree = self.os_tree(&image, "/");
                 let exclude = move |rel: &str| skip_dsc && rel == DSC_IN_OS;
                 let guest_dest = self.cx.system.path(dest)?;
-                let stats = tree::upload_tree(self.cx.ssh, &guest_dest, &tree, None, &exclude, self.host())?;
+                let what = format!("iOS's system files ({dest})");
+                let stats = tree::upload_tree_over(&what, self.cx.ssh, self.cx.more.as_ref(), &guest_dest, &tree, None, &exclude, self.host())?;
                 self.log(format!(
                     "[+] {dest}: {} files, {} dirs, {} links, {} MiB",
                     stats.files,
@@ -1052,7 +1054,7 @@ impl<'a, 'c> Installer<'a, 'c> {
         system.mkdir_p(GPU, 0o755)?;
         let dest = system.path(GPU)?;
         let source = LocalTree::new(&staged);
-        tree::upload_tree(self.cx.ssh, &dest, &source, Some(OWNER), &|_| false, self.host())?;
+        tree::upload_tree_as("the GPU driver", self.cx.ssh, &dest, &source, Some(OWNER), &|_| false, self.host())?;
         for file in [GPU.to_owned(), format!("{GPU}/AppleParavirtGPUMetalIOGPUFamily"), format!("{GPU}/_CodeSignature")] {
             system.set_mode(&file, 0o755)?;
         }
@@ -1074,7 +1076,7 @@ impl<'a, 'c> Installer<'a, 'c> {
         system.remove_item(target)?;
         system.mkdir_p(target, 0o755)?;
         let dest = system.path(target)?;
-        tree::upload_tree(self.cx.ssh, &dest, &source, Some(OWNER), &|_| false, self.host())?;
+        tree::upload_tree_as("the sound driver", self.cx.ssh, &dest, &source, Some(OWNER), &|_| false, self.host())?;
         for dir in [target.to_owned(), format!("{target}/_CodeSignature")] {
             system.set_mode(&dir, 0o755)?;
         }
@@ -1355,9 +1357,8 @@ impl<'a, 'c> Installer<'a, 'c> {
             let system = &self.cx.system;
             system.remove_item(DSC_IN_SYSTEM)?;
             system.mkdir_p(DSC_IN_SYSTEM, 0o755)?;
-            self.log("[*] uploading the patched dyld cache");
             let dest = system.path(DSC_IN_SYSTEM)?;
-            tree::upload_tree(self.cx.ssh, &dest, &source, None, &|_| false, self.host())?;
+            tree::upload_tree_over("the patched dyld cache", self.cx.ssh, self.cx.more.as_ref(), &dest, &source, None, &|_| false, self.host())?;
             self.records.mark("cfw.dsc-uploaded")?;
         }
 

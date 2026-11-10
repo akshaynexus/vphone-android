@@ -32,6 +32,12 @@ pub const CLI: &str = "libvphone_cli.so";
 pub const GPU_BUNDLE: &str = "AppleParavirtGPUMetalIOGPUFamily.bundle";
 /// The first bytes of the driver's SHA-1 on the tested cloudOS 26.4 23E5207q.
 pub const KNOWN_GPU_SHA1_PREFIX: &str = "b5d95b38";
+/// The whole of it, which the driver read straight from that cloudOS's image must have.
+pub const KNOWN_GPU_SHA1: &str = "b5d95b3886dfcfdeb45de7d60124697bd4916109";
+/// The decrypted system image while the driver is read from it; removed when the step ends.
+/// The cloudOS build that hash belongs to.
+pub const KNOWN_CLOUD_BUILD: &str = "23E5207q";
+const GPU_IMAGE: &str = ".gpu-driver-system.img";
 
 const GIGALOCKER_SH: &str = r#"x=; for n in 1 2 3 4 5 6 7; do t=$(/System/Library/Filesystems/apfs.fs/apfs.util -p /dev/disk1s$n 2>/dev/null); [ "$t" = xART ] && x=/dev/disk1s$n; done
 [ -n "$x" ] || x=/dev/disk1s3
@@ -53,6 +59,9 @@ const USBMUX_ANSWER: Duration = Duration::from_secs(2);
 /// A ramdisk boots slowly on a phone; this is what the wait came to at its old pace. Time the
 /// person has the creation paused does not count.
 const SSH_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
+/// How many connections a copy of gigabytes to the guest uses (measured through the ramdisk's
+/// dropbear on a PC: 133 MB/s over one, 236 over two, 412 over four).
+const COPY_STREAMS: usize = 3;
 /// Between attempts that failed straight away; one still waiting blocks in `connect` instead.
 const SSH_RETRY: Duration = Duration::from_secs(1);
 
@@ -168,6 +177,152 @@ pub fn extract_gpu_bundle(disk_image: &Path, out_dir: &Path, progress: &dyn Prog
     describe_gpu_bundle(&out)
 }
 
+fn zip_err(path: &Path) -> impl Fn(zip::result::ZipError) -> Error + '_ {
+    move |e| Error::msg(format!("{}: {e}", path.display()))
+}
+
+/// The member of a cloudOS IPSW that is its system volume's image (the manifest's `OS`), and
+/// the cloudOS build.
+fn cloud_os_member(ipsw: &Path, archive: &mut zip::ZipArchive<File>) -> Result<(String, String)> {
+    let mut bytes = Vec::new();
+    archive
+        .by_name("BuildManifest.plist")
+        .map_err(zip_err(ipsw))?
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::path(ipsw, e))?;
+    let manifest = Value::from_reader(std::io::Cursor::new(bytes))?;
+    let mut members = std::collections::BTreeSet::new();
+    let identities = manifest.as_dictionary().and_then(|d| d.get("BuildIdentities")).and_then(Value::as_array);
+    for identity in identities.into_iter().flatten() {
+        let path = identity
+            .as_dictionary()
+            .and_then(|d| d.get("Manifest"))
+            .and_then(Value::as_dictionary)
+            .and_then(|d| d.get("OS"))
+            .and_then(Value::as_dictionary)
+            .and_then(|d| d.get("Info"))
+            .and_then(Value::as_dictionary)
+            .and_then(|d| d.get("Path"))
+            .and_then(Value::as_string);
+        if let Some(path) = path {
+            members.insert(path.to_owned());
+        }
+    }
+    let build = manifest
+        .as_dictionary()
+        .and_then(|d| d.get("ProductBuildVersion"))
+        .and_then(Value::as_string)
+        .unwrap_or_default()
+        .to_owned();
+    let mut members = members.into_iter();
+    match (members.next(), members.next()) {
+        (Some(one), None) => Ok((one, build)),
+        (None, _) => bail!("{}: its BuildManifest names no OS image", ipsw.display()),
+        (Some(a), Some(b)) => bail!("{}: its BuildManifest names more than one OS image ({a}, {b})", ipsw.display()),
+    }
+}
+
+/// Removes the decrypted image however the step ends.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// How the driver was read from the image, for the log and for measuring.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTimings {
+    pub decrypt: Duration,
+    pub extract: Duration,
+    pub threads: usize,
+    pub image_bytes: u64,
+    pub written_bytes: u64,
+}
+
+/// The driver read from the cloudOS IPSW itself: its system image is an encrypted archive that
+/// carries its own key, so it is decrypted on `threads` threads into `out_dir` and the bundle is
+/// read from the APFS volume inside. `None` when the image has no key in its header; then only a
+/// restored cloudOS has the driver (`gpu_driver`).
+///
+/// The decrypted image exists only in `out_dir`, and only until this returns. The key is used
+/// and dropped here; nothing logs it.
+pub fn gpu_driver_from_image(
+    cloud_ipsw: &Path,
+    out_dir: &Path,
+    threads: usize,
+    progress: &dyn Progress,
+) -> Result<Option<(GpuDriver, GpuTimings)>> {
+    fs::create_dir_all(out_dir).map_err(|e| Error::path(out_dir, e))?;
+    let scratch = Scratch(out_dir.join(GPU_IMAGE));
+    let _ = fs::remove_file(&scratch.0);
+    let file = File::open(cloud_ipsw).map_err(|e| Error::path(cloud_ipsw, e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(zip_err(cloud_ipsw))?;
+    let (member, build) = cloud_os_member(cloud_ipsw, &mut archive)?;
+    let mut entry = archive.by_name(&member).map_err(zip_err(cloud_ipsw))?;
+    let archive_size = entry.size();
+    let prologue = crate::aea::Prologue::read(&mut entry).map_err(|e| Error::msg(format!("{member}: {e}")))?;
+    let Some(key) = prologue.embedded_key() else {
+        return Ok(None);
+    };
+    progress.log(&format!(
+        "=== Decrypting the cloudOS system image ({member}, {} MB) on {threads} threads",
+        archive_size >> 20
+    ));
+    let image = File::options()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&scratch.0)
+        .map_err(|e| Error::path(&scratch.0, e))?;
+    let began = Instant::now();
+    let done = crate::aea::decrypt(
+        &prologue,
+        &mut entry,
+        archive_size,
+        &key,
+        &image,
+        threads,
+        progress,
+        "Decrypting the cloudOS system image",
+    )
+    .map_err(|e| match e {
+        Error::Cancelled => Error::Cancelled,
+        e => Error::msg(format!("{member}: {e}")),
+    })?;
+    drop(image);
+    let decrypt = began.elapsed();
+    progress.log(&format!(
+        "decrypted {} MB ({} MB of it data) in {:.1} s",
+        done.size >> 20,
+        done.written >> 20,
+        decrypt.as_secs_f64()
+    ));
+    progress.log("=== Reading the GPU driver from the system image");
+    progress.progress(0, 0, "Reading the GPU driver from the system image");
+    let began = Instant::now();
+    let driver = extract_gpu_bundle(&scratch.0, out_dir, progress)?;
+    // The tested cloudOS has one driver; anything else from its image is a wrong read.
+    if build == KNOWN_CLOUD_BUILD && driver.sha1 != KNOWN_GPU_SHA1 {
+        let _ = fs::remove_dir_all(&driver.bundle);
+        bail!(
+            "the GPU driver read from cloudOS {build} has SHA-1 {}, not {KNOWN_GPU_SHA1}: the image or the read is damaged",
+            driver.sha1
+        );
+    }
+    let timings = GpuTimings {
+        decrypt,
+        extract: began.elapsed(),
+        threads,
+        image_bytes: done.size,
+        written_bytes: done.written,
+    };
+    drop(scratch);
+    Ok(Some((driver, timings)))
+}
+
 /// Add iPhone99,11 to a manifest's SupportedProductTypes (the temporary VM's
 /// product type, absent from cloudOS releases after the 26.4 beta).
 pub fn admit_temporary_vm(manifest_path: &Path) -> Result<()> {
@@ -239,7 +394,8 @@ pub struct GpuParams<'a> {
 }
 
 /// tools/gpu-driver-from-cloudos.sh: restore the stock cloudOS into a temporary
-/// VM and read the driver from its System volume. About 20-30 minutes.
+/// VM and read the driver from its System volume. Only for a cloudOS whose image
+/// `gpu_driver_from_image` cannot open: it is a whole restore.
 pub fn gpu_driver(params: &GpuParams) -> Result<GpuDriver> {
     let host = params.host;
     let existing = params.out_dir.join(GPU_BUNDLE);
@@ -420,7 +576,7 @@ fn ssh_wait(host: &dyn Host, log: &Path) -> Result<GuestSsh> {
         if !host.vm_alive() {
             bail!("the VM stopped while waiting for the SSH ramdisk\n{}", host.diagnostics());
         }
-        let began = Instant::now();
+        let began = crate::active::ActiveInstant::now();
         let attempt = (|| -> Result<GuestSsh> {
             let stream = vusb_portfwd::connect(&socket, 22, Duration::from_secs(30))
                 .map_err(|e| Error::Ssh(format!("usbmux: {e}")))?;
@@ -433,7 +589,7 @@ fn ssh_wait(host: &dyn Host, log: &Path) -> Result<GuestSsh> {
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(e) => last = e.to_string(),
         }
-        // Counted before the sleep, which a pause holds.
+        // On the active clock, and before the sleep, which a pause holds: paused time is not spent.
         spent += began.elapsed() + SSH_RETRY;
         if spent >= noted + NOTE_EVERY {
             noted = spent;
@@ -499,7 +655,16 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         ssh.exec(GIGALOCKER_SH, Some(Duration::from_secs(300)))?.check("gigalocker")?;
         ssh.exec(MOUNT_SH, Some(Duration::from_secs(1800)))?.check("mount_filesystems")?;
         let (sftp, raw) = ssh.sftp()?;
+        // The copies of gigabytes go over a few connections: the guest's SSH server is one
+        // process a connection, and the slowest part of the path. Three leave the guest's other
+        // vCPUs to its tar and its filesystem.
+        let mux = host.usbmux_socket();
+        let open = move || -> Result<GuestSsh> {
+            let stream = vusb_portfwd::connect(&mux, 22, Duration::from_secs(60)).map_err(|e| Error::Ssh(format!("usbmux: {e}")))?;
+            GuestSsh::connect(Connect::ramdisk(Target::Connected(stream)))
+        };
         let context = InstallContext {
+            more: Some(crate::tree::MoreLinks { open: &open, streams: COPY_STREAMS }),
             host,
             vm: &vm,
             release: params.release,

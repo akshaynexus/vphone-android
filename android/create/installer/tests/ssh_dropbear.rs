@@ -231,6 +231,147 @@ fn tar_upload_preserves_tree_including_long_names_and_setuid() {
     assert!(dest2.join("empty").exists());
 }
 
+/// What a copy told the screen and the log.
+#[derive(Default)]
+struct Told {
+    lines: std::sync::Mutex<Vec<String>>,
+    progress: std::sync::Mutex<Vec<(u64, u64, String)>>,
+}
+
+impl vc::progress::Progress for Told {
+    fn log(&self, line: &str) {
+        self.lines.lock().unwrap().push(line.to_owned());
+    }
+    fn progress(&self, done: u64, total: u64, message: &str) {
+        self.progress.lock().unwrap().push((done, total, message.to_owned()));
+    }
+}
+
+/// The copy the phone showed as stuck: one file of the dyld cache's kind, through the real
+/// dropbear. It must say how much there is before it starts, how far it is while it runs, and
+/// how long it took.
+#[test]
+fn a_large_copy_reports_its_total_its_progress_and_its_speed() {
+    let server = start_dropbear("ecdsa", None);
+    let ssh = connect(server.port);
+    let dir = tmp();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    const SIZE: u64 = 600_000_000;
+    fs::File::create(source.join("dyld_shared_cache_arm64e")).unwrap().set_len(SIZE).unwrap();
+    fs::write(source.join("small"), b"x").unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let told = Told::default();
+    let start = std::time::Instant::now();
+    tree::upload_tree_as("the patched dyld cache", &ssh, dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+    let took = start.elapsed().as_secs_f64();
+    println!("{} MB in {took:.2} s: {:.0} MB/s", SIZE / 1_000_000, SIZE as f64 / 1e6 / took);
+    assert_eq!(fs::metadata(dest.join("dyld_shared_cache_arm64e")).unwrap().len(), SIZE);
+    let lines = told.lines.lock().unwrap();
+    assert_eq!(lines[0], "[*] copying the patched dyld cache to the VM: 2 files, 600 MB (tar over SSH, one stream)");
+    let end = lines.last().unwrap();
+    assert!(end.starts_with("[+] copied the patched dyld cache: 600 MB in ") && end.contains("(average "), "{end}");
+    println!("{end}");
+    let progress = told.progress.lock().unwrap();
+    assert_eq!(progress[0], (0, SIZE + 1, "Copying the patched dyld cache to the VM: 0% (0 of 600 MB) \u{b7} measuring speed".to_owned()));
+    // Reports within the one big file, each with the total, never going back.
+    assert!(progress.len() >= 4, "{} reports", progress.len());
+    assert!(progress.iter().all(|p| p.1 == SIZE + 1));
+    assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0));
+    assert!(progress.iter().any(|p| p.0 > 0 && p.0 < SIZE), "a report from inside the file");
+    assert_eq!(progress.last().unwrap().0, SIZE + 1);
+    println!("{}", progress[progress.len() - 2].2);
+}
+
+/// A copy shaped like the patched dyld cache (a few large files) over one connection and over
+/// several, through the real dropbear: the same tree arrives either way, directory times
+/// included, and the rates are printed for comparison.
+#[test]
+fn a_large_copy_over_several_connections_arrives_the_same_and_faster() {
+    let server = start_dropbear("ecdsa", None);
+    let ssh = connect(server.port);
+    let dir = tmp();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("sub/deeper")).unwrap();
+    let mut total = 0u64;
+    for (i, mb) in [300u64, 250, 200, 150, 100, 100, 50, 50].iter().enumerate() {
+        let name = if i % 3 == 2 { format!("sub/deeper/cache.{i:02}") } else { format!("cache.{i:02}") };
+        // Not all zeros: each megabyte starts with its own number.
+        let f = fs::File::create(source.join(&name)).unwrap();
+        f.set_len(mb * 1_000_000).unwrap();
+        use std::os::unix::fs::FileExt;
+        for m in 0..*mb {
+            f.write_all_at(format!("{name} {m}").as_bytes(), m * 1_000_000).unwrap();
+        }
+        total += mb * 1_000_000;
+    }
+    std::os::unix::fs::symlink("cache.00", source.join("link")).unwrap();
+    fs::set_permissions(source.join("sub"), fs::Permissions::from_mode(0o750)).unwrap();
+    // A directory time from the past, which adding files to the copy must not replace.
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    fs::File::open(source.join("sub")).unwrap().set_modified(old).unwrap();
+    let port = server.port;
+    let open = move || Ok(connect(port));
+    let mut rates = Vec::new();
+    for streams in [1usize, 2, 4] {
+        let dest = dir.path().join(format!("dest{streams}"));
+        fs::create_dir_all(&dest).unwrap();
+        let told = Told::default();
+        let more = tree::MoreLinks { open: &open, streams };
+        let start = std::time::Instant::now();
+        let stats = tree::upload_tree_over("the cache", &ssh, Some(&more), dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+        let rate = total as f64 / 1e6 / start.elapsed().as_secs_f64();
+        println!("{streams} stream(s): {rate:.0} MB/s  ({})", told.lines.lock().unwrap().last().unwrap());
+        rates.push(rate);
+        assert_eq!((stats.files, stats.bytes, stats.symlinks, stats.dirs), (8, total, 1, 3));
+        assert_trees_equal(&source, &dest);
+        assert_eq!(fs::metadata(dest.join("sub")).unwrap().modified().unwrap(), old, "{streams} streams: the directory's time");
+        assert_eq!(fs::metadata(dest.join("sub")).unwrap().permissions().mode() & 0o777, 0o750);
+        let first = told.lines.lock().unwrap()[0].clone();
+        assert!(first.contains(if streams == 1 { "one stream" } else { "streams, one connection each" }), "{first}");
+        let progress = told.progress.lock().unwrap();
+        assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0), "progress never goes back");
+        assert_eq!(progress.last().unwrap().0, total);
+        fs::remove_dir_all(&dest).unwrap();
+    }
+    assert!(rates[2] > rates[0] * 1.3, "four connections were not faster than one: {rates:?}");
+}
+
+/// A copy too small to be worth a second key exchange stays on the one connection, and so does a
+/// large one when no further connection can be made.
+#[test]
+fn a_small_copy_or_no_second_connection_means_one_stream() {
+    let server = start_dropbear("ecdsa", None);
+    let ssh = connect(server.port);
+    let dir = tmp();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    sample_tree(&source);
+    let opened = std::sync::atomic::AtomicUsize::new(0);
+    let open = || {
+        opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(vc::error::Error::Ssh("refused".into()))
+    };
+    let more = tree::MoreLinks { open: &open, streams: 4 };
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let told = Told::default();
+    tree::upload_tree_over("a small tree", &ssh, Some(&more), dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+    assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 0, "a small copy asks for no connection");
+    assert_trees_equal(&source, &dest);
+    // Large, and the guest takes no second connection: one stream, said in the log, and it works.
+    fs::File::create(source.join("large")).unwrap().set_len(tree::PARALLEL_MIN_BYTES + 1).unwrap();
+    let dest = dir.path().join("dest-large");
+    fs::create_dir_all(&dest).unwrap();
+    let told = Told::default();
+    tree::upload_tree_over("a large tree", &ssh, Some(&more), dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+    assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1, "it stops asking at the first refusal");
+    let lines = told.lines.lock().unwrap();
+    assert!(lines[0].contains("no further connection to the VM's SSH") && lines[1].contains("one stream"), "{lines:?}");
+    assert_trees_equal(&source, &dest);
+}
+
 #[test]
 fn tar_upload_reports_a_failing_guest_tar() {
     let server = start_dropbear("ecdsa", None);

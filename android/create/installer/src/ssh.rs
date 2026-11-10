@@ -1,6 +1,7 @@
 //! An SSH client for the ramdisk's dropbear (root/alpine) over any byte stream,
 //! with a blocking facade so step code stays synchronous.
 
+use crate::active::ActiveInstant;
 use crate::error::{Error, Result};
 use crate::progress::{check_cancel, Progress};
 use russh_sftp::client::{RawSftpSession, SftpSession};
@@ -22,8 +23,14 @@ pub const USER: &str = "root";
 pub const PASSWORD: &str = "alpine";
 pub const SFTP_SERVER: &str = "/usr/libexec/sftp-server";
 
-/// The guest is emulated: a single request can take far longer than the library's default.
-const SFTP_TIMEOUT_SECS: u64 = 600;
+/// The SFTP library limits each request on the system clock, which runs on through a paused
+/// creation: a request the guest was stopped in would fail when it resumes. So the library's
+/// limit is out of the way. A guest that stops answering is caught by what watches the VM itself:
+/// a VM that exits closes this connection, and one that stops moving is stopped (the engine's
+/// stall watch).
+const SFTP_TIMEOUT_SECS: u64 = 30 * 24 * 3600;
+/// How often a command's time limit is looked at.
+const LIMIT_TICK: Duration = Duration::from_millis(500);
 
 struct AcceptAny {
     negotiated: Arc<Mutex<String>>,
@@ -159,6 +166,9 @@ impl GuestSsh {
             .map_err(|e| Error::io("tokio", e))?;
         let config = Arc::new(client::Config {
             keepalive_interval: Some(Duration::from_secs(15)),
+            // Keepalives go out, but going unanswered does not end the session: a paused guest
+            // answers none, for as long as the person keeps it paused.
+            keepalive_max: 0,
             preferred: preferred_algorithms(),
             ..Default::default()
         });
@@ -247,7 +257,8 @@ impl GuestSsh {
         self.runtime.block_on(f)
     }
 
-    /// Run a command and collect its output and exit status.
+    /// Run a command and collect its output and exit status. `timeout` is counted on the active
+    /// clock, which stops while the creation is paused.
     pub fn exec(&self, command: &str, timeout: Option<Duration>) -> Result<Output> {
         self.block_on(async {
             let mut channel = self
@@ -275,9 +286,20 @@ impl GuestSsh {
                 Ok::<_, Error>(out)
             };
             match timeout {
-                Some(t) => tokio::time::timeout(t, collect)
-                    .await
-                    .map_err(|_| Error::Ssh(format!("timed out: {command}")))?,
+                Some(limit) => {
+                    let began = ActiveInstant::now();
+                    tokio::pin!(collect);
+                    loop {
+                        tokio::select! {
+                            output = &mut collect => break output,
+                            _ = tokio::time::sleep(LIMIT_TICK) => {
+                                if began.elapsed() >= limit {
+                                    break Err(Error::Ssh(format!("timed out: {command}")));
+                                }
+                            }
+                        }
+                    }
+                }
                 None => collect.await,
             }
         })
