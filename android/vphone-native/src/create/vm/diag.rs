@@ -549,7 +549,8 @@ impl Sampler {
         let mut rows: Vec<(Thread, f64)> = current
             .iter()
             .map(|t| {
-                let before = self.last.iter().find(|o| o.tid == t.tid).map_or(t.ticks, |o| o.ticks);
+                // A thread born since the last sample did all its work in this window.
+                let before = self.last.iter().find(|o| o.tid == t.tid).map_or(0, |o| o.ticks);
                 (t.clone(), t.ticks.saturating_sub(before) as f64 / self.hz / secs * 100.0)
             })
             .collect();
