@@ -795,9 +795,8 @@ fn first_boot_flow(params: &FirstBoot, monitor: &firstboot::Monitor) -> Result<(
     wait_vphoned(host)?;
     monitor.agent_answered();
     firstboot::phase(host, "migration");
-    if params.trim_services {
-        firstboot::apply_profile(host, false);
-    }
+    // The trimmed profile waits for the migration: launchd only honours it at a job's next load,
+    // so it would not shorten this boot, and no migration has been run with it in place.
     // Asked every 10 s: the answer is a few preference reads in the guest, and each one not asked
     // is up to that long of a finished migration waited on.
     while !guest::data_migration_done(host) {
