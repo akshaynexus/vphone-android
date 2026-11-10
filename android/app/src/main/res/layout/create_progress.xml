@@ -107,6 +107,17 @@
                 android:layout_marginTop="2dp"
                 android:orientation="vertical" />
 
+            <!-- The running step's phases (the first boot's), each with its time. -->
+            <TextView
+                android:id="@+id/phases"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:layout_marginStart="28dp"
+                android:lineSpacingExtra="2dp"
+                android:textAppearance="?attr/textAppearanceBodySmall"
+                android:visibility="gone" />
+
             <com.google.android.material.card.MaterialCardView
                 style="@style/Widget.Material3.CardView.Filled"
                 android:layout_width="match_parent"

@@ -86,6 +86,10 @@ pub fn is_error(body: &str) -> bool {
         "unable to find persona with type",
         "failed to read nonce slot data",
     ];
+    // The first boot's load lines name guest processes, whatever they are called.
+    if body.starts_with(vphone_create_steps::firstboot::LOAD_MARK) {
+        return false;
+    }
     let lower = body.to_ascii_lowercase();
     SAYS.iter().any(|s| lower.contains(s)) && !BUT_NOT.iter().any(|s| lower.contains(s))
 }
@@ -1341,6 +1345,29 @@ fn step_times(status: &Status, index: &LogIndex, now: u64) -> HashMap<String, St
         .collect()
 }
 
+/// Each phase of the running step in a line of its own: what it took, how long it has run and
+/// what it last took on this phone, or that there is no estimate yet.
+pub fn phase_lines(status: &Status, now: u64) -> Vec<String> {
+    status
+        .phases
+        .iter()
+        .map(|p| {
+            let last = if p.measured {
+                format!("took {} last time on this phone", duration_text(p.est_secs))
+            } else {
+                "no estimate yet".to_string()
+            };
+            match p.state.as_str() {
+                "done" => format!("\u{2713} {} \u{b7} took {}", p.title, duration_text(p.elapsed_secs)),
+                "skipped" => format!("\u{2013} {} \u{b7} not seen", p.title),
+                "stopped" => format!("\u{2715} {} \u{b7} stopped after {}", p.title, duration_text(p.elapsed_secs)),
+                "running" => format!("\u{25b6} {} \u{b7} running for {} \u{b7} {last}", p.title, duration_text(ago(now, p.started_ms))),
+                _ => format!("\u{b7} {} \u{b7} {last}", p.title),
+            }
+        })
+        .collect()
+}
+
 static LIVE: Mutex<Option<LogIndex>> = Mutex::new(None);
 
 /// The status screen's live panel for this creation, as JSON. Called off the main thread.
@@ -1362,6 +1389,7 @@ pub fn live_json(paths: &Paths, status: &Status) -> String {
         "vm": vm_stats_facts(paths, status.state == "running"),
         "phone": phone_facts(paths),
         "stepTimes": times,
+        "phases": phase_lines(status, now),
     })
     .to_string()
 }
@@ -1476,6 +1504,7 @@ mod tests {
             assert!(!is_error(routine), "{routine}");
         }
         assert!(is_error("TXM [Error]: Errno: selector: 45 | 78"), "this one can matter");
+        assert!(!is_error("[load] t+90s | migration running | 2.10 guest CPUs busy: ReportCrash 0.90, failuredetectord 0.40; 300 processes"));
         for bad in ["ERROR: Unable to connect", "step restore failed", "panic(cpu 0 caller 0x1): x", "the restore timed out"] {
             assert!(is_error(bad), "{bad}");
         }

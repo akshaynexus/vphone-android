@@ -4,7 +4,7 @@ use super::compat::Firmware;
 use super::download::{self, Gate};
 use super::exec::{Background, Exec};
 use super::mirror::{self, Mirror};
-use super::state::{self, Spec, Status, StepStatus};
+use super::state::{self, PhaseStatus, Spec, Status, StepStatus};
 use super::steps::STEPS;
 use super::vm::{display, vitals, Supervisor, VmKind, VmProcess};
 use crate::paths::Paths;
@@ -36,6 +36,8 @@ const MUX_LOG: &str = "usbmuxd.log";
 pub const RESTORE_FREE_FLOOR: u64 = 25 * GIB;
 const GENERAL_FREE_FLOOR: u64 = 3 * GIB;
 const VM_FREE_FLOOR: u64 = 2 * GIB;
+/// The step whose phases are timed.
+pub const FIRST_BOOT_STEP: &str = "booted";
 
 /// Where the steps' measured times are kept, for every VM made on this phone.
 pub fn measured_file(paths: &Paths) -> PathBuf {
@@ -83,6 +85,109 @@ pub fn estimate(steps: &[StepStatus], current: &str, running_secs: u64) -> (u64,
     (secs, String::new())
 }
 
+/// The key a phase's time is kept under in the measured times, beside the steps' own.
+pub fn phase_key(step: &str, phase: &str) -> String {
+    format!("{step}.{phase}")
+}
+
+/// The phases a step starts with, each with what it last took on this phone.
+fn phases_of(step: &str, measured: &BTreeMap<String, u64>) -> Vec<PhaseStatus> {
+    if step != FIRST_BOOT_STEP {
+        return Vec::new();
+    }
+    vphone_create_steps::firstboot::PHASES
+        .iter()
+        .map(|(key, title)| {
+            let last = measured.get(&phase_key(step, key)).copied();
+            PhaseStatus {
+                key: (*key).into(),
+                title: (*title).into(),
+                state: "pending".into(),
+                est_secs: last.unwrap_or(0),
+                measured: last.is_some(),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// The time the phases still take, from what each last took on this phone, with `running_secs`
+/// of the running one gone; `None` where one of them has never finished here, or none is left.
+pub fn phases_left(phases: &[PhaseStatus], running_secs: u64) -> Option<u64> {
+    let left: Vec<&PhaseStatus> = phases.iter().filter(|p| matches!(p.state.as_str(), "pending" | "running")).collect();
+    if left.is_empty() || left.iter().any(|p| !p.measured) {
+        return None;
+    }
+    Some(left.iter().map(|p| if p.state == "running" { p.est_secs.saturating_sub(running_secs) } else { p.est_secs }).sum())
+}
+
+/// `key` begins: the phase running until now is done after `ran_secs`, and those listed before
+/// `key` that never began are passed over (the guest was not seen entering them). The phase that
+/// ended and its time, for the measured record.
+pub fn advance_phases(phases: &mut [PhaseStatus], key: &str, ran_secs: u64, now_ms: u64) -> Option<(String, u64)> {
+    let at = phases.iter().position(|p| p.key == key)?;
+    if phases[at].state != "pending" {
+        return None;
+    }
+    let mut ended = None;
+    for phase in phases.iter_mut().take(at) {
+        match phase.state.as_str() {
+            "running" => {
+                phase.state = "done".into();
+                phase.elapsed_secs = ran_secs;
+                ended = Some((phase.key.clone(), ran_secs));
+            }
+            "pending" => phase.state = "skipped".into(),
+            _ => {}
+        }
+    }
+    phases[at].state = "running".into();
+    phases[at].started_ms = now_ms;
+    ended
+}
+
+/// Where the vCPUs were over the samples since the last line: how many were in user code (EL0)
+/// and in the kernel (EL1 and above), and the kernel address seen most, which is the idle loop
+/// when the guest is idle and a hot spot when it is not.
+#[derive(Default)]
+pub struct VcpuWindow {
+    samples: u32,
+    user: u32,
+    kernel_pcs: BTreeMap<u64, u32>,
+    /// A vCPU of this boot was seen in user code.
+    pub userspace_seen: bool,
+}
+
+impl VcpuWindow {
+    pub fn observe(&mut self, vcpus: &[crate::qmp::Vcpu]) {
+        for vcpu in vcpus {
+            self.samples += 1;
+            if vcpu.el == 0 {
+                self.user += 1;
+                self.userspace_seen = true;
+            } else {
+                *self.kernel_pcs.entry(vcpu.pc).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// The window in words, and a new window; empty where nothing was sampled.
+    pub fn take_note(&mut self) -> String {
+        if self.samples == 0 {
+            return String::new();
+        }
+        let kernel = self.samples - self.user;
+        let percent = |n: u32| (u64::from(n) * 100 + u64::from(self.samples) / 2) / u64::from(self.samples);
+        let mut note = format!("vCPU samples {}: user {}% kernel {}%", self.samples, percent(self.user), percent(kernel));
+        if let Some((pc, count)) = self.kernel_pcs.iter().max_by_key(|(pc, count)| (**count, std::cmp::Reverse(**pc))) {
+            note += &format!(" (most at {pc:#x}: {}%)", percent(*count));
+        }
+        let seen = self.userspace_seen;
+        *self = VcpuWindow { userspace_seen: seen, ..Default::default() };
+        note
+    }
+}
+
 pub fn free_bytes(dir: &Path) -> u64 {
     let Ok(c) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) else {
         return 0;
@@ -116,6 +221,10 @@ pub struct Engine {
     followed_paths: Mutex<Vec<PathBuf>>,
     /// The VM is held (pause, thermal, storage): nothing it does counts against a time limit.
     vm_held: Arc<AtomicBool>,
+    /// When the running phase began, on the active clock.
+    phase_started: Mutex<Option<active::ActiveInstant>>,
+    /// The vCPU samples since the first boot's last load line.
+    vcpu_window: Mutex<VcpuWindow>,
 }
 
 /// A log being followed into the step's log, with what marks its lines there.
@@ -178,6 +287,8 @@ impl Engine {
             restore_rate: Mutex::new(mirror::RestoreRate::new()),
             followed_paths: Mutex::new(Vec::new()),
             vm_held,
+            phase_started: Mutex::new(None),
+            vcpu_window: Mutex::new(VcpuWindow::default()),
         });
         Ok(e)
     }
@@ -226,7 +337,10 @@ impl Engine {
             .ok();
         *self.step_started.lock().unwrap() = active::ActiveInstant::now();
         let path = log_path.to_string_lossy().into_owned();
+        *self.phase_started.lock().unwrap() = None;
+        let phases = phases_of(key, &self.measured.lock().unwrap());
         self.status(true, |s| {
+            s.phases = phases;
             s.step = key.to_string();
             s.step_started_ms = state::now_ms();
             s.state = "running".into();
@@ -258,11 +372,18 @@ impl Engine {
             }
             total
         };
+        // The phase running when the step ended ran until now; only a finished step's is a
+        // measurement.
+        let last_phase = self.phase_started.lock().unwrap().take().map(|began| began.elapsed().as_secs());
+        let running_phase = self.snapshot().phases.iter().find(|p| p.state == "running").map(|p| p.key.clone());
         // A step that finished is a measurement of this phone, for the next estimate.
         let measured = (state_text == "done").then(|| {
             let mut m = self.measured.lock().unwrap();
             let secs = kept_measurement(m.get(key).copied(), elapsed.as_secs());
             m.insert(key.to_string(), secs);
+            if let (Some(phase), Some(ran)) = (&running_phase, last_phase) {
+                m.insert(phase_key(key, phase), ran);
+            }
             if let Ok(json) = serde_json::to_vec(&*m) {
                 let file = measured_file(&self.paths);
                 let _ = fs::create_dir_all(file.parent().unwrap_or(&self.paths.files));
@@ -271,6 +392,12 @@ impl Engine {
             secs
         });
         self.status(true, |s| {
+            for phase in &mut s.phases {
+                if phase.state == "running" {
+                    phase.elapsed_secs = last_phase.unwrap_or(0);
+                    phase.state = if state_text == "done" { "done".into() } else { "stopped".into() };
+                }
+            }
             for st in &mut s.steps {
                 if st.key == key {
                     st.state = state_text.to_string();
@@ -290,9 +417,45 @@ impl Engine {
     /// numbers that were not measured would only mislead.
     fn set_eta(&self, s: &mut Status) {
         let running = self.step_started.lock().unwrap().elapsed().as_secs();
-        let (secs, note) = estimate(&s.steps, &s.step, running);
+        let (mut secs, mut note) = estimate(&s.steps, &s.step, running);
+        // The first boot's own phases say more than its total: what is left of them replaces the
+        // step's share. Every step after the first boot is none, so nothing else is in the sum.
+        if s.step == FIRST_BOOT_STEP && s.steps.last().is_some_and(|last| last.key == FIRST_BOOT_STEP) {
+            let in_phase = self.phase_started.lock().unwrap().as_ref().map_or(0, |began| began.elapsed().as_secs());
+            // Where a phase has never finished here, the step's own total (or its reason for
+            // having none) stands.
+            if let Some(left) = phases_left(&s.phases, in_phase) {
+                (secs, note) = (left, String::new());
+            }
+        }
         s.eta_secs = secs;
         s.eta_note = note;
+    }
+
+    /// A phase of the running step began (`Progress::phase`).
+    fn begin_phase(&self, key: &str) {
+        let ran = {
+            let mut began = self.phase_started.lock().unwrap();
+            let ran = began.as_ref().map_or(0, |b| b.elapsed().as_secs());
+            *began = Some(active::ActiveInstant::now());
+            ran
+        };
+        let step = self.snapshot().step;
+        let mut ended = None;
+        self.status(true, |s| {
+            ended = advance_phases(&mut s.phases, key, ran, state::now_ms());
+            self.set_eta(s);
+        });
+        if let Some((phase, secs)) = ended {
+            self.append_log(&format!("phase {phase} took {}", super::logview::duration_text(secs)));
+            let mut m = self.measured.lock().unwrap();
+            m.insert(phase_key(&step, &phase), secs);
+            if let Ok(json) = serde_json::to_vec(&*m) {
+                let file = measured_file(&self.paths);
+                let _ = fs::create_dir_all(file.parent().unwrap_or(&self.paths.files));
+                let _ = state::write_atomic(&file, &json);
+            }
+        }
     }
 
     /// Follows a helper's own log into the step's, with what the VM and the USB link say beside
@@ -760,6 +923,9 @@ impl Progress for Engine {
             self.set_eta(s);
         });
     }
+    fn phase(&self, key: &str, _title: &str) {
+        self.begin_phase(key);
+    }
     /// Every long in-process job asks this often, so a pause stops them here.
     fn cancelled(&self) -> bool {
         while self.pause_requested() && !self.cancelled_now() {
@@ -856,6 +1022,7 @@ impl Sampler {
             self.ticks += 1;
             if self.ticks.is_multiple_of(vitals::PC_SAMPLE_TICKS) {
                 if let Ok(vcpus) = crate::qmp::sample_vcpus(&e.paths.qmp_socket(), self.vcpus) {
+                    e.vcpu_window.lock().unwrap().observe(&vcpus);
                     match self.watch.observe_pcs(vcpus) {
                         Some(vitals::Event::StoppedMoving) => e.append_log(&format!(
                             "[vm] the guest has stopped moving: {}",
@@ -898,6 +1065,7 @@ impl Host for Engine {
         let usb = Followed { mirror: Mirror::new(&logs.join("usb-broker.log")), prefix: "[usb] " };
         let mux = Followed { mirror: Mirror::new(&logs.join(MUX_LOG)), prefix: "[mux] " };
         self.sup.start(kind, vm, run, &self.vusb_socket(), display::setting(&self.vm))?;
+        *self.vcpu_window.lock().unwrap() = VcpuWindow::default();
         // From here the step's log shows the guest and the USB link, before any tool runs.
         let guest = Followed { mirror: Mirror::from_start(&self.sup.serial_log()), prefix: "[guest] " };
         let threads = Followed { mirror: Mirror::from_start(&run.join(super::vm::THREADS_LOG)), prefix: "[vm] " };
@@ -930,6 +1098,12 @@ impl Host for Engine {
             tail(logs.join("usb-broker.log")),
             tail(logs.join(MUX_LOG))
         )
+    }
+    fn vcpu_note(&self) -> String {
+        self.vcpu_window.lock().unwrap().take_note()
+    }
+    fn guest_userspace_seen(&self) -> bool {
+        self.vcpu_window.lock().unwrap().userspace_seen
     }
     fn vphoned_rpc(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         self.vphoned().rpc(method, params, timeout)
@@ -988,6 +1162,58 @@ mod tests {
         let last = [step("patch", "done", 60, true), step("booted", "running", 0, false)];
         assert_eq!(estimate(&last, "booted", 10).1, "No time estimate yet: the step left has never finished on this phone");
         assert_eq!(estimate(&[step("a", "done", 1, true)], "", 0), (0, String::new()));
+    }
+
+    #[test]
+    fn the_first_boots_phases_are_timed_and_estimated_from_this_phones_own_runs() {
+        let none = BTreeMap::new();
+        let mut phases = phases_of(FIRST_BOOT_STEP, &none);
+        assert_eq!(phases.len(), 6);
+        assert!(phases_of("restore", &none).is_empty());
+        assert_eq!(phases_left(&phases, 0), None, "nothing was ever measured here");
+        assert_eq!(advance_phases(&mut phases, "kernel", 0, 1000), None);
+        assert_eq!(advance_phases(&mut phases, "launchd", 40, 2000), Some(("kernel".into(), 40)));
+        assert_eq!(advance_phases(&mut phases, "launchd", 9, 2500), None, "a phase begins once");
+        assert_eq!(advance_phases(&mut phases, "migration", 60, 3000), Some(("launchd".into(), 60)));
+        assert_eq!((phases[0].state.as_str(), phases[0].elapsed_secs), ("done", 40));
+        assert_eq!((phases[2].state.as_str(), phases[2].started_ms), ("running", 3000));
+        // A guest never seen in user code before its agent answered: launchd is passed over.
+        let mut direct = phases_of(FIRST_BOOT_STEP, &none);
+        advance_phases(&mut direct, "kernel", 0, 1);
+        assert_eq!(advance_phases(&mut direct, "migration", 90, 2), Some(("kernel".into(), 90)));
+        assert_eq!(direct[1].state, "skipped");
+
+        // With every phase measured: what is left, the running one's own time taken off.
+        let measured: BTreeMap<String, u64> =
+            [("kernel", 40), ("launchd", 60), ("migration", 3000), ("setup", 20), ("unlock", 30), ("finish", 400)]
+                .into_iter()
+                .map(|(k, v)| (phase_key(FIRST_BOOT_STEP, k), v))
+                .collect();
+        let mut phases = phases_of(FIRST_BOOT_STEP, &measured);
+        assert_eq!(phases_left(&phases, 0), Some(3550));
+        advance_phases(&mut phases, "kernel", 0, 1);
+        advance_phases(&mut phases, "launchd", 35, 2);
+        advance_phases(&mut phases, "migration", 70, 3);
+        assert_eq!(phases_left(&phases, 1000), Some(2000 + 20 + 30 + 400));
+        assert_eq!(phases_left(&phases, 5000), Some(450), "a phase that overruns leaves the rest");
+        // One phase never finished here: no number.
+        let mut some = measured.clone();
+        some.remove(&phase_key(FIRST_BOOT_STEP, "finish"));
+        assert_eq!(phases_left(&phases_of(FIRST_BOOT_STEP, &some), 0), None);
+    }
+
+    #[test]
+    fn vcpu_samples_are_summed_into_one_note() {
+        use crate::qmp::Vcpu;
+        let mut window = VcpuWindow::default();
+        assert_eq!(window.take_note(), "");
+        window.observe(&[Vcpu { index: 0, pc: 0xfffffe0000001000, el: 1 }, Vcpu { index: 1, pc: 0xfffffe0000002000, el: 1 }]);
+        assert!(!window.userspace_seen);
+        window.observe(&[Vcpu { index: 0, pc: 0xfffffe0000001000, el: 1 }, Vcpu { index: 1, pc: 0x100004000, el: 0 }]);
+        assert!(window.userspace_seen);
+        assert_eq!(window.take_note(), "vCPU samples 4: user 25% kernel 75% (most at 0xfffffe0000001000: 50%)");
+        assert_eq!(window.take_note(), "", "a new window");
+        assert!(window.userspace_seen, "which still knows the boot reached user code");
     }
 
     #[test]

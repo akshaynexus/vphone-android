@@ -140,6 +140,20 @@
             android:layout_height="wrap_content"
             android:text="Delete the firmware files when finished (12 GB back; another VM downloads them again)" />
 
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/trim_services"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="Turn off background services a VM has no use for" />
+
+        <TextView
+            android:id="@+id/trim_note"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="?attr/colorOnSurfaceVariant" />
+
         <TextView
             android:id="@+id/preflight"
             android:layout_width="match_parent"

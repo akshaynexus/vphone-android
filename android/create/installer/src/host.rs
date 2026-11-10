@@ -35,6 +35,15 @@ pub trait Host: Progress {
     fn diagnostics(&self) -> String {
         String::new()
     }
+    /// Where the guest's vCPUs were since this was last asked (user or kernel code), in a few
+    /// words; empty where the host cannot tell.
+    fn vcpu_note(&self) -> String {
+        String::new()
+    }
+    /// Whether a vCPU of this boot has been seen running user code: the kernel has started launchd.
+    fn guest_userspace_seen(&self) -> bool {
+        false
+    }
     /// `POST /v1/rpc` on the guest's vphoned; the result object.
     fn vphoned_rpc(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String>;
     /// Run a `lib*.so` helper to completion. Exit status, Err only when it could not be run.

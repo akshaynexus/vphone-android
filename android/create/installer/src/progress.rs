@@ -13,6 +13,8 @@ pub trait Progress: Send + Sync {
     fn log(&self, line: &str);
     /// Progress within the current step; `total == 0` when unknown.
     fn progress(&self, done: u64, total: u64, message: &str);
+    /// A named phase of the step began, and the one before it ended.
+    fn phase(&self, _key: &str, _title: &str) {}
     /// Polled between units of work; true makes the step return `Error::Cancelled`.
     fn cancelled(&self) -> bool {
         false

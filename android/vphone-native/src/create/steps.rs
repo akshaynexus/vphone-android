@@ -443,13 +443,19 @@ fn cfw(e: &Arc<Engine>) -> Result<(), String> {
 }
 
 fn first_boot(e: &Arc<Engine>) -> Result<(), String> {
-    e.status(true, |s| s.message = "First boot: iOS migrates its data; the logo and progress bar can stay up for a long time".into());
+    e.status(true, |s| s.message = "First boot: iOS migrates its data".into());
     let params = installer::FirstBoot {
         host: e.as_ref(),
         vm: &e.vm,
         scale: e.spec.scale,
         gfx: true,
+        trim_services: !e.spec.keep_all_services,
     };
+    e.append_log(if params.trim_services {
+        "background daemons: the trimmed service profile is applied in this boot, as chosen"
+    } else {
+        "background daemons: all kept on, as chosen"
+    });
     outcome(e, installer::first_boot(&params))?;
     // The VM leaves through a clean shutdown; the person launches it in the app's VM screen.
     e.status(true, |s| s.message = "Shutting the VM down cleanly".into());

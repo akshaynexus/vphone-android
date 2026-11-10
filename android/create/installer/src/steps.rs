@@ -7,6 +7,7 @@ use crate::bundle::{self, Bundle, BundleParams, Screen};
 use crate::cfw::{self, InstallContext, InstallReport};
 use crate::display::{self, WidthPolicy};
 use crate::error::{Error, Result};
+use crate::firstboot;
 use crate::guest;
 use crate::guestfs::GuestVolume;
 use crate::host::{BackgroundHelper, Host, VmKind};
@@ -816,13 +817,15 @@ pub struct FirstBoot<'a> {
     pub vm: &'a Path,
     pub scale: u32,
     pub gfx: bool,
+    /// Apply vphoned's `trimmed` service profile (`firstboot`'s module docs).
+    pub trim_services: bool,
 }
 
 fn wait_vphoned(host: &dyn Host) -> Result<()> {
     loop {
         check_cancel(host)?;
         if !host.vm_alive() {
-            bail!("QEMU exited; see {}", host.serial_log().display());
+            bail!("QEMU exited before the guest's agent answered; see {}\n{}", host.serial_log().display(), host.diagnostics());
         }
         if host.vphoned_rpc("setup.status", json!({}), Duration::from_secs(150)).is_ok() {
             return Ok(());
@@ -834,22 +837,45 @@ fn wait_vphoned(host: &dyn Host) -> Result<()> {
 /// `do_first_boot`: first boot, data migration, Setup Assistant, unlock,
 /// Auto-Lock Never, and the display scale's guest half with its restart and 1x logo.
 pub fn first_boot(params: &FirstBoot) -> Result<()> {
+    let monitor = firstboot::Monitor::new(params.host);
+    std::thread::scope(|scope| {
+        scope.spawn(|| monitor.run());
+        let result = first_boot_flow(params, &monitor);
+        monitor.stop();
+        result
+    })
+}
+
+fn first_boot_flow(params: &FirstBoot, monitor: &firstboot::Monitor) -> Result<()> {
     let host = params.host;
     let run = params.vm.join(".runs-first");
     fs::create_dir_all(&run).map_err(|e| Error::path(&run, e))?;
-    host.log("the first boot migrates iOS's data behind an Apple logo and progress bar (20+ min)");
+    host.log("the first boot migrates iOS's data behind an Apple logo and progress bar");
     host.start_vm(VmKind::FirstBoot { gfx: params.gfx }, params.vm, &run).map_err(Error::msg)?;
+    firstboot::phase(host, "kernel");
     wait_vphoned(host)?;
+    monitor.agent_answered();
+    firstboot::phase(host, "migration");
+    // The trimmed profile waits for the migration: launchd only honours it at a job's next load,
+    // so it would not shorten this boot, and no migration has been run with it in place.
+    // Asked every 10 s: the answer is a few preference reads in the guest, and each one not asked
+    // is up to that long of a finished migration waited on.
     while !guest::data_migration_done(host) {
         if !host.vm_alive() {
-            bail!("QEMU exited during the first boot; see {}", host.serial_log().display());
+            bail!("QEMU exited during the first boot; see {}\n{}", host.serial_log().display(), host.diagnostics());
         }
-        cancellable_sleep(host, Duration::from_secs(30))?;
+        cancellable_sleep(host, Duration::from_secs(10))?;
     }
+    firstboot::phase(host, "setup");
     guest::skip_setup(host)?;
+    if params.trim_services {
+        firstboot::apply_profile(host, true);
+    }
+    firstboot::phase(host, "unlock");
     if !guest::unlock(host) {
         host.log("the screen did not unlock");
     }
+    firstboot::phase(host, "finish");
     guest::auto_lock_never(host)?;
     if params.scale == 3 {
         return Ok(());
@@ -1087,6 +1113,16 @@ mod tests {
         assert!(device_left_usb(&none));
         assert!(!device_left_usb(&some));
         assert!(!device_left_usb(&dir.path().join("absent")), "no usbmuxd says nothing about the device");
+    }
+
+    #[test]
+    fn a_first_boot_whose_vm_died_says_how_it_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = FakeHost::new(false, dir.path().join("no-usbmux"));
+        let params = FirstBoot { host: &host, vm: dir.path(), scale: 3, gfx: true, trim_services: true };
+        let err = first_boot(&params).err().expect("the VM is gone").to_string();
+        assert!(err.contains("QEMU exited before the guest's agent answered"), "{err}");
+        assert!(err.contains("HOW THE VM ENDED"), "{err}");
     }
 
     #[test]

@@ -532,6 +532,29 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
+/// The end of a boot's stderr, for an error message: its last lines, and before them the lines
+/// in which the GPU library or the translator said why it ended the process or what it ran out
+/// of, wherever they stand. A GPU boot's stderr is mostly the translator's notes about how each
+/// shader differs, which would push the one line that names the cause out of any tail.
+fn stderr_tail(text: &str) -> String {
+    const LAST: usize = 20;
+    const CAUSES: usize = 12;
+    let names_a_cause = |l: &str| {
+        let l = l.to_ascii_lowercase();
+        l.contains("fatal") || l.contains("answered as when memory runs out") || l.contains("ran out of kernel mappings")
+    };
+    let plain: Vec<&str> = text.lines().filter(|l| !l.contains("[metal2vulkan-") || names_a_cause(l)).collect();
+    let last = &plain[plain.len().saturating_sub(LAST)..];
+    let causes: Vec<&str> = text.lines().filter(|l| names_a_cause(l) && !last.contains(l)).collect();
+    let causes = &causes[causes.len().saturating_sub(CAUSES)..];
+    let mut out: Vec<&str> = causes.to_vec();
+    if !causes.is_empty() {
+        out.push("...");
+    }
+    out.extend(last);
+    out.join("\n")
+}
+
 pub fn read_pid(paths: &Paths) -> Option<i32> {
     fs::read_to_string(pid_path(paths)).ok()?.trim().parse().ok()
 }
@@ -693,10 +716,7 @@ impl Supervisor {
         if let Some(facts) = self.stall.lock().unwrap().as_ref() {
             return facts.clone();
         }
-        // A GPU boot's stderr is mostly the translator's notes about how each shader differs.
-        let tail = crate::runtime::log_tail(&run.join("stderr.log").to_string_lossy(), 16384);
-        let tail: Vec<&str> = tail.lines().filter(|l| !l.contains("[metal2vulkan-")).collect();
-        let tail = tail[tail.len().saturating_sub(20)..].join("\n");
+        let tail = stderr_tail(&crate::runtime::log_tail(&run.join("stderr.log").to_string_lossy(), 256 * 1024));
         let tail = tail.trim();
         let reason = self.process.exit_reason();
         format!(
@@ -962,6 +982,20 @@ mod tests {
         let drives = drives(&normal.args);
         assert_eq!(drives.len(), 5, "{drives:?}");
         assert!(drives.iter().all(|d| !d.contains("cache=")), "{drives:?}");
+    }
+
+    #[test]
+    fn the_stderr_tail_keeps_the_line_that_names_the_cause() {
+        let mut text = String::from("reims-vgpu: fatal: platform call replaceBackingWithRanges:readOnly:: the host refused a remap (kern_return 3)\n");
+        for i in 0..40 {
+            text += &format!("metal2vulkan: shader {i} differs [metal2vulkan-degrade-x]\nline {i}\n");
+        }
+        let tail = stderr_tail(&text);
+        assert!(tail.starts_with("reims-vgpu: fatal: platform call replaceBackingWithRanges"), "{tail}");
+        assert!(tail.contains("\n...\nline 20\n") && tail.ends_with("line 39"), "{tail}");
+        assert!(!tail.contains("degrade"), "{tail}");
+        assert_eq!(stderr_tail("a\nb\n"), "a\nb");
+        assert_eq!(stderr_tail("x [metal2vulkan-y] fatal: z\nb\n"), "x [metal2vulkan-y] fatal: z\nb");
     }
 
     #[test]

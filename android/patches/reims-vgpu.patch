@@ -327,8 +327,181 @@ index caa55e58a5c39e22f520d8797bf2d5e253048bb0..36547a5cbf109007f595f0b8fe32ce5a
          assert_eq!(
              chosen(Some("/census".to_owned())),
              linux.then(|| PathBuf::from("/census"))
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/backing.rs b/crates/reims-vgpu-vulkan/src/gpu/backing.rs
+index 8f7d7464839060ef90ab745e8760615fd2cb47aa..aa8457d873bd5d049d78a143b5c9aad8b93bf313 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/backing.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/backing.rs
+@@ -639,7 +639,8 @@ impl Backing {
+     /// `replaceBackingWithRanges:readOnly:` of an object whose ranges must total `length` bytes
+     /// (a buffer's length, a heap descriptor's size) and whose runtime object covers `size`
+     /// (its length, the heap's size): NO for an attached object, ranges of another total, and
+-    /// ranges [`gather`] cannot alias, as Metal answers; else `rebind` gives the runtime's object
++    /// ranges [`gather_or_nil`] cannot alias, as Metal answers, or whose alias the host refused
++    /// for want of mappings or memory; else `rebind` gives the runtime's object
+     /// the alias, and YES. The alias is freed by its keep-alive, which a refused `rebind` drops
+     /// at once. A no-copy buffer's first YES runs its deallocator inside the call, as Metal's
+     /// does, where the runtime let go of the memory it was made over ([`Held`]).
+@@ -654,7 +655,7 @@ impl Backing {
+         if !self.is_detached() || total(ranges) != Some(length) {
+             return Ok(false);
+         }
+-        let Some(alias) = gather(REPLACE, ranges, size, read_only || self.read_only) else {
++        let Some(alias) = gather_or_nil(REPLACE, ranges, size, read_only || self.read_only) else {
+             return Ok(false);
+         };
+         let alias = Arc::new(alias);
+@@ -1182,7 +1183,7 @@ fn total(ranges: &[ResourceAddressRange]) -> Option<u64> {
+ }
+ 
+ /// A range of this platform's address space whose pages are the guest's, shared, and zeros past
+-/// them ([`gather`]), freed when it drops; or a range another holder maps, which the alias
++/// them ([`gather_or_nil`]), freed when it drops; or a range another holder maps, which the alias
+ /// borrows ([`Alias::borrowing`]): a surface's own view of the guest's pages on Linux, which
+ /// holds the same pages, zeros past them included, and lets the surface's buffers lie over it
+ /// with no second view of its pages (`crate::os::surface_alias`).
+@@ -1475,8 +1476,12 @@ fn off_the_page(sel: &'static str, address: u64, into: u64) -> ! {
+ /// unmapped range, one with a page the host maps without read access, which the runtime refuses
+ /// to import, past `size` too). Where the host refuses the alias what it needs past those checks
+ /// (address space, a remap of the guest's pages, which on Linux takes pages with a file behind
+-/// them, the block of zeros, a protection), the process ends at `sel` ([`refused_by_host`]):
+-/// Metal takes the ranges. [`gather_or_nil`] answers nil there instead.
++/// them, the block of zeros, a protection), the call answers as Metal's does when memory runs
++/// out, nothing left mapped (`crate::answer::out_of_host_memory`, counted; in strict mode the
++/// process ends at `sel`): a buffer over a surface or a heap over address ranges is nil, and a
++/// replace answers NO, its object staying detached. A replace ended the process there once: an
++/// iOS guest's first boot reached it at the views' budget, and the VM with every process in it
++/// is more to lose than one object's pages.
+ ///
+ /// Where the runtime imports read-only memory through a writable twin of its files
+ /// ([`crate::os::TWINS_READ_ONLY`], Linux), a read-only alias's zeros past the ranges' pages map
+@@ -1487,19 +1492,6 @@ fn off_the_page(sel: &'static str, address: u64, into: u64) -> ! {
+ /// either as host memory, which RADV refuses for any page with a file behind it, or as dma-bufs,
+ /// which udmabuf makes of files alone (`crate::os::host_memory`), so an alias of the guest's file
+ /// pages and anonymous zeros would import neither way; on Mach any allocation.
+-pub(crate) fn gather(
+-    sel: &'static str,
+-    ranges: &[ResourceAddressRange],
+-    size: u64,
+-    read_only: bool,
+-) -> Option<Alias> {
+-    gather_short(sel, ranges, size, read_only).unwrap_or_else(|short| refused_by_host(sel, &short))
+-}
+-
+-/// [`gather`] for a call whose refusal is a nil object (a buffer over a surface, a heap over
+-/// address ranges): where the host refuses the alias what it needs, the call answers nil, as
+-/// Metal's does when memory runs out, nothing left mapped
+-/// (`crate::answer::out_of_host_memory`, counted; in strict mode the process ends at `sel`).
+ pub(crate) fn gather_or_nil(
+     sel: &'static str,
+     ranges: &[ResourceAddressRange],
+@@ -1512,7 +1504,7 @@ pub(crate) fn gather_or_nil(
+     })
+ }
+ 
+-/// What the host refused [`gather`]'s alias past the checks of its ranges, where Metal's call
++/// What the host refused [`gather_or_nil`]'s alias past the checks of its ranges, where Metal's call
+ /// goes on: the line that names it.
+ #[derive(Debug)]
+ struct HostShort(String);
+@@ -1528,7 +1520,7 @@ impl HostShort {
+     }
+ }
+ 
+-/// [`gather`], `Err` where the host refuses the alias what it needs, nothing left mapped.
++/// [`gather_or_nil`], `Err` where the host refuses the alias what it needs, nothing left mapped.
+ fn gather_short(
+     sel: &'static str,
+     ranges: &[ResourceAddressRange],
+@@ -1596,20 +1588,6 @@ fn gather_short(
+     Ok(Some(alias))
+ }
+ 
+-/// The death at `sel` of what the host refused ([`HostShort`]), where Metal's call goes on: this
+-/// platform's alias of the guest's pages, or its zeros, need what Metal's own call does not, and
+-/// no answer of Metal's fits without them (a NO where Metal answers YES, or a detach whose object
+-/// stays over the guest's pages).
+-fn refused_by_host(sel: &'static str, short: &HostShort) -> ! {
+-    fatal_with_detail(
+-        DeathId::Platform {
+-            kind: DeathKind::Abort,
+-            call: sel,
+-        },
+-        &short.0,
+-    )
+-}
+-
+ /// The line of the death at `detachBacking` of an object the runtime refused to detach
+ /// ([`Backing::detach`]), `refused` its answer: a texture over its bytes whose image no stand-in
+ /// of zero bytes presents exactly (a multisample or multi-planar texture, or one with a depth or
+@@ -1928,7 +1906,7 @@ mod tests {
+         for (into, sel) in [(0x40, REPLACE), (PAGE / 4, "newHeapWithDescriptor:")] {
+             let ranges = [range(address(guest) + into, 2 * PAGE)];
+             *crate::answer::LAST_LINE.lock() = None;
+-            let site = catch_death(|| gather(sel, &ranges, 2 * PAGE, false).is_some()).unwrap_err();
++            let site = catch_death(|| gather_or_nil(sel, &ranges, 2 * PAGE, false).is_some()).unwrap_err();
+             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
+             assert!(
+@@ -1946,7 +1924,7 @@ mod tests {
+                 .is_success()
+         );
+         let unmapped = [range(address(guest) + 0x40, 2 * PAGE)];
+-        assert!(gather(REPLACE, &unmapped, 2 * PAGE, false).is_none());
++        assert!(gather_or_nil(REPLACE, &unmapped, 2 * PAGE, false).is_none());
+         assert!(vm.deallocate(guest, 2 * PAGE).is_success());
+     }
+ 
+@@ -1961,7 +1939,7 @@ mod tests {
+             range(address(guest) + PAGE, PAGE),
+             range(address(guest) + 3 * PAGE, PAGE),
+         ];
+-        let alias = gather(REPLACE, &ranges, 4 * PAGE, false).unwrap();
++        let alias = gather_or_nil(REPLACE, &ranges, 4 * PAGE, false).unwrap();
+         let first = alias.first();
+         assert_eq!(
+             [0, PAGE, 2 * PAGE, 3 * PAGE].map(|at| read(first, at)),
+@@ -2006,7 +1984,7 @@ mod tests {
+             vec![range(address(last), 2 * PAGE)],
+         ] {
+             assert!(
+-                gather(REPLACE, &ranges, 2 * PAGE, false).is_none(),
++                gather_or_nil(REPLACE, &ranges, 2 * PAGE, false).is_none(),
+                 "{ranges:?}"
+             );
+         }
+@@ -2020,7 +1998,7 @@ mod tests {
+             vec![range(address(last), 2 * PAGE)],
+         ] {
+             assert!(
+-                gather(REPLACE, &ranges, PAGE, false).is_none(),
++                gather_or_nil(REPLACE, &ranges, PAGE, false).is_none(),
+                 "{ranges:?}"
+             );
+         }
+@@ -2029,10 +2007,10 @@ mod tests {
+             range(address(around), PAGE),
+             range(address(last) + 0x40, PAGE - 0x40),
+         ];
+-        assert!(gather(REPLACE, &ends, 2 * PAGE, false).is_some());
++        assert!(gather_or_nil(REPLACE, &ends, 2 * PAGE, false).is_some());
+         let read_only = pages(1, 0);
+         vm.protect_max(read_only, PAGE, VmProt::READ).unwrap();
+-        assert!(gather(REPLACE, &[range(address(read_only), PAGE)], PAGE, false).is_some());
++        assert!(gather_or_nil(REPLACE, &[range(address(read_only), PAGE)], PAGE, false).is_some());
+         for page in [around, around.wrapping_add(2 * PAGE), last, read_only] {
+             assert!(vm.deallocate(page, PAGE).is_success());
+         }
+@@ -2234,7 +2212,7 @@ mod tests {
+     #[test]
+     fn a_read_only_alias_reads_zeros_past_its_pages() {
+         let guest = pages(1, 0xa5);
+-        let alias = gather(REPLACE, &[range(address(guest), PAGE)], 3 * PAGE, true).unwrap();
++        let alias = gather_or_nil(REPLACE, &[range(address(guest), PAGE)], 3 * PAGE, true).unwrap();
+         assert_eq!(alias.length, 3 * PAGE);
+         assert_eq!(read(alias.at, 0), 0xa5);
+         for offset in [PAGE, 2 * PAGE + 5, 3 * PAGE - 1] {
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/device.rs b/crates/reims-vgpu-vulkan/src/gpu/device.rs
-index efb4230a11c041cfaf56d9214b1d4d1386443aeb..e3d80193862792ead3ff3015bfdc9e7f3d60ac27 100644
+index efb4230a11c041cfaf56d9214b1d4d1386443aeb..1f9faeeef0bc08f3b2e7131ffb7d793fb4d6a906 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/device.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/device.rs
 @@ -322,7 +322,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
@@ -340,6 +513,15 @@ index efb4230a11c041cfaf56d9214b1d4d1386443aeb..e3d80193862792ead3ff3015bfdc9e7f
      crate::os::learn_view_imports(&raw);
      #[cfg(not(test))]
      if let Some(home) = std::env::var_os("HOME") {
+@@ -778,7 +778,7 @@ impl VulkanDevice {
+     /// (`newBufferWithIOSurface:`) answers the allocation size too, its first byte the surface's at
+     /// the base address, and reads 0 past the allocation's end (measured on the M3 Max at 0x40,
+     /// 0x1000 and 0x4000, by a kernel's copy). So the buffer is over an alias of the allocation's
+-    /// pages followed by zero-filled pages of the platform's own ([`backing::gather`]), from the
++    /// pages followed by zero-filled pages of the platform's own ([`backing::gather_or_nil`]), from the
+     /// offset into it, where the pages past the allocation would be other memory or none; what a
+     /// write past the allocation's end does on Metal is not measured, and here it reaches those
+     /// pages alone. On Linux a surface over several ranges of the guest's pages lends its own
 @@ -2791,7 +2791,7 @@ pub(crate) mod tests {
      /// command buffer completes, and the memory is unmapped once the import was freed. The command
      /// buffer reads another texture through its ID, so no command of it names the surface's.
@@ -398,7 +580,7 @@ index 22c34a3dbe8faccaa9fd4620c373b13b1eca3a7e..4b04cfc6c0e18655db4dba93389c5640
      CLOCKS.map(|clock| {
          let mut at = Timespec { sec: 0, nsec: 0 };
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource.rs b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
-index a053113024372d0fc8a54b0f7b918d4d51aad270..233fe0f5d3283fcb1891d053eaed8c07b084e426 100644
+index a053113024372d0fc8a54b0f7b918d4d51aad270..5d5ea485da43f2a216851056b85c67dee02121d3 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
 @@ -2402,7 +2402,7 @@ pub(crate) mod tests {
@@ -419,6 +601,15 @@ index a053113024372d0fc8a54b0f7b918d4d51aad270..233fe0f5d3283fcb1891d053eaed8c07
      #[test]
      fn a_fill_into_read_only_pages_dies_on_linux() {
          use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+@@ -4356,7 +4356,7 @@ pub(crate) mod tests {
+     /// an x86_64 guest's pages, is made on every host. The runtime's heap covers 16 KiB
+     /// ([`crate::gpu::backing::HEAP_GRANULE`]), so on a host of 4 KiB pages its alias has zeros
+     /// past the page: on Linux a file of their own, which the runtime imports with the guest's
+-    /// page as dma-bufs (`crate::gpu::backing::gather`); anonymous zeros beside them would import
++    /// page as dma-bufs (`crate::gpu::backing::gather_or_nil`); anonymous zeros beside them would import
+     /// neither as host memory nor as a dma-buf
+     #[test]
+     fn a_heap_over_less_than_its_granule_is_made() {
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/writes.rs b/crates/reims-vgpu-vulkan/src/gpu/writes.rs
 index ffeda6f7cd3d48b563fa4db5fa954cd9f97e64fd..c000fedac24b9ec4711712938cb86d2753334232 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/writes.rs
@@ -547,10 +738,10 @@ index f03e166d70a77ea76f8ea31080797b9e6adcc0fc..688989a5d1ab8362b4314372c930dcde
      // lives.
      unsafe { ash::Entry::load() }
 diff --git a/crates/reims-vgpu-vulkan/src/os/linux/budget.rs b/crates/reims-vgpu-vulkan/src/os/linux/budget.rs
-index cf52fd2bb23616f9a144ada14d3f90877dbd6db7..978fb0aef47d4ac3bb4991be1162045948b80f81 100644
+index cf52fd2bb23616f9a144ada14d3f90877dbd6db7..9d77833693ed6ba4b34e72c03e9f53474daf5cbb 100644
 --- a/crates/reims-vgpu-vulkan/src/os/linux/budget.rs
 +++ b/crates/reims-vgpu-vulkan/src/os/linux/budget.rs
-@@ -100,13 +100,20 @@ pub(super) fn set_test_limit(limit: Option<u64>) {
+@@ -100,13 +100,29 @@ pub(super) fn set_test_limit(limit: Option<u64>) {
      TEST_LIMIT.with(|l| l.set(limit));
  }
  
@@ -563,6 +754,15 @@ index cf52fd2bb23616f9a144ada14d3f90877dbd6db7..978fb0aef47d4ac3bb4991be11620459
 +const UNREAD_LIMIT: u64 = u64::MAX;
 +#[cfg(target_os = "android")]
 +const UNREAD_LIMIT: u64 = 65_530;
++
++/// [`UNREAD_LIMIT`] as the census of a refused map names the limit (`super::vm`'s `map_census`):
++/// `"?"` where nothing is assumed.
++pub(super) fn unread_limit_text() -> String {
++    match UNREAD_LIMIT {
++        u64::MAX => "?".to_owned(),
++        limit => limit.to_string(),
++    }
++}
 +
 +/// `vm.max_map_count` read now; [`UNREAD_LIMIT`] where it does not read.
  fn read_limit() -> u64 {
@@ -603,6 +803,203 @@ index 2f03c4ea6340c18d1148e7047c320f1a28453ca6..544818a87a76aedefd0ebf7864e54ae2
  fn set_util_floor(floor: u32) -> std::io::Result<()> {
      let request = util_floor_request(floor);
      // SAFETY: the calling thread's attributes, from a live `sched_attr` of the size it names.
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/import.rs b/crates/reims-vgpu-vulkan/src/os/linux/import.rs
+index 2a3ae16e4ac57ae54b88e30af35ebdf7f0f6b9a4..b201a5f20f93fc95def4339c76f809d30fb97286 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/import.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/import.rs
+@@ -989,7 +989,7 @@ mod tests {
+             address: first,
+             length: PAGE,
+         }];
+-        let alias = crate::gpu::backing::gather("test", &ranges, 3 * PAGE, true).unwrap();
++        let alias = crate::gpu::backing::gather_or_nil("test", &ranges, 3 * PAGE, true).unwrap();
+         let at = alias.first();
+         let view = import_view(at, 3 * PAGE);
+         let twin = addr(view.at());
+@@ -1007,9 +1007,9 @@ mod tests {
+         assert!(vm.deallocate(guest, PAGE).is_success());
+     }
+ 
+-    /// Readable pages with no file behind them, which no view is made of, end the process at the
+-    /// call that gathers them into an alias, where Metal takes them; a call whose refusal is nil
+-    /// answers nil there by default, counted, as when memory runs out, and dies in strict mode
++    /// Readable pages with no file behind them, which no view is made of, are the host's refusal
++    /// at the call that gathers them into an alias, where Metal takes them: it answers nil (a
++    /// replace NO) by default, counted, as when memory runs out, and dies in strict mode
+     #[test]
+     fn a_gather_of_pages_without_a_file_is_the_hosts_refusal() {
+         use reims_vgpu_core::platform::types::ResourceAddressRange;
+@@ -1022,9 +1022,6 @@ mod tests {
+             address: at.addr().to_u64(),
+             length: PAGE,
+         }];
+-        let gathered = || crate::gpu::backing::gather("test", &ranges, PAGE, false).is_some();
+-        let site = catch_death(gathered).unwrap_err();
+-        assert_eq!((site.kind, site.file), (DeathKind::Abort, "test"));
+         let or_nil = || crate::gpu::backing::gather_or_nil("test", &ranges, PAGE, false).is_some();
+         let site = catch_death(or_nil).unwrap_err();
+         assert_eq!((site.kind, site.file), (DeathKind::Abort, "test"), "strict");
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/surface.rs b/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+index 3ffff61013765ff8e7e7d632d0e303bb52f464be..61cb2e112adaa873e972816a452fc40efc15faf1 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+@@ -496,7 +496,7 @@ fn checked_ranges(ranges: &[PhysicalMemoryRange], alloc_size: u64) -> Option<()>
+ ///
+ /// The zeros are the tail the buffers over the surface at an offset read past its allocation,
+ /// which lie over the view ([`own_alias`]), as an alias of the allocation would give them
+-/// (`crate::gpu::backing::gather`): a writable view's are a file of its own, which the runtime
++/// (`crate::gpu::backing::gather_or_nil`): a writable view's are a file of its own, which the runtime
+ /// imports with the guest's pages, as host memory or as dma-bufs (`super::dma_buf`), which
+ /// udmabuf makes of files alone; a read-only view's map the block of zeros, whose twin, which the
+ /// runtime imports, is zeros of its own (`super::import`).
+@@ -554,7 +554,7 @@ fn view(runs: &[std::ops::Range<u64>], length: u64, zeros: u64, read_only: bool)
+ /// of the guest's pages (`crate::os::surface_alias`), borrowed: the view holds the allocation's
+ /// pages and the zeros a buffer at the surface's offset reads past them ([`view`]), read-only
+ /// where the surface is read-only for the GPU, as an alias of the allocation would be
+-/// (`crate::gpu::backing::gather`), and stays mapped while the alias holds the surface's memory
++/// (`crate::gpu::backing::gather_or_nil`), and stays mapped while the alias holds the surface's memory
+ /// ([`surface_memory_hold`]). `None` for a surface with no view: its own memory, one range of the
+ /// guest's pages, or none.
+ pub(crate) fn own_alias(surface: &LinuxSurface) -> Option<Alias> {
+@@ -1165,7 +1165,7 @@ mod tests {
+     /// buffers lie over ([`own_alias`]): the allocation's whole pages, then zeros as far as a
+     /// buffer at its offset reads, writable or read-only as the surface is for the GPU, the
+     /// zeros of a writable one a file of their own and of a read-only one the block of zeros, as
+-    /// an alias of the allocation's would be (`crate::gpu::backing::gather`). The alias keeps the
++    /// an alias of the allocation's would be (`crate::gpu::backing::gather_or_nil`). The alias keeps the
+     /// view mapped past the surface's last reference, and frees nothing of its own. A surface of
+     /// one range, or of its own memory, has no view to lend
+     #[test]
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/vm.rs b/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
+index a80f3599661b3926d6b523f98a5e7a196fb8e99b..38328439ee02d0ab580bd1c1e45b123d652e0f12 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
+@@ -14,7 +14,7 @@
+ //!   from [`allocate_aliasable`], a shared mapping of a file of its own: the detach heap's
+ //!   temporary, which Metal's heap is made over, is one (core's `HostVm::allocate_aliasable`),
+ //!   and so is an alias whose zeros past the guest's pages the runtime imports with them
+-//!   (`crate::gpu::backing::gather`), as a dma-buf takes file pages alone.
++//!   (`crate::gpu::backing::gather_or_nil`), as a dma-buf takes file pages alone.
+ //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source
+ //!   has no file behind it, as Mach fails for an unmapped source, before it maps anything. A
+ //!   piece the kernel refuses fails the call with nothing changed, as Mach's remap is all or
+@@ -428,12 +428,13 @@ fn at_the_limit(mappings: &str, limit: &str) -> bool {
+ }
+ 
+ /// The process's mappings (`/proc/self/maps`' lines) and `vm.max_map_count`, each as read, or
+-/// `"?"` where it does not read.
++/// `"?"` where it does not read; on Android, where an app may not read the limit, the kernel's
++/// default, which the budget assumes there too (`budget::unread_limit_text`).
+ pub(super) fn map_census() -> (String, String) {
+     let mappings = std::fs::read_to_string("/proc/self/maps")
+         .map_or_else(|_| "?".to_owned(), |m| m.lines().count().to_string());
+     let limit = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+-        .map_or_else(|_| "?".to_owned(), |l| l.trim().to_owned());
++        .map_or_else(|_| budget::unread_limit_text(), |l| l.trim().to_owned());
+     (mappings, limit)
+ }
+ 
+@@ -1038,25 +1039,25 @@ impl HostVm for LinuxVm {
+         allocate_aliasable(len)
+     }
+ 
+-    /// Fresh memory a view can be made of (vphone-linux: a new file's, not anonymous) over the
+-    /// pages of the range's length from the page of its address (module docs).
++    /// Fresh anonymous memory over the pages of the range's length from the page of its address
++    /// (module docs), which then show no file.
++    ///
++    /// Not a file of its own, as [`LinuxVm::allocate_anywhere`]'s is: core's one caller is a
++    /// mapping task's unmap, which takes every access from the range at once, so no view is ever
++    /// made of it, and a file for each would leave a kernel mapping and an open file behind every
++    /// range a guest task ever unmapped until the task goes, as two neighbours of different files
++    /// are never one mapping: a guest that maps and unmaps at new addresses would walk the views
++    /// to their budget with nothing mapped. Anonymous neighbours are one mapping, counted by no
++    /// budget, so an unmap is never refused for want of mappings and always frees the view's.
+     fn allocate_fixed_overwrite(&self, addr: HostAddr, len: u64) -> Result<(), KernReturn> {
+         let (first, length) = length_pages(addr, len).ok_or(NO_SPACE)?;
+         if length == 0 {
+             return Ok(());
+         }
+-        // vphone-linux: a shared mapping of a new file a view can be made of, as
+-        // `allocate_anywhere`'s.
+         reclaiming(|| {
+-            if !budget::admit(1, "a range a view can be made of") {
+-                return Err(NO_SPACE);
+-            }
+             let _views = views();
+-            let fd = memfd(length).map_err(|_| NO_SPACE)?;
+-            let backing = Backing { fd, offset: 0 };
+-            let prot = libc::PROT_READ | libc::PROT_WRITE;
+-            file(Some(first), length, &backing, prot)?;
+-            files::record(first, length, backing, prot);
++            anonymous(Some(first), length, "allocate_fixed_overwrite")?;
++            files::forget(first, length);
+             Ok(())
+         })
+     }
+@@ -1615,6 +1616,40 @@ pub(crate) mod tests {
+         }
+     }
+ 
++    /// A mapping task's life: ranges of a reservation mapped and unmapped again, each at an
++    /// address of its own, as a guest's task maps and unmaps its buffers. The unmapped ranges are
++    /// anonymous neighbours the kernel holds as one mapping and the table as none, so however
++    /// many ranges came and went, the views hold no mapping for them and the kernel a few; an
++    /// unmap is not weighed against the views' budget, so it frees a view's mappings at the
++    /// budget too
++    #[test]
++    fn unmapped_ranges_of_a_task_leave_no_mapping_behind() {
++        let v = vm();
++        let p = page();
++        let rounds = 256;
++        let src = allocate_aliasable(p).unwrap();
++        let task = v.allocate_anywhere(2 * rounds * p).unwrap();
++        v.protect_max(task, 2 * rounds * p, VmProt::NONE).unwrap();
++        let (first, end) = (task.addr().to_u64(), task.addr().to_u64() + 2 * rounds * p);
++        for i in 0..rounds {
++            let at = task.wrapping_add(i * p);
++            v.remap_shared_overwrite(at, src, p).unwrap();
++            // At the budget: the unmap goes through all the same.
++            budget::set_test_limit(Some(0));
++            let unmapped = v.allocate_fixed_overwrite(at, p);
++            budget::set_test_limit(None);
++            unmapped.unwrap();
++            v.protect_max(at, p, VmProt::NONE).unwrap();
++        }
++        // The half of the reservation no range was mapped in is all the views hold there.
++        assert_eq!(files::mappings_between(first, end), 1);
++        // The ranges unmapped, as one, and what is left of the reservation.
++        assert!(kernel_mappings(first, end) <= 2, "{}", kernel_mappings(first, end));
++        assert!(files::pieces(first, p).is_none(), "an unmapped range shows no file");
++        assert!(v.deallocate(task, 2 * rounds * p).is_success());
++        assert!(v.deallocate(src, p).is_success());
++    }
++
+     /// A view of more mappings than a piece of a deallocation holds, and a part piece past them,
+     /// is unmapped and forgotten whole, and the pages either side of it stay mapped
+     #[test]
+@@ -1851,10 +1886,10 @@ pub(crate) mod tests {
+     /// An alias of a guest page with zeros past it, as a heap of less than the runtime's 16 KiB
+     /// is made over, has a file behind every byte, writable or read-only, so a dma-buf can be
+     /// made of all of it, as the runtime asks where the device refuses file pages as host memory
+-    /// (`crate::gpu::backing::gather`, `super::dma_buf`)
++    /// (`crate::gpu::backing::gather_or_nil`, `super::dma_buf`)
+     #[test]
+     fn an_alias_with_zeros_past_its_pages_has_a_file_behind_every_byte() {
+-        use crate::gpu::backing::{REPLACE, gather};
++        use crate::gpu::backing::{REPLACE, gather_or_nil};
+         use reims_vgpu_core::platform::types::ResourceAddressRange;
+         let p = page();
+         for read_only in [false, true] {
+@@ -1864,7 +1899,7 @@ pub(crate) mod tests {
+                 address: guest.addr().to_u64(),
+                 length: p,
+             }];
+-            let alias = gather(REPLACE, &ranges, 4 * p, read_only).unwrap();
++            let alias = gather_or_nil(REPLACE, &ranges, 4 * p, read_only).unwrap();
+             let first = alias.first().as_ptr().addr().to_u64();
+             assert!(
+                 files::pieces(first, 4 * p).is_some(),
 diff --git a/crates/reims-vgpu-vulkan/src/os/surface.rs b/crates/reims-vgpu-vulkan/src/os/surface.rs
 index 55921c3f35ad4826e945ee8c9e6b5c0c9fbfdbf4..c83407395ec27de4cd7603509f6e0efcdd275f43 100644
 --- a/crates/reims-vgpu-vulkan/src/os/surface.rs
@@ -2319,3 +2716,17 @@ index c16496afb52c39cc2f782f76a656a955a951286a..c5b8a561c60c009a8c96737e6fd729e3
  mod linux;
  #[cfg(target_os = "macos")]
  mod macos;
+diff --git a/docs/qemu.md b/docs/qemu.md
+index c504f3a4e816fa2f5ea3ee473eba889240a2b289..0d3fd545e36a3bfbc1695326d0e3648d8371aff5 100644
+--- a/docs/qemu.md
++++ b/docs/qemu.md
+@@ -922,7 +922,8 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
+   IOSurface stand-in's memory is none, an import's twin is none, and a buffer
+   over a surface or a heap over address ranges is nil. Each is counted and
+   logged at the first and at each power of two. A replace whose alias is
+-  refused still ends the process. With `REIMS_VGPU_STRICT=1` each ends the
++  refused answers NO, its object staying detached (it ended the process
++  before: an iOS guest's first boot on Android reached it). With `REIMS_VGPU_STRICT=1` each ends the
+   process at the call, naming the numbers.
+ - **Where `/dev/udmabuf` is not the process's** (the device node is the `kvm`
+   group's on Ubuntu), every view is mapped from its files, so views past the

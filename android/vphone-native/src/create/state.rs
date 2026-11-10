@@ -44,6 +44,9 @@ pub struct Spec {
     /// Delete this VM's firmware from the cache when the VM is finished.
     pub delete_firmware_after: bool,
     pub firmware: Option<Firmware>,
+    /// Leave every background daemon of iOS on. Off by default: the first boot then applies
+    /// vphoned's `trimmed` service profile (the installer's `firstboot` module).
+    pub keep_all_services: bool,
 }
 
 pub const STATE_FILE: &str = ".create-state";
@@ -104,6 +107,23 @@ pub struct StepStatus {
     pub log: String,
 }
 
+/// One phase of the running step (the first boot's: kernel boot, data migration, ...).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PhaseStatus {
+    pub key: String,
+    pub title: String,
+    /// "pending", "running", "done"
+    pub state: String,
+    /// How long it took, once done.
+    pub elapsed_secs: u64,
+    /// When it began, for the screen's "running for"; 0 before it has.
+    pub started_ms: u64,
+    /// How long it last took on this phone; meaningful with `measured`.
+    pub est_secs: u64,
+    pub measured: bool,
+}
+
 /// What the UI shows; written by the running creation, read by any process.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, rename_all = "camelCase")]
@@ -133,6 +153,8 @@ pub struct Status {
     pub eta_note: String,
     /// Whether the person paused it. Read from the pause file when the status is asked for.
     pub paused: bool,
+    /// The running step's phases, where it has any.
+    pub phases: Vec<PhaseStatus>,
 }
 
 /// Held by the process running a creation. The kernel drops it when that process ends, however it

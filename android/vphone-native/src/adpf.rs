@@ -143,7 +143,7 @@ pub fn start(vcpus: u32, done: impl Fn() -> bool + Send + 'static, report: impl 
                 report(&status_line(&result, &allowed_cpus()));
             }
         };
-        if let Err(why) = run(vcpus as usize, &done, &say) {
+        if let Err(why) = run(vcpus as usize, &done, &say, &|line| report(line)) {
             if said.get() {
                 report(&format!("performance hints stopped: {why}"));
             } else {
@@ -156,7 +156,41 @@ pub fn start(vcpus: u32, done: impl Fn() -> bool + Send + 'static, report: impl 
     drop(spawned);
 }
 
-fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>)) -> Result<(), String> {
+/// How often the vCPU threads' placement is said.
+const PLACEMENT_EVERY: Duration = Duration::from_secs(30);
+
+/// The CPU a thread last ran on: field 39 of its `stat`.
+fn last_cpu(tid: i32) -> Option<usize> {
+    let text = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+    text[text.rfind(')')? + 2..].split(' ').nth(36)?.parse().ok()
+}
+
+fn cpu_khz(cpu: usize, file: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/{file}")).ok()?.trim().parse().ok()
+}
+
+/// `vCPU threads last ran on CPUs 2-3,6-7, at 2.9-3.6 GHz of 3.6-4.3; 598 work reports accepted`.
+/// `speeds` is each of those CPUs' clock now and its highest, in kHz; empty where the phone does
+/// not let an app read them.
+fn placement_line(cpus: &[usize], speeds: &[(u64, u64)], reports: u64) -> String {
+    let mut on: Vec<usize> = cpus.to_vec();
+    on.sort_unstable();
+    on.dedup();
+    let ghz = |khz: u64| format!("{:.1}", khz as f64 / 1e6);
+    let range = |values: Vec<u64>| match (values.iter().min(), values.iter().max()) {
+        (Some(low), Some(high)) if low != high => format!("{}-{}", ghz(*low), ghz(*high)),
+        (Some(one), _) => ghz(*one),
+        _ => String::new(),
+    };
+    let clock = if speeds.is_empty() {
+        "their clocks are not readable here".to_owned()
+    } else {
+        format!("at {} GHz of {}", range(speeds.iter().map(|s| s.0).collect()), range(speeds.iter().map(|s| s.1).collect()))
+    };
+    format!("performance hints: vCPU threads last ran on CPUs {}, {clock}; {reports} work reports accepted in all", cpu_list(&on))
+}
+
+fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>), say_more: &dyn Fn(&str)) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut tids = vcpu_threads();
     while tids.len() < vcpus {
@@ -168,6 +202,20 @@ fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>
         }
         std::thread::sleep(Duration::from_millis(250));
         tids = vcpu_threads();
+    }
+    // QEMU makes its vCPU threads one after another, the SEP's among them: a list read part way
+    // through would leave the late ones out of the session for the whole boot. Read until it
+    // stands still.
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let again = vcpu_threads();
+        if again.len() == tids.len() {
+            break;
+        }
+        tids = again;
+        if done() || Instant::now() > deadline {
+            break;
+        }
     }
     if tids.iter().any(|t| cpu_ns(*t).is_none()) {
         return Err("this kernel has no schedstat to measure the vCPU threads by".into());
@@ -185,8 +233,17 @@ fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>
     }
     let mut last: Vec<i64> = tids.iter().map(|t| cpu_ns(*t).unwrap_or(0)).collect();
     let mut outcome = Ok(());
+    let (mut reports, mut placed_at) = (0u64, Instant::now());
     while !done() {
         std::thread::sleep(PERIOD);
+        // What the hints are for, checked: which CPUs the vCPU threads run on, and how fast those
+        // are clocked.
+        if placed_at.elapsed() >= PLACEMENT_EVERY {
+            placed_at = Instant::now();
+            let cpus: Vec<usize> = tids.iter().filter_map(|t| last_cpu(*t)).collect();
+            let speeds: Vec<(u64, u64)> = cpus.iter().filter_map(|c| Some((cpu_khz(*c, "scaling_cur_freq")?, cpu_khz(*c, "cpuinfo_max_freq")?))).collect();
+            say_more(&placement_line(&cpus, &speeds, reports));
+        }
         let now: Vec<i64> = tids.iter().map(|t| cpu_ns(*t).unwrap_or(0)).collect();
         let busiest = now.iter().zip(&last).map(|(a, b)| a - b).max().unwrap_or(0);
         last = now;
@@ -197,6 +254,7 @@ fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>
                 outcome = Err(format!("the system refused a work report (error {status})"));
                 break;
             }
+            reports += 1;
             say(Ok(tids.len()));
         }
     }
@@ -215,6 +273,22 @@ mod tests {
         assert_eq!(cpu_list(&[3]), "3");
         assert_eq!(cpu_list(&[0, 1, 2, 3, 6, 7]), "0-3,6-7");
         assert_eq!(cpu_list(&[0, 2, 4, 5]), "0,2,4-5");
+    }
+
+    #[test]
+    fn the_placement_line_names_the_cpus_and_their_clocks() {
+        assert_eq!(
+            placement_line(&[7, 2, 3, 6, 7, 6], &[(3_600_000, 4_320_000), (2_900_000, 3_630_000)], 598),
+            "performance hints: vCPU threads last ran on CPUs 2-3,6-7, at 2.9-3.6 GHz of 3.6-4.3; 598 work reports accepted in all"
+        );
+        assert_eq!(
+            placement_line(&[0], &[], 0),
+            "performance hints: vCPU threads last ran on CPUs 0, their clocks are not readable here; 0 work reports accepted in all"
+        );
+        // This test's own thread has a stat line of the same shape.
+        // SAFETY: gettid has no preconditions.
+        let me = unsafe { libc::gettid() };
+        assert!(last_cpu(me).is_some());
     }
 
     #[test]
