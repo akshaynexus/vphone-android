@@ -190,6 +190,16 @@ pub extern "system" fn Java_com_vphone_android_Native_recordDeath(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_logLine(
+    mut env: JNIEnv,
+    _this: JObject,
+    line: JString,
+) {
+    let line = text(&mut env, &line);
+    quiet(|| runtime::log_line(&line));
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_vphone_android_Native_logTail(
     mut env: JNIEnv,
     _this: JObject,
@@ -251,8 +261,9 @@ pub extern "system" fn Java_com_vphone_android_Native_touch(
     action: jint,
     x: jfloat,
     y: jfloat,
+    event_ns: jni::sys::jlong,
 ) {
-    quiet(|| runtime::touch(action, x, y));
+    quiet(|| runtime::touch(action, x, y, event_ns));
 }
 
 #[no_mangle]

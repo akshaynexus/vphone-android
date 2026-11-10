@@ -237,7 +237,7 @@ the launcher overrides some of them (above).
 | `VPHONE_IBC` | on | Per-site indirect-branch cache; `0` = jump cache lookup. `VPHONE_IBC_REPLACE` sets how many other-target misses replace a valid slot (default 8) | `target/arm/tcg/translate-a64.c`, `accel/tcg/cpu-exec.c` |
 | `VPHONE_INLINE_ZVA` | on | `DC ZVA` in generated code; `0` = helpers | `target/arm/tcg/translate-a64.c` |
 | `VPHONE_FENCE` | 1 | Acquire/release on a TSO host: one fence per release store; `0` = upstream mapping | `target/arm/tcg/translate-a64.c` |
-| `VPHONE_FAST_CNT` | off | Counter reads without the BQL or a TB exit (no measured effect on iOS) | `target/arm/helper.c`, `target/arm/tcg/translate-a64.c` |
+| `VPHONE_FAST_CNT` | off (the Android app sets 1) | Counter reads without the BQL or a TB exit. No measured effect on the desktop; on a phone, see android/README.md | `target/arm/helper.c`, `target/arm/tcg/translate-a64.c` |
 | `VPHONE_MARK` | off | Diagnostic: `hint #0x7e` phase markers log host instructions/cycles/CPU time per guest phase; `VPHONE_INSN_STATS`, `VPHONE_SYSREG_STATS` count instruction classes and system registers | `target/arm/tcg/translate-a64.c` |
 | `VPHONE_NATIVE_FP` | on | A64 FP/Neon as host SSE/AVX instructions; `0` = helpers (and softfloat's hardfloat) as before | `target/arm/tcg/host-fpcr.h`, `translate-a64.c` |
 | `VPHONE_FAST_F32` | on | Neon float32 add/sub/mul/fused multiply-add on the host's SIMD; `0` = softfloat lane by lane | `target/arm/tcg/vec-f32-fast.h` |

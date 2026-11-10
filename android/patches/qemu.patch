@@ -170,10 +170,27 @@ index a863f4b8ef388261aaa3b972ccb47fc3d238a73e..c0fa54292b6b4ef1286952fc50d234b8
 +    return qatomic_read(&tb_ctx.tb_flush_count);
 +}
 diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
-index 3b72dcf06ada12685de4621e41d6ecdfc89ba03e..27a29d85e18a99e15a20ed64be6d012a7e759187 100644
+index 3b72dcf06ada12685de4621e41d6ecdfc89ba03e..5495096b130f37d6942e41502db2fb1846bae71b 100644
 --- a/accel/tcg/translate-all.c
 +++ b/accel/tcg/translate-all.c
-@@ -295,6 +295,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-stats.h"
+ 
+ #include "trace.h"
+ #include "tcg/tcg.h"
+@@ -264,6 +265,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+     int gen_code_size, search_size, max_insns;
+     int64_t ti;
+     void *host_pc;
++    /* Counted for the app's log line (qemu/vphone-stats.h): two clock reads a block. */
++    int64_t vphone_t0 = get_clock();
+ 
+     qemu_thread_jit_write();
+ 
+@@ -295,6 +298,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
          cpu->exception_index = EXCP_INTERRUPT;
          cpu_loop_exit(cpu);
      }
@@ -182,6 +199,17 @@ index 3b72dcf06ada12685de4621e41d6ecdfc89ba03e..27a29d85e18a99e15a20ed64be6d012a
  
      gen_code_buf = tcg_ctx->code_gen_ptr;
      tb->tc.ptr = tcg_splitwx_to_rx(gen_code_buf);
+@@ -530,8 +535,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
+         qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+         tcg_tb_remove(tb);
++        vphone_translate_add(vphone_t0);
+         return existing_tb;
+     }
++    vphone_translate_add(vphone_t0);
+     return tb;
+ }
+ 
 diff --git a/backends/hostmem-memfd.c b/backends/hostmem-memfd.c
 index 923239f9cf695743dc79bc1bef8b4d9e1c729e5d..79cc0e17a600b5795683dbeb53b6008ba1f814c1 100644
 --- a/backends/hostmem-memfd.c
@@ -292,10 +320,10 @@ index 97ee78299bf7566a1c0c808dc7bbca7eaad82102..f967680fc16ffa1b007db3787a268f4a
  
      filename = g_strdup_printf("%s/vl.XXXXXX", tmpdir);
 diff --git a/cpu-common.c b/cpu-common.c
-index 9064c6ab821a5f18b36299d1a91e9436a426d97e..5929bc31ccd93ab2dbc9adf7aa8337cafe935cad 100644
+index 9064c6ab821a5f18b36299d1a91e9436a426d97e..28fe44393378714191fbd763b41a0cb9a33f28da 100644
 --- a/cpu-common.c
 +++ b/cpu-common.c
-@@ -23,6 +23,12 @@
+@@ -23,6 +23,15 @@
  #include "hw/core/cpu.h"
  #include "qemu/lockable.h"
  #include "trace/trace-root.h"
@@ -303,12 +331,15 @@ index 9064c6ab821a5f18b36299d1a91e9436a426d97e..5929bc31ccd93ab2dbc9adf7aa8337ca
 +
 +uint64_t vphone_wait_ns[VPHONE_WAIT__COUNT];
 +uint64_t vphone_wait_n[VPHONE_WAIT__COUNT];
++uint64_t vphone_lock_takes;
++uint64_t vphone_translate_ns;
++uint64_t vphone_translate_n;
 +int vphone_guest_cpus;
 +int64_t vphone_stats_since;
  
  QemuMutex qemu_cpu_list_lock;
  static QemuCond exclusive_cond;
-@@ -218,6 +224,8 @@ void start_exclusive(void)
+@@ -218,6 +227,8 @@ void start_exclusive(void)
          return;
      }
  
@@ -317,7 +348,7 @@ index 9064c6ab821a5f18b36299d1a91e9436a426d97e..5929bc31ccd93ab2dbc9adf7aa8337ca
      qemu_mutex_lock(&qemu_cpu_list_lock);
      exclusive_idle();
  
-@@ -239,6 +247,7 @@ void start_exclusive(void)
+@@ -239,6 +250,7 @@ void start_exclusive(void)
      while (pending_cpus > 1) {
          qemu_cond_wait(&exclusive_cond, &qemu_cpu_list_lock);
      }
@@ -325,7 +356,7 @@ index 9064c6ab821a5f18b36299d1a91e9436a426d97e..5929bc31ccd93ab2dbc9adf7aa8337ca
  
      /* Can release mutex, no one will enter another exclusive
       * section until end_exclusive resets pending_cpus to 0.
-@@ -304,10 +313,13 @@ void cpu_exec_start(CPUState *cpu)
+@@ -304,10 +316,13 @@ void cpu_exec_start(CPUState *cpu)
               * run.  Since we have the lock, just set cpu->running to true
               * while holding it; no need to check pending_cpus again.
               */
@@ -363,6 +394,74 @@ index 8d0b0fab09ba6d442fd147a115b6e1dedfaa1b01..198f5266994b3f9698b85e7d63c4d938
  
  # Optional: the agxemu library executes the jobs the GPU firmware kicks.
  agxemu_dir = get_option('agxemu')
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index c61ecb1ff81c3ec4d8a267f41803e60ab312a8cb..4332b05d5f0ec7410422b5956ac0984d662d6d64 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-touch.h"
+ #include "qemu/cutils.h"
+ #include "qemu/error-report.h"
+ #include "qemu/lockable.h"
+@@ -437,6 +438,8 @@ struct AppleGFXEvent {
+             uint16_t width;
+             uint16_t height;
+             uint32_t buttons;
++            /* The Android app's number for the event, 0 for none (qemu/vphone-touch.h). */
++            uint32_t tag;
+         } pointer;
+         RvgWindowScroll scroll;
+         struct {
+@@ -488,6 +491,8 @@ static void apple_gfx_event_run(AppleGFXEvent *event)
+         update_cursor(d);
+         break;
+     case APPLE_GFX_EVENT_POINTER:
++        /* Before the input layer has it: a waiting guest transfer takes it at once. */
++        vphone_touch_queued(event->pointer.tag);
+         apple_gfx_input_pointer(d, event->pointer.x, event->pointer.y,
+                                 event->pointer.width, event->pointer.height,
+                                 event->pointer.buttons);
+@@ -786,7 +791,13 @@ static void apple_gfx_window_pointer_cb(void *ctx, uint16_t x, uint16_t y,
+     event->pointer.y = y;
+     event->pointer.width = width;
+     event->pointer.height = height;
+-    event->pointer.buttons = buttons;
++    /*
++     * The Android app numbers its events above the button bits, to time their
++     * way here (qemu/vphone-touch.h); no other window sets those bits.
++     */
++    event->pointer.tag = buttons >> VPHONE_TOUCH_TAG_SHIFT;
++    event->pointer.buttons = buttons & ((1u << VPHONE_TOUCH_TAG_SHIFT) - 1);
++    vphone_touch_callback(event->pointer.tag);
+     apple_gfx_event_push(event);
+ }
+ 
+diff --git a/hw/usb/dev-hid.c b/hw/usb/dev-hid.c
+index 02e44ac090e557c799e8fd4315ffb8e4c8c17193..5cf52018c5988307bde0fe09df417f1b7bb609e5 100644
+--- a/hw/usb/dev-hid.c
++++ b/hw/usb/dev-hid.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-touch.h"
+ #include "ui/console.h"
+ #include "hw/usb.h"
+ #include "migration/vmstate.h"
+@@ -1018,6 +1019,10 @@ static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *buf, int len)
+     if (!us->touch) {
+         return hid_pointer_poll(&us->hid, buf, len);
+     }
++    if (us->hid.n > 0) {
++        /* The guest's transfer takes a queued touch: timed for the app's log. */
++        vphone_touch_taken();
++    }
+     n = hid_pointer_poll(&us->hid, tablet, sizeof(tablet));
+     if (n < 5 || len < TOUCH_REPORT_SIZE) {
+         return 0;
 diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
 index 22952cd1e4ce641a67b6a6c1222e93fb88252916..83eabf94b8441c1ff4b0383f4fccdffcbb2ce53e 100644
 --- a/hw/virtio/meson.build
@@ -1891,10 +1990,10 @@ index 0000000000000000000000000000000000000000..ca8c4060eb471ccc627d27b01ae04e16
 +#endif
 diff --git a/include/qemu/vphone-stats.h b/include/qemu/vphone-stats.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..3fbb74603cf1fb3bdc3c761cb0728eb2fc06fd6b
+index 0000000000000000000000000000000000000000..5b40bfabf9d63ed24645b15f5e5d44fbe9ee3cd6
 --- /dev/null
 +++ b/include/qemu/vphone-stats.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,74 @@
 +/*
 + * Where the guest's vCPU threads spend the time they do not run guest code,
 + * and how often the guest spins: counters for one line of the Android app's
@@ -1932,6 +2031,28 @@ index 0000000000000000000000000000000000000000..3fbb74603cf1fb3bdc3c761cb0728eb2
 +    qatomic_set(&vphone_guest_cpus, cpus);
 +}
 +
++/*
++ * What else the line counts, summed over the guest's vCPU threads: how often
++ * they took QEMU's global lock at all (a wait is one of these that found it
++ * held), and the time they spent translating guest code and the blocks they
++ * made (accel/tcg/translate-all.c). After the whole code cache is flushed,
++ * everything the guest runs is translated again: this is what that costs.
++ */
++extern uint64_t vphone_lock_takes;
++extern uint64_t vphone_translate_ns;
++extern uint64_t vphone_translate_n;
++
++/* A translation of the calling thread that began at get_clock() == t0 is done. */
++static inline void vphone_translate_add(int64_t t0)
++{
++    CPUState *cpu = current_cpu;
++
++    if (cpu && cpu->cpu_index < qatomic_read(&vphone_guest_cpus)) {
++        qatomic_add(&vphone_translate_ns, (uint64_t)(get_clock() - t0));
++        qatomic_inc(&vphone_translate_n);
++    }
++}
++
 +/* How many times the whole code cache was flushed (accel/tcg/tcg-stats.c). */
 +unsigned vphone_tb_flush_count(void);
 +
@@ -1945,6 +2066,41 @@ index 0000000000000000000000000000000000000000..3fbb74603cf1fb3bdc3c761cb0728eb2
 +        qatomic_inc(&vphone_wait_n[kind]);
 +    }
 +}
++
++#endif
+diff --git a/include/qemu/vphone-touch.h b/include/qemu/vphone-touch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d469e989287befd35c2105cbfbcf55e1f938adc3
+--- /dev/null
++++ b/include/qemu/vphone-touch.h
+@@ -0,0 +1,29 @@
++/*
++ * A touch's way from the phone's screen to the guest, timed for one line of
++ * the Android app's log (util/vphone-touch.c).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_VPHONE_TOUCH_H
++#define QEMU_VPHONE_TOUCH_H
++
++/*
++ * The app tags each pointer event in bits 8-31 of its buttons word; 0 is an
++ * event nobody tagged.
++ */
++#define VPHONE_TOUCH_TAG_SHIFT 8
++/* The app: Android read the touch at event_ns and the app sends it at call_ns. */
++void vphone_android_touch_mark(uint32_t tag, int64_t event_ns, int64_t call_ns);
++/* The window's callback has the event, on a thread that is not QEMU's. */
++void vphone_touch_callback(uint32_t tag);
++/* QEMU's main loop is about to give the event to the input layer. */
++void vphone_touch_queued(uint32_t tag);
++/* The guest's transfer takes the touchscreen's report. */
++void vphone_touch_taken(void);
++/*
++ * One line for the app's log over the events since the last call; at most cap
++ * bytes, no terminator; 0 when no tagged event came.
++ */
++size_t vphone_android_touch_line(char *buf, size_t cap);
 +
 +#endif
 diff --git a/include/system/memory.h b/include/system/memory.h
@@ -2131,10 +2287,10 @@ index c483fda69e5baedb2da63b67a268e7512b73af48..1f003b1bc820a089482ddbd59ca91651
  ##
 diff --git a/system/android-exports.map b/system/android-exports.map
 new file mode 100644
-index 0000000000000000000000000000000000000000..946116647fa204e4b52abe80ac6d62598406aff0
+index 0000000000000000000000000000000000000000..2423645b318c077e8387b5d19e65c00034bfd6a4
 --- /dev/null
 +++ b/system/android-exports.map
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,17 @@
 +/*
 + * What libqemu-vphone.so shows to the app: QEMU's entry point and the entry
 + * points the app calls in reims-vgpu's static library.
@@ -2147,11 +2303,13 @@ index 0000000000000000000000000000000000000000..946116647fa204e4b52abe80ac6d6259
 +    rvg_android_pointer;
 +    rvg_android_perf_line;
 +    vphone_android_cpu_line;
++    vphone_android_touch_mark;
++    vphone_android_touch_line;
 +  local:
 +    *;
 +};
 diff --git a/system/cpus.c b/system/cpus.c
-index 2171847691413350cce816dcb0f8b8082a518e7f..b667867ce3f614dcea140379ee954b4e545cbd33 100644
+index 2171847691413350cce816dcb0f8b8082a518e7f..9dbd3c9fb4eca54dced799515940e871c5a101f0 100644
 --- a/system/cpus.c
 +++ b/system/cpus.c
 @@ -23,6 +23,7 @@
@@ -2205,7 +2363,7 @@ index 2171847691413350cce816dcb0f8b8082a518e7f..b667867ce3f614dcea140379ee954b4e
      }
  
      qemu_process_cpu_events_common(cpu);
-@@ -546,7 +556,20 @@ void bql_lock_impl(const char *file, int line)
+@@ -546,7 +556,23 @@ void bql_lock_impl(const char *file, int line)
      QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
  
      assert(!bql_locked());
@@ -2215,6 +2373,9 @@ index 2171847691413350cce816dcb0f8b8082a518e7f..b667867ce3f614dcea140379ee954b4e
 +     * lock taken at once costs it one try, a contended one two clock reads.
 +     */
 +    if (current_cpu && bql_lock_fn == qemu_mutex_lock_impl) {
++        if (current_cpu->cpu_index < qatomic_read(&vphone_guest_cpus)) {
++            qatomic_inc(&vphone_lock_takes);
++        }
 +        if (qemu_mutex_trylock_impl(&bql, file, line) != 0) {
 +            int64_t t0 = get_clock();
 +
@@ -2338,21 +2499,23 @@ index 86006123076d51be4de1099ebbdd474ed8b2edd9..82845176f6c8ec9d95232c20dd9eea81
  
  static void memory_region_set_ram_ptr(MemoryRegion *mr, uint64_t size,
 diff --git a/target/arm/cpu.h b/target/arm/cpu.h
-index 99e0d61751e8b54cd941805c3c99d62c5c9406d1..228440eaa39d877733db70c0ec2a63b01e5b4eab 100644
+index 99e0d61751e8b54cd941805c3c99d62c5c9406d1..da09f09b5300c539b70bad4f81b0105d88a8aab1 100644
 --- a/target/arm/cpu.h
 +++ b/target/arm/cpu.h
-@@ -822,6 +822,9 @@ typedef struct CPUArchState {
+@@ -822,6 +822,11 @@ typedef struct CPUArchState {
  
      /* vphone diagnostic: executed instructions per class (VPHONE_INSN_STATS) */
      uint64_t vphone_icount[24];
 +/* The always-on classes among them: the guest's spin hints (translate-a64.c). */
 +#define VPHONE_ICOUNT_WFE   16
 +#define VPHONE_ICOUNT_YIELD 18
++/* And the reads of the counter (CNTVCT_EL0, CNTPCT_EL0 and their SS forms; helper.c). */
++#define VPHONE_ICOUNT_CNT   19
  
      /*
       * Newer SPRR layout (M1/A14 and later, the vresearch101 CPU): one
 diff --git a/target/arm/helper.c b/target/arm/helper.c
-index 0e118aabacf798402a3e0239fb8ecec1c570339a..eed670c02ed1196ec4397f401aed355b487b59b3 100644
+index 0e118aabacf798402a3e0239fb8ecec1c570339a..4dfdbedb12d61457eb7da100f89666f32877d9fa 100644
 --- a/target/arm/helper.c
 +++ b/target/arm/helper.c
 @@ -16,6 +16,8 @@
@@ -2364,7 +2527,45 @@ index 0e118aabacf798402a3e0239fb8ecec1c570339a..eed670c02ed1196ec4397f401aed355b
  #include "qemu/bitops.h"
  #include "qemu/qemu-print.h"
  #include "exec/cputlb.h"
-@@ -2838,12 +2840,112 @@ static void vphone_mark_switch(unsigned asid)
+@@ -1478,12 +1480,17 @@ static void gt_timer_reset(CPUARMState *env, const ARMCPRegInfo *ri,
+ static uint64_t gt_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
+ {
+     uint64_t offset = gt_direct_access_timer_offset(env, GTIMER_PHYS);
++
++    env->vphone_icount[VPHONE_ICOUNT_CNT]++;
+     return gt_get_countervalue(env) - offset;
+ }
+ 
+ static uint64_t gt_virt_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
+ {
+     uint64_t offset = gt_direct_access_timer_offset(env, GTIMER_VIRT);
++
++    /* Counted for the app's log: iOS's mach_absolute_time is this read. */
++    env->vphone_icount[VPHONE_ICOUNT_CNT]++;
+     return gt_get_countervalue(env) - offset;
+ }
+ 
+@@ -1498,6 +1505,19 @@ bool vphone_is_counter_read(const ARMCPRegInfo *ri)
+     return ri->readfn == gt_cnt_read || ri->readfn == gt_virt_cnt_read;
+ }
+ 
++/* VPHONE_FAST_CNT, read once: the translator and the app's log line ask. */
++bool vphone_fast_cnt_on(void)
++{
++    static int on = -1;
++
++    if (unlikely(on < 0)) {
++        const char *e = getenv("VPHONE_FAST_CNT");
++
++        on = e && *e ? atoi(e) != 0 : 0;
++    }
++    return on;
++}
++
+ static void gt_cval_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                           int timeridx,
+                           uint64_t value)
+@@ -2838,12 +2858,136 @@ static void vphone_mark_switch(unsigned asid)
      }
  }
  
@@ -2388,13 +2589,14 @@ index 0e118aabacf798402a3e0239fb8ecec1c570339a..eed670c02ed1196ec4397f401aed355b
 +        "waiting for TLB flushes",
 +    };
 +    static uint64_t last_ns[VPHONE_WAIT__COUNT], last_n[VPHONE_WAIT__COUNT];
-+    static uint64_t last_wfe, last_yield;
++    static uint64_t last_wfe, last_yield, last_cnt, last_takes;
++    static uint64_t last_tr_ns, last_tr_n;
 +    static int64_t last_t;
 +    static unsigned last_flushes;
 +    unsigned flushes;
 +    int cpus = qatomic_read(&vphone_guest_cpus);
 +    g_autoptr(GString) line = NULL;
-+    uint64_t wfe = 0, yield = 0;
++    uint64_t wfe = 0, yield = 0, cnt = 0, takes, tr_ns, tr_n;
 +    int64_t now = get_clock();
 +    double secs, all;
 +    CPUState *cs;
@@ -2409,6 +2611,7 @@ index 0e118aabacf798402a3e0239fb8ecec1c570339a..eed670c02ed1196ec4397f401aed355b
 +        if (cs->cpu_index < cpus) {
 +            wfe += qatomic_read(&cpu_env(cs)->vphone_icount[VPHONE_ICOUNT_WFE]);
 +            yield += qatomic_read(&cpu_env(cs)->vphone_icount[VPHONE_ICOUNT_YIELD]);
++            cnt += qatomic_read(&cpu_env(cs)->vphone_icount[VPHONE_ICOUNT_CNT]);
 +        }
 +    }
 +    cpu_list_unlock();
@@ -2436,6 +2639,28 @@ index 0e118aabacf798402a3e0239fb8ecec1c570339a..eed670c02ed1196ec4397f401aed355b
 +        last_ns[i] = ns;
 +        last_n[i] = n;
 +    }
++    /*
++     * What takes the lock and what a flush costs: the lock's takes (a wait is
++     * one that found it held), the counter reads, which take it and end
++     * their block unless VPHONE_FAST_CNT is on, and the time spent
++     * translating.
++     */
++    takes = qatomic_read(&vphone_lock_takes);
++    tr_ns = qatomic_read(&vphone_translate_ns);
++    tr_n = qatomic_read(&vphone_translate_n);
++    g_string_append_printf(line, ", translating %.1f%% (%.0f blocks/s); "
++                           "QEMU's lock taken %.0f/s, counter reads %.0f/s "
++                           "(%s)",
++                           (tr_ns - last_tr_ns) * 100.0 / all,
++                           (tr_n - last_tr_n) / secs,
++                           (takes - last_takes) / secs,
++                           (cnt - last_cnt) / secs,
++                           vphone_fast_cnt_on() ? "without the lock" :
++                           "each takes the lock");
++    last_takes = takes;
++    last_tr_ns = tr_ns;
++    last_tr_n = tr_n;
++    last_cnt = cnt;
 +    flushes = vphone_tb_flush_count();
 +    g_string_append_printf(line, "; code cache %zu of %zu MiB, flushed whole "
 +                           "%u times (%u since the last line)",
@@ -2477,6 +2702,18 @@ index 0e118aabacf798402a3e0239fb8ecec1c570339a..eed670c02ed1196ec4397f401aed355b
      };
      g_autoptr(GString) line = g_string_new("vphone-icount ");
      struct timespec ts;
+diff --git a/target/arm/internals.h b/target/arm/internals.h
+index 3c57cc03789a6a473e7a8c85743605b0d5edd15f..88355330e52db1d8cee9156502784f03e9cd73be 100644
+--- a/target/arm/internals.h
++++ b/target/arm/internals.h
+@@ -2028,6 +2028,7 @@ void vphone_sysreg_dump(const char *what);
+ bool vphone_sysreg_stats_enable(void);
+ /* counter register reads that need no BQL (helper.c, VPHONE_FAST_CNT) */
+ bool vphone_is_counter_read(const ARMCPRegInfo *ri);
++bool vphone_fast_cnt_on(void);
+ bool vphone_mark_on(void);
+ void vphone_mark_op(CPUARMState *env, uint64_t op, uint64_t arg);
+ 
 diff --git a/target/arm/tcg/crypto_helper.c b/target/arm/tcg/crypto_helper.c
 index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..7a50e75b806bf49469dcff8223b73ecc834dee59 100644
 --- a/target/arm/tcg/crypto_helper.c
@@ -2980,7 +3217,7 @@ index 982f302b5cb1e7e872c54b11d1cca629dbb4679e..e3e94dc1ae374063a49c34f8ddb76635
  #define ARM_HOST_MXCSR_BASE  0x1f80
  #define ARM_HOST_MXCSR_FLAGS 0x3f
 diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
-index 028e6c22c807a9f086edbea047f4a373923ad95f..997a55022f864ab53166c3f126365d07834e1b62 100644
+index 028e6c22c807a9f086edbea047f4a373923ad95f..ef3241effb2c4a075e8c1953d1b2f6c54c462af9 100644
 --- a/target/arm/tcg/translate-a64.c
 +++ b/target/arm/tcg/translate-a64.c
 @@ -22,6 +22,7 @@
@@ -3051,7 +3288,35 @@ index 028e6c22c807a9f086edbea047f4a373923ad95f..997a55022f864ab53166c3f126365d07
      /*
       * We rely here on our WFE implementation being a NOP, so we
       * don't need to do anything different to handle the WFET timeout
-@@ -6015,12 +6036,34 @@ typedef struct FPScalar {
+@@ -3117,19 +3138,17 @@ static void gen_sysreg_undef(DisasContext *s, bool isread,
+  * env and the virtual clock (a seqlock reader). VPHONE_FAST_CNT=1 reads them
+  * through helper_vphone_cnt_read without the BQL and keeps the TB going;
+  * 0 (the default) = QEMU's way. The access check is unchanged. Off by
+- * default: VPHONE_SYSREG_STATS showed iOS 27 reads CNTVCT_EL0 only ~14
+- * thousand times a second (EL1; user code does not use MRS for its clock),
+- * too few to matter.
++ * default on the desktop: VPHONE_SYSREG_STATS showed iOS 27 reads CNTVCT_EL0
++ * only ~14 thousand times a second there (EL1), too few to matter. The
++ * Android app turns it on: on a phone the vCPU threads waited for the BQL
++ * 25-43 thousand times a second (7-9% of their time), and its log showed
++ * user code in the commpage's mach_absolute_time, which reads CNTVCT_EL0
++ * itself (ISB; MRS). The app's cpu line counts the reads either way.
+  */
+ static bool vphone_fast_cnt(DisasContext *s, const ARMCPRegInfo *ri, bool isread)
+ {
+-    static int on = -1;
+-
+-    if (unlikely(on < 0)) {
+-        const char *e = getenv("VPHONE_FAST_CNT");
+-        on = e && *e ? atoi(e) != 0 : 0;
+-    }
+-    return on && isread && ri->readfn && !(ri->type & ARM_CP_CONST) &&
++    return vphone_fast_cnt_on() && isread && ri->readfn &&
++           !(ri->type & ARM_CP_CONST) &&
+            !(tb_cflags(s->base.tb) & CF_USE_ICOUNT) && vphone_is_counter_read(ri);
+ }
+ 
+@@ -6015,12 +6034,34 @@ typedef struct FPScalar {
   * guard"). The helper path recomputes from the untouched inputs; the flags
   * the native attempt raised are a subset of what the helper raises.
   *
@@ -3086,7 +3351,7 @@ index 028e6c22c807a9f086edbea047f4a373923ad95f..997a55022f864ab53166c3f126365d07
  static bool fp_native_ok(DisasContext *s)
  {
      return arm_native_fp_enabled && !s->fpcr_ah && !s->fpcr_nep &&
-@@ -12919,6 +12962,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
+@@ -12919,6 +12960,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
  {
      DisasContext *dc = container_of(dcbase, DisasContext, base);
      CPUARMState *env = cpu_env(cpu);
@@ -4728,6 +4993,18 @@ index b877aaea1da1a01b1f1065380caaab072252bc51..5e9fc1ef7c7b4ec31785101a16cb98dc
      /* SIGINT cannot be handled via signalfd, so that ^C can be used
       * to interrupt QEMU when it is being run under gdb.  SIGHUP and
       * SIGTERM are also handled asynchronously, even though it is not
+diff --git a/util/meson.build b/util/meson.build
+index d9a4695158b05015544dbfbb7de9c540aeaf9d5f..416370f46c453399424b4c54adeed07c089e1bea 100644
+--- a/util/meson.build
++++ b/util/meson.build
+@@ -20,6 +20,7 @@ if host_os != 'windows'
+   endif
+   util_ss.add(files('oslib-posix.c'), freebsd_dep)
+   util_ss.add(files('qemu-thread-posix.c'))
++  util_ss.add(files('vphone-touch.c'))
+   util_ss.add(files('memfd.c'))
+   util_ss.add(files('drm.c'))
+ else
 diff --git a/util/oslib-posix.c b/util/oslib-posix.c
 index 14cf94ac03417f2c38a0b40582afd59eaf0e0b79..24f76b8edcd2b02abe5a6f235f46809eccd15a11 100644
 --- a/util/oslib-posix.c
@@ -4855,3 +5132,187 @@ index b703c86f15a36fc95d5e34f1f8513bf8ede9c0d5..fbc350260947b20e6ac096db099c440e
 +    rcu_init_complete(true);
 +#endif
  }
+diff --git a/util/vphone-touch.c b/util/vphone-touch.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fe402ab75079af14683620995e82da29c060d13
+--- /dev/null
++++ b/util/vphone-touch.c
+@@ -0,0 +1,178 @@
++/*
++ * Where a touch's time goes between the phone's screen and the guest's read
++ * of its HID report, for one line of the Android app's log.
++ *
++ * The app numbers each pointer event it sends (a tag in bits 8-31 of the
++ * buttons word it gives rvg_android_pointer, which reims-vgpu passes through
++ * to QEMU's pointer callback untouched; 0 = not numbered) and says when
++ * Android read the touch and when the app sent it
++ * (vphone_android_touch_mark). QEMU stamps the same event when the window's
++ * callback has it (reims-vgpu's input thread), when its main loop gives it
++ * to the input layer under the BQL, and when the guest's USB transfer takes
++ * the touchscreen's report. Every stamp is CLOCK_MONOTONIC, which is what
++ * Android's MotionEvent times are on.
++ *
++ * What the guest does after its xHCI driver has the report (backboardd,
++ * SpringBoard, the app, the frame) cannot be seen from here.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/timer.h"
++#include "qemu/vphone-touch.h"
++
++#define MARKS 256
++#define SAMPLES 2048
++
++enum {
++    STAGE_APP,      /* Android's read of the touch -> the app's call */
++    STAGE_THREAD,   /* the app's call -> the window's callback in QEMU */
++    STAGE_LOOP,     /* the callback -> QEMU's main loop has it, under the BQL */
++    STAGE_GUEST,    /* in the device's queue -> the guest's transfer takes it */
++    STAGE_TOTAL,    /* Android's read -> the guest's transfer takes it */
++    STAGE__COUNT,
++};
++
++typedef struct {
++    uint32_t tag;
++    int64_t event_ns, call_ns, cb_ns;
++} Mark;
++
++static GMutex lock;
++static Mark marks[MARKS];
++/* Microseconds, the newest SAMPLES of each stage since the last line. */
++static uint32_t samples[STAGE__COUNT][SAMPLES];
++static uint32_t counts[STAGE__COUNT];
++/* The oldest report the guest has not taken, and the newest event in it. */
++static int64_t pending_since, pending_event_ns;
++
++static void sample(int stage, int64_t ns)
++{
++    uint64_t us = ns <= 0 ? 0 : (uint64_t)ns / 1000;
++
++    samples[stage][counts[stage] % SAMPLES] = MIN(us, UINT32_MAX);
++    counts[stage]++;
++}
++
++static Mark *mark_of(uint32_t tag)
++{
++    Mark *m = &marks[tag % MARKS];
++
++    return tag && m->tag == tag ? m : NULL;
++}
++
++void vphone_android_touch_mark(uint32_t tag, int64_t event_ns, int64_t call_ns)
++{
++    if (!tag) {
++        return;
++    }
++    g_mutex_lock(&lock);
++    marks[tag % MARKS] = (Mark){ .tag = tag, .event_ns = event_ns,
++                                 .call_ns = call_ns };
++    g_mutex_unlock(&lock);
++}
++
++void vphone_touch_callback(uint32_t tag)
++{
++    Mark *m;
++
++    if (!tag) {
++        return;
++    }
++    g_mutex_lock(&lock);
++    m = mark_of(tag);
++    if (m) {
++        m->cb_ns = get_clock();
++    }
++    g_mutex_unlock(&lock);
++}
++
++void vphone_touch_queued(uint32_t tag)
++{
++    int64_t now;
++    Mark *m;
++
++    if (!tag) {
++        return;
++    }
++    now = get_clock();
++    g_mutex_lock(&lock);
++    m = mark_of(tag);
++    if (m && m->cb_ns) {
++        sample(STAGE_APP, m->call_ns - m->event_ns);
++        sample(STAGE_THREAD, m->cb_ns - m->call_ns);
++        sample(STAGE_LOOP, now - m->cb_ns);
++        if (!pending_since) {
++            pending_since = now;
++        }
++        pending_event_ns = m->event_ns;
++        m->tag = 0;
++    }
++    g_mutex_unlock(&lock);
++}
++
++void vphone_touch_taken(void)
++{
++    int64_t now = get_clock();
++
++    g_mutex_lock(&lock);
++    if (pending_since) {
++        sample(STAGE_GUEST, now - pending_since);
++        sample(STAGE_TOTAL, now - pending_event_ns);
++        pending_since = 0;
++    }
++    g_mutex_unlock(&lock);
++}
++
++static int by_value(const void *a, const void *b)
++{
++    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
++
++    return x < y ? -1 : x > y;
++}
++
++/* "p50/p95/max 0.3/1.2/4.0 ms" of a stage's samples; sorts them in place. */
++static void stage_words(GString *line, const char *name, int stage)
++{
++    uint32_t n = MIN(counts[stage], SAMPLES);
++    uint32_t *s = samples[stage];
++
++    if (!n) {
++        g_string_append_printf(line, "%s no sample", name);
++        return;
++    }
++    qsort(s, n, sizeof(*s), by_value);
++    g_string_append_printf(line, "%s %.1f/%.1f/%.1f ms", name,
++                           s[n / 2] / 1000.0, s[(n * 95) / 100] / 1000.0,
++                           s[n - 1] / 1000.0);
++}
++
++size_t vphone_android_touch_line(char *buf, size_t cap)
++{
++    g_autoptr(GString) line = NULL;
++    size_t len;
++
++    if (!buf || !cap) {
++        return 0;
++    }
++    g_mutex_lock(&lock);
++    if (!counts[STAGE_LOOP]) {
++        g_mutex_unlock(&lock);
++        return 0;
++    }
++    line = g_string_new(NULL);
++    g_string_append_printf(line, "%u events reached QEMU, the guest read %u "
++                           "reports; median/95th/longest: ",
++                           counts[STAGE_LOOP], counts[STAGE_GUEST]);
++    stage_words(line, "Android to the app", STAGE_APP);
++    stage_words(line, ", the app to QEMU (input thread)", STAGE_THREAD);
++    stage_words(line, ", QEMU's main loop and lock", STAGE_LOOP);
++    stage_words(line, ", waiting for the guest to read the report",
++                STAGE_GUEST);
++    stage_words(line, "; touch to the guest's read in all", STAGE_TOTAL);
++    memset(counts, 0, sizeof(counts));
++    g_mutex_unlock(&lock);
++    len = MIN(line->len, cap);
++    memcpy(buf, line->str, len);
++    return len;
++}

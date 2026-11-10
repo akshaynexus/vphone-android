@@ -90,6 +90,10 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
         ("VPHONE_RET_PREFETCH", "2".to_string()),
         ("QEMU_TLB_UNSYNCED", "2".to_string()),
         ("VPHONE_XHCI_NONREMOVABLE", "0x1fe".to_string()),
+        // The guest's clock reads (iOS's mach_absolute_time is `MRS CNTVCT_EL0` in user code)
+        // without QEMU's global lock or the end of their block: on a phone the vCPU threads
+        // waited for that lock 25-43 thousand times a second (the 0.6.0 log).
+        ("VPHONE_FAST_CNT", "1".to_string()),
     ];
     env.extend(gfx_env(paths).into_iter().map(|(key, value)| {
         // Without the screen the GPU device is the same and draws nowhere.
@@ -233,6 +237,7 @@ mod tests {
         ));
         assert!(line.contains("-qmp unix:/data/files/qmp.sock,server=on,wait=off"));
         assert!(l.env.contains(&("QEMU_TLB_UNSYNCED", "2".to_string())));
+        assert!(l.env.contains(&("VPHONE_FAST_CNT", "1".to_string())));
         assert!(l.env.contains(&("REIMS_VGPU_WINDOW", "1".to_string())));
     }
 

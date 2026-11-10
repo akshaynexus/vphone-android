@@ -41,6 +41,29 @@ pub fn vcpu_nice(performance: Performance) -> i32 {
     }
 }
 
+/// The nice value of QEMU's main loop thread, two steps more urgent than the vCPUs'. It runs in
+/// short bursts and everything a vCPU waits on passes through it: the guest's timers, its disk
+/// and network completions, and each touch on its way to the touchscreen device. At the default
+/// priority it queued behind six busy vCPU threads and the GPU device's, all at the vCPUs' nice
+/// value, on a phone whose every core was busy (the 0.6.0 log).
+pub fn main_loop_nice(performance: Performance) -> i32 {
+    vcpu_nice(performance) - 2
+}
+
+/// The name `runtime` gives the thread QEMU's main loop runs on.
+const MAIN_LOOP: &str = "qemu-main";
+
+fn main_loop_threads() -> Vec<i32> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter(|t| std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim_end() == MAIN_LOOP))
+        .filter_map(|t| t.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
 /// The vCPU threads' clocks, summed over the samples since the last reading: how many CPUs were
 /// sampled, their clocks as thousandths of each CPU's highest, and how many ran at 95% or more.
 static CLOCK_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -465,6 +488,13 @@ fn run(
     let nice = vcpu_nice(performance);
     let (raised, refusal) = raise_priority(&tids, nice);
     say_more(&priority_line(nice, tids.len(), raised, refusal.as_deref()));
+    let main_loop = main_loop_threads();
+    let (raised, refusal) = raise_priority(&main_loop, main_loop_nice(performance));
+    say_more(&match refusal {
+        None if raised > 0 => format!("performance: QEMU's main loop runs at nice {}", main_loop_nice(performance)),
+        None => "performance: QEMU's main loop thread was not found; it keeps its priority".to_string(),
+        Some(why) => format!("performance: the system refused nice {} for QEMU's main loop ({why})", main_loop_nice(performance)),
+    });
     if tids.iter().any(|t| cpu_ns(*t).is_none()) {
         return Err("this kernel has no schedstat to measure the vCPU threads by".into());
     }
@@ -495,6 +525,7 @@ fn run(
     // The GPU device's threads, given the vCPUs' priority as they appear: a frame's vCPU waits
     // on them, and at the default priority they queue behind the vCPU threads of other work.
     let mut gpu_raised: Vec<i32> = Vec::new();
+    let mut gpu_said = false;
     let mut ticks = 0u64;
     let mut last: Vec<i64> = tids.iter().map(|t| cpu_ns(*t).unwrap_or(0)).collect();
     let mut outcome = Ok(());
@@ -514,7 +545,7 @@ fn run(
             });
             let groups = tids.first().and_then(|t| std::fs::read_to_string(format!("/proc/self/task/{t}/cgroup")).ok()).unwrap_or_default();
             say_more(&format!(
-                "{}; {}{heat}; {}; {} GPU threads at nice {nice}",
+                "{}; {}{heat}; {}; {} live GPU threads at nice {nice}",
                 placement_line(&cpus, &speeds, reports),
                 clusters_line(&clusters()),
                 scheduler_groups(&groups),
@@ -532,12 +563,16 @@ fn run(
         }
         // The GPU device makes its threads as the guest makes its queues: every two seconds.
         if ticks % 40 == 1 {
-            let new: Vec<i32> = gpu_threads().into_iter().filter(|t| !gpu_raised.contains(t)).collect();
+            // The live ones: the GPU device ends threads as the guest's processes end, and a
+            // thread id that comes round again belongs to a thread nobody has raised.
+            let live = gpu_threads();
+            let new: Vec<i32> = live.iter().copied().filter(|t| !gpu_raised.contains(t)).collect();
+            let first = !gpu_said && !new.is_empty();
+            gpu_raised = live;
             if !new.is_empty() {
-                let first = gpu_raised.is_empty();
                 let (raised, refusal) = raise_priority(&new, nice);
-                gpu_raised.extend(new.iter().copied());
                 if first {
+                    gpu_said = true;
                     say_more(&match refusal {
                         None => format!("performance: {raised} GPU threads run at nice {nice}, and the ones made later will"),
                         Some(why) => format!("performance: {raised} of {} GPU threads took nice {nice}; the system refused the rest ({why})", new.len()),
@@ -613,6 +648,11 @@ mod tests {
         assert!(vcpu_nice(Performance::Max) < vcpu_nice(Performance::Balanced));
         // Nothing below what an app may ask for its own threads (-20 is the kernel's floor).
         assert!(vcpu_nice(Performance::Max) >= -19);
+        // The main loop is more urgent than the vCPUs it serves, within the same limit.
+        for p in [Performance::Max, Performance::Balanced] {
+            assert!(main_loop_nice(p) < vcpu_nice(p) && main_loop_nice(p) >= -19);
+        }
+        assert!(main_loop_threads().is_empty(), "no test thread is QEMU's main loop");
     }
 
     #[test]

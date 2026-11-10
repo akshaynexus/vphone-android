@@ -98,12 +98,12 @@ see the build report.
 
 *Boot* checks the bundle, the app's libraries and free memory, then starts the VM. Boot takes several
 minutes on a phone: the screen shows the phase until iOS is up, and the app unlocks the screen once `vphoned`
-answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
+answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, iOS's background services, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
 RAM and a 1024 MiB code cache on a 12 GB phone; 6 GiB and 2048 MiB from 16 GB; 8 GiB and 2048 MiB from 24 GB.
 
 | Control | What it does |
 |---|---|
-| Touch | One finger, as the desktop window's pointer |
+| Touch | One finger, as the desktop window's pointer. A press and a release go to the guest at once; moves go at most once per refresh of the guest's display, the newest place each time (`vphone-native/src/touch.rs`) |
 | Home | A middle click on the guest's touchscreen, which QEMU sends as Cmd+H |
 | Lock | vphoned's `input.button lock` |
 | Power | iOS's own shutdown, then QMP `quit` if the guest does not answer |
@@ -161,6 +161,56 @@ as the compositor reads it; the swapchain image's `layout` line says how Turnip 
 Android 17 adds a per-app memory limit based on the phone's RAM. A VM it ends is reported as such;
 lower the RAM or the code cache.
 
+## Making it faster on the phone
+
+Everything iOS does here waits on emulated CPUs, so what the phone gives the vCPU threads decides the frame
+rate. In the first full log (0.6.0, OnePlus 15, Performance = Max) the phone held their clocks at 1.6 to
+2.4 GHz of 3.6 while Android's thermal status read "none", and the guest had 5.2 to 5.9 of 6 CPUs busy
+with background work.
+
+**On the phone** (not verified on a device by this repository; the next log's `performance hints` and
+`game mode` lines say whether the allowed clock rose):
+
+- The app declares itself a game (`android:appCategory="game"`, a game-mode config that supports the
+  performance mode, and `GameManager.setGameState` while the VM is on screen), because phones apply their
+  performance settings to games. On a OnePlus: open the **Games** app (Game Assistant), add *vphone* if it is
+  not listed, and choose **Pro Gamer mode** (or the performance setting it offers) for it.
+- **Settings > Battery > Power mode (or More settings) > High performance mode** on a OnePlus lifts the
+  clocks for every app.
+- A game overlay opens with a swipe in from a top corner of the screen, which is also where iOS's
+  Notification Center and Control Center start. If it gets in the way, turn the overlay's gesture off in
+  the Games app's settings (*Game Assistant* / *Gaming tools*), or remove vphone from the Games list.
+- Keep the phone cool and off the charger's heat: a case off and a fan do more than any setting once
+  the phone is warm.
+
+**In the VM's settings:** *iOS background services*.
+
+- *Trimmed* applies the guest agent's `trimmed` profile (the about 137 daemons creation's option disables:
+  Siri and the intelligence services, Find My, Wallet, Watch, Home, iCloud and Mail sync, analytics, media
+  analysis, the App Store) and `com.apple.momentsd`.
+- *Fewest* (experimental, not run on a guest) also disables `com.apple.sharingd` (AirDrop, Handoff) and
+  `com.apple.chronod` (every widget). If `guest top` then shows a process busier than before, go back.
+- The app asks the guest's agent once after the unlock, whenever the setting differs from what it last
+  applied (`<vm>/services.json`), and the log says `[vphone] services: ...`. iOS honours it from its next
+  start, so shut the VM down and start it again. *As they are* turns back on what the app turned off.
+- The labels could not be checked against an iOS 27 `launchd.plist` here. BackgroundShortcutRunner is an XPC
+  service started for widgets' App Intents and locationd is one the agent refuses to disable; neither can
+  be switched off this way.
+
+**In iOS:** remove the Weather, Clock and other widgets from the Home Screen and Today view (they ran at
+0.2 to 0.4 of a guest CPU each, and their App Intents kept BackgroundShortcutRunner at 0.6 to 0.8), and turn
+on Settings > Accessibility > Motion > Reduce Motion and Display & Text Size > Reduce Transparency.
+
+What 0.6.2 changed in the app itself, and what was measured:
+
+| Change | Measured |
+|---|---|
+| Counter reads (`MRS CNTVCT_EL0`, which is iOS's `mach_absolute_time` in user code) without QEMU's global lock and without ending their block (`VPHONE_FAST_CNT=1`, checked by `tests/tcg/vphone-cnt`) | On the build PC (x86-64, one vCPU, lock uncontended): 4 million reads in 0.23 s instead of 0.47 s, about 50 ns a read instead of 105. On the phone the vCPU threads waited for that lock 25-43 thousand times a second, 7-9% of their time; how much of that the reads were is what the next log's `cpu` line says |
+| QEMU's main loop thread at nice -10 (the vCPU and GPU threads are at -8) | Not measured. It delivers the guest's timers, I/O completions and every touch, and ran at the default priority behind them |
+| Touch: only the newest place of each Android event, moves at most once a refresh | Unit tests; fewer reports for the guest's HID driver and backboardd. The `touch` line measures the rest |
+| `WFE` left a NOP | On the build PC a spin iteration with `WFE` costs 5.6 ns (200 million in 1.1 s). The log's 1.6-4.8 million a second is then about 1-2% of the six vCPU threads' time on the phone, scaled by its clocks; the same rate as the desktop's 14,000 waits of 11 us (docs/PERFORMANCE.md). Yielding the host CPU could win back no more than that |
+| Whole-cache flushes | The log's long frame gaps do not follow them (11.9, 10.9, 6.2 and 5.0 s in periods without a flush; 6.5 and 9.8 s in periods with one), and a gap also counts a screen that did not change. After each flush the cache grew by about 12 MiB/s for a minute against 3-5 MiB/s otherwise: about 500 MiB translated again. The `cpu` line now gives the translation's share of vCPU time |
+
 ## Reading a boot log for speed
 
 Every 30 s `serial.log` has these lines. Measure a few minutes after the unlock: iOS's own work after
@@ -174,13 +224,25 @@ rate (`best second` is the burst's own).
 - `[vphone] performance hints: ...`: the CPUs the vCPU threads last ran on, each cluster's clock now with
   what the system allows and its highest, Android's thermal status and headroom (1.00 is where it throttles
   severely), the scheduler groups of a vCPU thread (`top-app` while the VM is on screen), and how many of the
-  GPU device's threads were given the vCPUs' priority.
+  GPU device's live threads have the vCPUs' priority.
+- `[vphone] game mode: ...`: whether the phone counts the app as a game and in which of Android's game
+  modes, each time the VM comes on screen. Compare the allowed clocks before and after switching the phone's
+  performance or game settings.
+- `[vphone] touch ...`: the touch events since the last line and how many went to the guest, then the
+  median, 95th percentile and longest of each leg: Android's read of the touch to the app's call, the app
+  to QEMU (reims-vgpu's input thread), QEMU's main loop and lock, and the wait until the guest's USB
+  transfer took the report; and the sum. All of that is the host's side. What iOS does after its driver has
+  the report (backboardd, the app, the frame) is not visible from the host: a delay you feel with these
+  figures at a few milliseconds is the guest's, and follows `guest top` and the `gpu` line's frame time.
+- `[vphone] services: ...`: what the VM's *iOS background services* setting asked of the guest's agent.
 - `[vphone] cpu ...` (QEMU's `vphone_android_cpu_line`): how often the guest ran `WFE` and `YIELD`, which
   are NOPs under multi-threaded TCG, so a guest that spins on them burns host cores: tens of thousands a
   second is iOS at rest, millions is a spin; the share of the vCPU threads' time spent halted (the guest
   idle), waiting for QEMU's global lock, in exclusive sections, and spinning for other vCPUs' part of a TLB
-  flush; and the translated-code cache's fill and how often it was flushed whole (each flush translates
-  everything the guest runs again: raise the code cache if it happens in use).
+  flush, and translating guest code (with the blocks made a second); how often they took QEMU's lock at all
+  and how often the guest read its counter, which takes no lock since 0.6.2; and the translated-code
+  cache's fill and how often it was flushed whole (each flush translates everything the guest runs again;
+  the settings allow at most 2048 MiB, which is the phone's RAM to give, not a limit of QEMU's on arm64).
 - `[vphone] guest top ...`: which of iOS's processes used its CPUs since the last line (vphoned's
   `processes.list`), from the unlock on: `5.61 guest CPUs busy: mediaanalysisd 1.92, ...`.
 - `[vphone] guest code ...`: when at least half the vCPUs are in one 16 KiB page of user code, 48

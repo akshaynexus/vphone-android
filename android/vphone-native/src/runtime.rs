@@ -114,6 +114,11 @@ pub(crate) struct Qemu {
     /// `vphone_android_cpu_line`: the guest's spin hints and the vCPU threads' waits since the
     /// last call; absent in a QEMU built before it.
     cpu_line: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
+    /// `vphone_android_touch_mark`: a numbered pointer event, when Android read the touch and
+    /// when it is sent (`CLOCK_MONOTONIC` ns); and `vphone_android_touch_line`, where the
+    /// events' time went on their way to the guest since the last call. Absent in an older QEMU.
+    touch_mark: Option<unsafe extern "C" fn(u32, i64, i64)>,
+    touch_line: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
 }
 static QEMU: OnceLock<Qemu> = OnceLock::new();
 
@@ -157,7 +162,7 @@ fn notice(text: String) {
     *NOTICE.lock().unwrap() = text;
 }
 
-fn log_line(line: &str) {
+pub(crate) fn log_line(line: &str) {
     log(TAG, line);
     write_log(format!("[vphone] {line}\n").as_bytes());
 }
@@ -282,6 +287,8 @@ pub(crate) fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
             pointer: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_pointer")?),
             perf_line: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_perf_line")?),
             cpu_line: dlsym(h, c"vphone_android_cpu_line").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
+            touch_mark: dlsym(h, c"vphone_android_touch_mark").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
+            touch_line: dlsym(h, c"vphone_android_touch_line").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
         }
     };
     Ok(QEMU.get_or_init(|| q))
@@ -537,9 +544,22 @@ fn start(name: &str) -> Result<(), String> {
         #[cfg(target_os = "android")]
         crate::adpf::start(cfg.vcpus, cfg.performance, || QEMU_DONE.load(Ordering::SeqCst), log_line);
     }
+    let services = cfg.services;
+    let vm_dir = dir.clone();
     std::thread::Builder::new()
         .name("vphoned-watch".into())
-        .spawn(move || watch(Client::new(&Paths::get().vsock_socket())))
+        .spawn(move || {
+            let client = Client::new(&Paths::get().vsock_socket());
+            if watch(client.clone()) {
+                // After the unlock, which the user waits for; the guest's agent is up.
+                crate::services::apply(&client, &vm_dir, services, &|line| {
+                    log_line(line);
+                    if line.contains("next starts") {
+                        notice(line.trim_start_matches("services: ").to_string());
+                    }
+                });
+            }
+        })
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -594,6 +614,28 @@ fn cpu_line(qemu: &Qemu) -> String {
     let written = unsafe { line(buffer.as_mut_ptr(), buffer.len()) };
     buffer.truncate(written.min(buffer.len()));
     String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// The touches since the last line: how many came and went on (`touch::Counts`), and QEMU's
+/// account of their way to the guest; empty when nobody touched the screen.
+fn touch_line(qemu: &Qemu) -> String {
+    let counts = TOUCH.lock().unwrap().pacer.take_counts();
+    if counts == crate::touch::Counts::default() {
+        return String::new();
+    }
+    let mut buffer = vec![0u8; 1024];
+    let written = match qemu.touch_line {
+        // SAFETY: the buffer holds the capacity given; the call writes at most that.
+        Some(line) => unsafe { line(buffer.as_mut_ptr(), buffer.len()) },
+        None => 0,
+    };
+    buffer.truncate(written.min(buffer.len()));
+    let stages = String::from_utf8_lossy(&buffer).into_owned();
+    if stages.is_empty() {
+        counts.words()
+    } else {
+        format!("{}; {stages}", counts.words())
+    }
 }
 
 /// How many 16 KiB pages of guest code are dumped in one run: each is a line of the log.
@@ -671,6 +713,10 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
         if let Some(line) = QEMU.get().map(cpu_line).filter(|l| !l.is_empty()) {
             log_line(&format!("cpu {at} {line}"));
         }
+        // Where the touches' time went between the screen and the guest's read of them.
+        if let Some(line) = QEMU.get().map(touch_line).filter(|l| !l.is_empty()) {
+            log_line(&format!("touch {at} {line}"));
+        }
         // Which of the guest's processes used its CPUs since the last line, once its agent is up.
         if matches!(s.phase, Phase::Unlocking | Phase::Running) {
             let now = Instant::now();
@@ -741,8 +787,9 @@ fn guest_summary(vcpus: &[qmp::Vcpu], still_samples: u32, every: Duration) -> St
     out
 }
 
-/// start-vm.sh's wait: vphoned's health, then `screen.unlock` until it reports unlocked.
-fn watch(client: Client) {
+/// start-vm.sh's wait: vphoned's health, then `screen.unlock` until it reports unlocked. True
+/// when the guest's agent answered and the VM is still up.
+fn watch(client: Client) -> bool {
     let mut healthy = false;
     for _ in 0..HEALTH_ATTEMPTS {
         if client.healthy(Duration::from_secs(10)) {
@@ -750,36 +797,37 @@ fn watch(client: Client) {
             break;
         }
         if !sleep_while_up(Duration::from_secs(10)) {
-            return;
+            return false;
         }
     }
     if !healthy {
         update(|s| s.message = "iOS did not answer in 40 minutes; see the log".into());
-        return;
+        return false;
     }
     log_line("vphoned is up; unlocking");
     set_phase(Phase::Unlocking, "");
     for _ in 0..20 {
         if !sleep_while_up(Duration::ZERO) {
-            return;
+            return false;
         }
         match client.unlock(Duration::from_secs(120)) {
             Ok(true) => {
                 set_phase(Phase::Running, "");
                 log_line("unlocked");
-                return;
+                return true;
             }
             Ok(false) => log_line("screen.unlock: still locked"),
             Err(e) => log_line(&e),
         }
         if !sleep_while_up(Duration::from_secs(15)) {
-            return;
+            return false;
         }
     }
     set_phase(
         Phase::Running,
         "iOS is up but the screen did not unlock; swipe up",
     );
+    true
 }
 
 // ------------------------------------------------------------------- stop
@@ -913,21 +961,97 @@ fn qemu_running() -> Option<&'static Qemu> {
     .flatten()
 }
 
-/// A MotionEvent's primary pointer: action 0 down, 1 up, 2 move, 3 cancel.
-pub fn touch(action: i32, x: f32, y: f32) {
-    let Some(q) = qemu_running() else { return };
-    let (gw, gh) = {
-        let s = STATE.lock().unwrap();
-        (s.width, s.height)
-    };
-    let mut p = POINTER.lock().unwrap();
-    (p.x, p.y) = to_guest(x, y, p.view_w, p.view_h, gw, gh);
-    match action {
-        0 | 2 => p.buttons |= BUTTON_LEFT,
-        _ => p.buttons &= !BUTTON_LEFT,
+/// The touch being paced on its way to the guest (`crate::touch`), and the last number given to
+/// an event.
+struct Touch {
+    pacer: crate::touch::Pacer,
+    tag: u32,
+    flusher: bool,
+}
+static TOUCH: Mutex<Touch> = Mutex::new(Touch { pacer: crate::touch::Pacer::new(0), tag: 0, flusher: false });
+/// Wakes the thread that sends a held move when its time comes.
+static TOUCH_HELD: std::sync::Condvar = std::sync::Condvar::new();
+
+/// `CLOCK_MONOTONIC` in ns: the clock of Android's event times and of QEMU's stamps.
+fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: ts is a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+/// Sends the guest a pointer state, numbered so that QEMU can time its way (`touch_line`).
+/// Called with `TOUCH` held, which keeps the events in order.
+fn send_pointer(q: &Qemu, t: &mut Touch, x: u16, y: u16, buttons: u32, event_ns: i64) {
+    let mut word = buttons;
+    if let Some(mark) = q.touch_mark {
+        t.tag = crate::touch::next_tag(t.tag);
+        word |= t.tag << crate::touch::TAG_SHIFT;
+        // SAFETY: plain values to a function of the shared contract.
+        unsafe { mark(t.tag, event_ns, monotonic_ns()) };
     }
     // SAFETY: plain values to a function of the shared contract.
-    unsafe { (q.pointer)(p.x, p.y, p.buttons) };
+    unsafe { (q.pointer)(x, y, word) };
+}
+
+/// The thread that sends a held move once its interval is over, so that a finger that stops
+/// between two refreshes is still where the guest thinks it is.
+fn touch_flusher() {
+    let mut t = TOUCH.lock().unwrap();
+    loop {
+        let Some(due) = t.pacer.due_at() else {
+            t = TOUCH_HELD.wait(t).unwrap();
+            continue;
+        };
+        let now = monotonic_ns();
+        if now < due {
+            t = TOUCH_HELD.wait_timeout(t, Duration::from_nanos((due - now) as u64)).unwrap().0;
+            continue;
+        }
+        if let (Some(sample), Some(q)) = (t.pacer.due(now), qemu_running()) {
+            let buttons = POINTER.lock().unwrap().buttons;
+            // A release since then has already said where the finger is.
+            if buttons & BUTTON_LEFT != 0 {
+                send_pointer(q, &mut t, sample.x, sample.y, buttons, sample.event_ns);
+            }
+        }
+    }
+}
+
+/// A MotionEvent's primary pointer: action 0 down, 1 up, 2 move, 3 cancel; `event_ns` is when
+/// Android read it (`MotionEvent.getEventTimeNanos`). Moves reach the guest at most once per
+/// refresh of its display (`crate::touch`); presses and releases at once.
+pub fn touch(action: i32, x: f32, y: f32, event_ns: i64) {
+    use crate::touch::{Kind, Sample};
+    let Some(q) = qemu_running() else { return };
+    let (gw, gh, hz) = {
+        let s = STATE.lock().unwrap();
+        (s.width, s.height, s.refresh_hz)
+    };
+    let mut t = TOUCH.lock().unwrap();
+    t.pacer.interval_ns = crate::touch::interval_ns(hz);
+    if !t.flusher {
+        t.flusher = std::thread::Builder::new().name("vm-touch".into()).spawn(touch_flusher).is_ok();
+    }
+    let (px, py, buttons) = {
+        let mut p = POINTER.lock().unwrap();
+        (p.x, p.y) = to_guest(x, y, p.view_w, p.view_h, gw, gh);
+        match action {
+            0 | 2 => p.buttons |= BUTTON_LEFT,
+            _ => p.buttons &= !BUTTON_LEFT,
+        }
+        (p.x, p.y, p.buttons)
+    };
+    let kind = match action {
+        0 => Kind::Down,
+        2 => Kind::Move,
+        _ => Kind::Up,
+    };
+    if t.pacer.offer(kind, Sample { x: px, y: py, event_ns }, monotonic_ns()) {
+        send_pointer(q, &mut t, px, py, buttons, event_ns);
+    } else {
+        TOUCH_HELD.notify_one();
+    }
 }
 
 /// A middle click, which QEMU's touchscreen turns into Cmd+H, iOS's Home shortcut.

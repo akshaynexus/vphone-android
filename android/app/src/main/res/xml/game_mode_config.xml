@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The app answers to Android's Game Mode: it runs in the performance mode when the phone offers
+     it, and the system does not scale its window down or cap its frame rate on its own. -->
+<game-mode-config xmlns:android="http://schemas.android.com/apk/res/android"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false"
+    android:supportsBatteryGameMode="false"
+    android:supportsPerformanceGameMode="true" />

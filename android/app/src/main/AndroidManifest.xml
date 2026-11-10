@@ -13,15 +13,24 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
-    <!-- Tagged heap pointers cannot pass through TCG's host-pointer arithmetic. -->
+    <!-- Tagged heap pointers cannot pass through TCG's host-pointer arithmetic.
+         The app is declared a game: a phone holds an ordinary app's CPU clocks down long before it
+         is warm (a OnePlus let the vCPUs have 1.6 to 2.4 of 3.6 GHz with its thermal status at
+         "none"), and its game mode and performance settings apply to games. -->
     <application
         android:name=".App"
+        android:appCategory="game"
+        android:isGame="true"
         android:allowBackup="false"
         android:allowNativeHeapPointerTagging="false"
         android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <meta-data
+            android:name="android.game_mode_config"
+            android:resource="@xml/game_mode_config" />
 
         <activity
             android:name=".MainActivity"

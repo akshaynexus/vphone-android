@@ -618,6 +618,20 @@ class MainActivity : Activity() {
             )
             setSelection(refreshValues.indexOf(config.optInt("refreshHz", 120)).coerceAtLeast(0))
         }
+        // crate::services::Level, in the order of the labels.
+        val servicesValues = listOf("unchanged", "trimmed", "fewest")
+        val services = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf(
+                    "As they are",
+                    "Trimmed (about 138 off: Siri, iCloud sync, analytics, Journal...)",
+                    "Fewest (experimental: also no widgets, no AirDrop)",
+                ),
+            )
+            setSelection(servicesValues.indexOf(config.optString("services", "unchanged")).coerceAtLeast(0))
+        }
         val display = CheckBox(this).apply {
             text = "Show the screen (off: iOS runs with nothing drawn)"
             isChecked = config.optBoolean("display", true)
@@ -656,6 +670,12 @@ class MainActivity : Activity() {
         labelled(form, "Code cache (MiB)", tb)
         labelled(form, "Performance", performance)
         form.addView(hints)
+        labelled(
+            form,
+            "iOS background services. Fewer leave more of the emulated CPUs to the screen. A change is " +
+                "applied at the VM's next start and takes effect at the start after that",
+            services,
+        )
         labelled(form, "Refresh rate (iOS's display mode, and the rate asked of this phone's screen)", refresh)
         form.addView(display)
         form.addView(compression)
@@ -678,6 +698,7 @@ class MainActivity : Activity() {
                     .put("performance", performanceValues[performance.selectedItemPosition.coerceIn(0, 1)])
                     .put("refreshHz", refreshValues[refresh.selectedItemPosition.coerceIn(0, 1)])
                     .put("performanceHints", hints.isChecked)
+                    .put("services", servicesValues[services.selectedItemPosition.coerceIn(0, 2)])
                     .put("display", display.isChecked)
                     .put("gpuCompression", compression.isChecked)
                     .put("gpuDiagnostics", diagnostics.isChecked)

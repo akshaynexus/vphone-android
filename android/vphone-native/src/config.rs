@@ -92,6 +92,9 @@ pub struct VmConfig {
     /// buffers (`REIMS_VGPU_SOFTWARE_DISPLAY=1`, `ANativeWindow_lock`) and makes no swapchain.
     /// Slower, and right whatever the GPU driver does with a swapchain.
     pub software_display: bool,
+    /// Which of iOS's background services run (`crate::services`), applied by the guest's agent
+    /// when it has changed, from iOS's next start.
+    pub services: crate::services::Level,
 }
 
 impl Default for VmConfig {
@@ -125,6 +128,7 @@ impl VmConfig {
             gpu_diagnostics: false,
             swapchain_layout: SwapchainLayout::Auto,
             software_display: false,
+            services: crate::services::Level::Unchanged,
         }
     }
 
@@ -251,6 +255,17 @@ mod tests {
         let fresh = VmConfig::for_phone(15 * 1024, 8);
         assert!(!fresh.gpu_diagnostics && !fresh.gpu_compression);
         assert_eq!((fresh.performance, fresh.refresh_hz, fresh.version), (Performance::Max, 120, VERSION));
+    }
+
+    /// Settings saved before the services had a setting leave the VM's services alone.
+    #[test]
+    fn the_services_setting_defaults_to_unchanged() {
+        use crate::services::Level;
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"version":2}"#).unwrap();
+        assert_eq!(old.services, Level::Unchanged);
+        let set: VmConfig = serde_json::from_str(r#"{"services":"fewest"}"#).unwrap();
+        assert_eq!(set.services, Level::Fewest);
+        assert!(serde_json::to_string(&VmConfig { services: Level::Trimmed, ..old }).unwrap().contains(r#""services":"trimmed""#));
     }
 
     /// The GPU switches name the driver's flags.

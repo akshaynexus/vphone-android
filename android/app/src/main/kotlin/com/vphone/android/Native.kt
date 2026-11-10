@@ -19,10 +19,13 @@ object Native {
     external fun stop()
     external fun lastRun(): String
     external fun recordDeath(reason: String)
+    /** A line of the running VM's log, from the app's side. */
+    external fun logLine(line: String)
     external fun logTail(path: String, bytes: Long): String
     external fun setSurface(surface: Surface?)
     external fun layoutImage(width: Int, height: Int): IntArray
-    external fun touch(action: Int, x: Float, y: Float)
+    /** [eventNanos] is `MotionEvent.getEventTimeNanos`: when Android read the touch. */
+    external fun touch(action: Int, x: Float, y: Float, eventNanos: Long)
     external fun home()
     external fun lock()
     external fun importBegin(folder: String, totalBytes: Long): String

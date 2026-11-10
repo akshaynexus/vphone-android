@@ -12,7 +12,9 @@ pub mod platform;
 pub mod preflight;
 pub mod qmp;
 pub mod runtime;
+pub mod services;
 pub mod share;
+pub mod touch;
 pub mod vphoned;
 
 mod adpf;

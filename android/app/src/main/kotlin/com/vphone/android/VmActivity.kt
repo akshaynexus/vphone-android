@@ -2,6 +2,9 @@ package com.vphone.android
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.GameManager
+import android.app.GameState
+import android.content.pm.ApplicationInfo
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -85,6 +88,7 @@ class VmActivity : Activity() {
         val speed = "$performance@$hz"
         if (performance.isEmpty() || speed == appliedSpeed) return
         appliedSpeed = speed
+        tellGameMode(true)
         if (getSystemService(PowerManager::class.java).isSustainedPerformanceModeSupported) {
             window.setSustainedPerformanceMode(performance == "balanced")
         }
@@ -101,6 +105,33 @@ class VmActivity : Activity() {
                 (mode?.let { ", display mode ${it.modeId} at ${it.refreshRate} Hz" } ?: ", no display mode of this size reaches it") +
                 "; modes ${display?.supportedModes?.joinToString { "${it.physicalWidth}x${it.physicalHeight}@${it.refreshRate.toInt()}" }}")
             if (::surface.isInitialized && surface.holder.surface?.isValid == true) askFrameRate(surface.holder.surface)
+        }
+    }
+
+    /**
+     * Tells Android the VM is on screen and must not be interrupted, which a phone's game mode
+     * takes as leave to raise the clocks, and writes into the VM's log how the phone treats the
+     * app: whether it counts as a game, and in which game mode. A phone that holds an ordinary
+     * app's clocks down lets a game in its performance mode have more.
+     */
+    private fun tellGameMode(playing: Boolean) {
+        val games = getSystemService(GameManager::class.java) ?: return
+        try {
+            games.setGameState(GameState(false, if (playing) GameState.MODE_GAMEPLAY_UNINTERRUPTIBLE else GameState.MODE_NONE))
+            if (!playing) return
+            val mode = when (val m = games.gameMode) {
+                GameManager.GAME_MODE_UNSUPPORTED -> "unsupported (the phone does not treat the app as a game)"
+                GameManager.GAME_MODE_STANDARD -> "standard"
+                GameManager.GAME_MODE_PERFORMANCE -> "performance"
+                GameManager.GAME_MODE_BATTERY -> "battery saver"
+                GameManager.GAME_MODE_CUSTOM -> "custom"
+                else -> "$m"
+            }
+            val game = applicationInfo.category == ApplicationInfo.CATEGORY_GAME
+            Native.logLine("game mode: $mode; the app is ${if (game) "" else "not "}in Android's game category; " +
+                "told the system the VM is on screen and not to be interrupted")
+        } catch (e: RuntimeException) {
+            Native.logLine("game mode: the system refused ($e)")
         }
     }
 
@@ -237,6 +268,9 @@ class VmActivity : Activity() {
     }
 
     override fun onStop() {
+        tellGameMode(false)
+        // Said again, with the mode the phone has by then, when the screen comes back.
+        appliedSpeed = ""
         handler.removeCallbacks(poll)
         super.onStop()
     }
@@ -315,30 +349,32 @@ class VmActivity : Activity() {
         )
     }
 
+    /**
+     * The finger's newest place only: Android batches the touchscreen's samples between two
+     * frames into one event, and the older ones in it are places the guest no longer needs
+     * (until 0.6.1 each was a report for its touchscreen driver). The native side holds moves
+     * to one per refresh of the guest's display; a press and a release go at once.
+     */
     private fun onTouch(event: MotionEvent): Boolean {
+        val at = event.eventTimeNanos
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 trackedPointer = event.getPointerId(0)
-                Native.touch(ACTION_DOWN, event.getX(0), event.getY(0))
+                Native.touch(ACTION_DOWN, event.getX(0), event.getY(0), at)
             }
             MotionEvent.ACTION_MOVE -> {
                 val index = event.findPointerIndex(trackedPointer)
-                if (index >= 0) {
-                    for (h in 0 until event.historySize) {
-                        Native.touch(ACTION_MOVE, event.getHistoricalX(index, h), event.getHistoricalY(index, h))
-                    }
-                    Native.touch(ACTION_MOVE, event.getX(index), event.getY(index))
-                }
+                if (index >= 0) Native.touch(ACTION_MOVE, event.getX(index), event.getY(index), at)
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 if (event.getPointerId(event.actionIndex) == trackedPointer) {
-                    Native.touch(ACTION_UP, event.getX(event.actionIndex), event.getY(event.actionIndex))
+                    Native.touch(ACTION_UP, event.getX(event.actionIndex), event.getY(event.actionIndex), at)
                     trackedPointer = -1
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (trackedPointer != -1) {
-                    Native.touch(ACTION_UP, event.x, event.y)
+                    Native.touch(ACTION_UP, event.x, event.y, at)
                     trackedPointer = -1
                 }
             }
