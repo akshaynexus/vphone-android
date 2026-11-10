@@ -17,6 +17,11 @@ start it.
 > The rest of this guide is the manual path — the same steps, every command visible — plus the
 > parts the two scripts do not cover (your own apps, performance tuning).
 
+For optional QMP control during the first boot started by `setup/create-vm.sh`, set
+`VPHONE_FIRST_BOOT_QMP` to a fresh Unix socket path in a directory you own with mode `0700`.
+The listener does not wait for a client. An already running VM is reused without changing its
+QMP configuration or restarting it. Leaving `VPHONE_FIRST_BOOT_QMP` unset adds no QMP listener.
+
 1. [What you need](#1-what-you-need)
 2. [Install the dependencies](#2-install-the-dependencies)
 3. [Build](#3-build)
@@ -176,7 +181,9 @@ linux-create/build.sh      # fetches vphone-cli, installs Swift if needed, syncs
 linux-create/vphone-cli --help
 ```
 
-`linux-create/vphone-cli` runs the built tool (it builds it first if needed); use it as
+`linux-create/vphone-cli` prefers the built Release tool. It warns and uses an existing Debug
+product if Release is absent. If neither exists, run `linux-create/build.sh` first.
+The wrapper does not build or install Swift when invoked. Use it as
 `sudo linux-create/vphone-cli ...` for the steps that need root.
 
 **vphone-cli's release files.** Download
@@ -232,6 +239,18 @@ Follow [CREATE-ON-LINUX.md](CREATE-ON-LINUX.md). In short, it:
 
 It takes about an hour plus the downloads, and asks for sudo a few times. You end up with
 `vms/myphone`, already at the lock screen; continue with step 5.
+
+The firmware cache defaults to `~/.cache/vphone`. To keep the large restore images
+on another filesystem, set `VSETUP_CACHE` to that directory before running
+`setup/create-vm.sh`. The creation preflight checks free space on both `VSETUP_CACHE` and
+`VSETUP_DEVICES`, so each can live on a different filesystem. For example:
+
+```sh
+VSETUP_CACHE=/mnt/large-disk/vphone-cache ./setup/create-vm.sh
+```
+
+Paths with spaces are supported. GPU-driver lookup also searches this cache;
+automatic extraction continues to write the driver under `VSETUP_RELEASE`.
 
 ## 5. Start it
 

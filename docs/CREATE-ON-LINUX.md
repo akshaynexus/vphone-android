@@ -34,7 +34,7 @@ The steps:
 Everything below uses `vms/` as the library and `myphone` as the VM. `VC` is the Linux vphone-cli:
 
 ```sh
-VC=$PWD/linux-create/.build/out/out/Products/Debug-linux-x86_64/vphone-cli
+VC=$PWD/linux-create/vphone-cli
 ```
 
 ## 1. Make an empty VM bundle
@@ -205,10 +205,43 @@ tools/ssh-ramdisk-stage.sh                              # -> runs/sshramdisk/ssh
 bash tools/ssh-ramdisk-rebuild-signed.sh vms myphone    # -> runs/sshramdisk/out/094-39914-031.dmg (asks for sudo once)
 ```
 
+The default keeps SSHRD's stock bootstrap and does not require an Apple SDK or signer.
+For ECID-bound SSH, explicitly choose a trusted prebuilt artifact:
+
+```sh
+export VPHONE_SSHRD_BOOTSTRAP=/path/to/bootstrap
+```
+
+Alternatively, opt into a source build before automated creation or manual staging:
+
+```sh
+export VPHONE_SSHRD_BOOTSTRAP_BUILD=1
+export DARWIN_SDK_BUNDLE="$HOME/.swiftpm/swift-sdks/darwin.artifactbundle"
+```
+
+Source builds require clang, ld64.lld, rcodesign, and xtool's Darwin SDK extracted
+from Xcode. `setup.sh` does not install that SDK. Set `SDKROOT`, `LD64_LLD`, or
+`RCODESIGN` when those tools live elsewhere. Do not select both modes.
+Staging checks its arm64 iOS architecture, ad-hoc signing identifier, executable page
+hashes, and signed USB/watchdog/platform/network entitlements before copying it.
+Only use a bootstrap built from source you trust; ad-hoc signing does not identify its publisher.
+Build one explicitly with `tools/sshramdisk-bootstrap/build.sh /path/to/bootstrap`.
+No Apple SDK or signer is needed when staging a valid prebuilt bootstrap. Explicit
+requests fail if validation or building fails. They never fall back to the stock bootstrap.
+
 - `ssh-ramdisk-stage.sh` downloads the SSH tools (dropbear, bash, coreutils, sftp-server for iOS)
   from SSHRD_Script's [sshtars](https://github.com/verygenericname/sshtars) at a pinned commit,
-  checks their SHA-256, and unpacks them. This repository doesn't redistribute them. They are not
-  re-signed: the trust cache built in the next step admits them as they ship.
+  checks their SHA-256, and unpacks them. This repository doesn't redistribute them. Downloaded
+  tools retain their signatures. When requested, `restored_external` is replaced by the signed
+  ECID-aware bootstrap. It reads the guest's exact nonzero eight-byte `/chosen/unique-chip-id`
+  and advertises its canonical ECID instead of SSHRD's shared build-date serial. Missing or
+  malformed identity stops initialization. Automated creation then binds `VPHONE_ECID` to the
+  selected VM. An explicit `VPHONE_ECID` during creation requires an ECID-aware bootstrap and
+  must match the VM. Direct connector requests remain strict, including when no device matches.
+  The trust cache built in the next step admits the exact staged code hashes.
+- For an existing staging tree, run `tools/ssh-ramdisk-stage.sh --bootstrap-only` before rebuilding
+  the image and trust cache. Automated creation performs this upgrade on every CFW attempt
+  when an ECID-aware bootstrap is requested. Without an opt-in, an existing staging tree is kept.
 - `ssh-ramdisk-rebuild-signed.sh` saves the tree's stock restore ramdisk to `runs/sshramdisk/` the
   first time, mounts a copy of its APFS volume (root, linux-apfs-rw), adds the tools, and repacks it.
 - The tested ramdisk also carried a PRNG seeder (`prng_seedctl`), which exited without effect; the
@@ -260,7 +293,7 @@ Preboot `disk1s5` at `/mnt6`, and xART `disk1s3` at `/mnt7` (it holds the gigalo
 With the ramdisk up and its volumes mounted:
 
 ```sh
-sudo $VC cfw install -l vms myphone --work-parent /var/tmp --keep-artifacts
+sudo $VC cfw install -l vms myphone --work-parent "${VPHONE_CFW_WORK_PARENT:-/var/tmp}" --keep-artifacts
 ```
 
 - The installer mounts the guest's System, xART and Preboot on the host with sshfs, through
@@ -273,7 +306,10 @@ sudo $VC cfw install -l vms myphone --work-parent /var/tmp --keep-artifacts
   small files, and the host disk barely grows for minutes at a time while it copies; it is not stuck.
 - It needs rcodesign (found on `PATH`, in `~/.cargo/bin` of the user who ran sudo, or at
   `$VPHONE_RCODESIGN`) and the APFS driver from SETUP step 3 (`modprobe apfs`, else
-  `$VPHONE_APFS_KO`, else `.build/linux-apfs-rw/apfs.ko`), and about 8 GB free in `/var/tmp`.
+  `$VPHONE_APFS_KO`, else `.build/linux-apfs-rw/apfs.ko`). It also needs about 8 GB of working space
+  on the filesystem selected for `--work-parent`. Set `VPHONE_CFW_WORK_PARENT` to select a
+  different path; it defaults to `/var/tmp`. The `cfw` command retains ownership and permission
+  checks on the selected directory.
 - It renames the xART gigalocker to `AA.gl`, installs vphoned and the launchd hook, and ends with
   `[+] Linux guest install complete` and a new `PatchReceipt.plist`.
 - Without `--keep-artifacts` the restore tree is deleted at the end (12 GB back; a new restore then

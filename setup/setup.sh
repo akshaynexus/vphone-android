@@ -138,6 +138,11 @@ do_phase deps && {
     # shellcheck disable=SC1091  # rustup's env file, outside this checkout
     . "$HOME/.cargo/env"
   fi
+  # Arch's rustup package puts cargo in /usr/bin and writes no ~/.cargo/env, so
+  # `cargo install` binaries (rcodesign) are found only with ~/.cargo/bin on PATH.
+  if [ -d "$HOME/.cargo/bin" ] && [[ ":$PATH:" != *":$HOME/.cargo/bin:"* ]]; then
+    PATH=$HOME/.cargo/bin:$PATH
+  fi
   if ! have rcodesign; then
     log " Installing rcodesign (apple-codesign)"
     cargo install apple-codesign --locked
@@ -179,7 +184,7 @@ do_phase deps && {
 # The setup lives IN the checkout it builds (VSETUP_SRC defaults to it); a
 # --src DIR still points the build at a second checkout.
 do_phase sources && {
-  if [ ! -d "$VSETUP_SRC/.git" ]; then
+  if [ ! -e "$VSETUP_SRC/.git" ]; then
     log " Cloning vphone-linux ($VPHONE_LINUX_BRANCH) into $VSETUP_SRC"
     mkdir -p "$(dirname "$VSETUP_SRC")"
     git clone --branch "$VPHONE_LINUX_BRANCH" \
@@ -211,12 +216,9 @@ build_qemu() {
     ninja qemu-system-aarch64 )
 }
 build_creator() {
-  log " Building vphone-cli's firmware tooling for Linux (vphone-cli $VPHONE_CLI_PUBLIC)"
-  local src="$VSETUP_SRC/cpu-tree/vphone-cli-$VPHONE_CLI_PUBLIC"
-  mkdir -p "$(dirname "$src")"
-  if [ ! -d "$src/.git" ]; then
-    git clone --depth 1 --branch "$VPHONE_CLI_PUBLIC" "$VPHONE_CLI_REPO" "$src"
-  fi
+  local src=${VPHONE_CLI:-$VSETUP_SRC/cpu-tree/vphone-cli-$VPHONE_CLI_VERSION}
+  log " Building vphone-cli's firmware tooling for Linux from $src"
+  ensure_vphone_cli_source "$src"
   VPHONE_CLI="$src" "$VSETUP_SRC/linux-create/build.sh"
 }
 build_usbmuxd() { "$VSETUP_SRC/tools/build-usbmuxd-32k.sh"; }
@@ -226,7 +228,7 @@ build_usbmuxd() { "$VSETUP_SRC/tools/build-usbmuxd-32k.sh"; }
 APFS_RW_COMMIT=03187127cd2e62cf78321cdb942eb3a7b17981f9
 build_apfs() {
   local dir="$VSETUP_SRC/.build/linux-apfs-rw"
-  if [ ! -d "$dir/.git" ]; then
+  if [ ! -e "$dir/.git" ]; then
     log " Fetching linux-apfs-rw"
     git clone https://github.com/linux-apfs/linux-apfs-rw.git "$dir"
   fi
@@ -257,28 +259,77 @@ do_phase build && for step in reims qemu creator usbmuxd apfs; do
 done
 
 # ------------------------------------------------------------- 4. release ---
+release_file_present() { [ -f "$1" ] && [ -s "$1" ]; }
+
+release_bundle_check() {
+  local resources="$1/Contents/Resources"
+  if ! release_file_present "$resources/OpenAVB/OpenAVB.bin" &&
+     ! release_file_present "$resources/OpenAVB.bin"; then
+    echo "incomplete VPhone.bundle: missing OpenAVB ROM under $resources" >&2
+    return 1
+  fi
+  if ! release_file_present "$resources/OpenSEP/OpenSEP.bin" &&
+     ! release_file_present "$resources/OpenSEP.bin"; then
+    echo "incomplete VPhone.bundle: missing OpenSEP ROM under $resources" >&2
+    return 1
+  fi
+  if ! release_file_present "$resources/guest-resources/vphoned"; then
+    echo "incomplete VPhone.bundle: missing guest-resources/vphoned under $resources" >&2
+    return 1
+  fi
+  if ! release_file_present "$resources/guest-resources/vphoned.plist"; then
+    echo "incomplete VPhone.bundle: missing guest-resources/vphoned.plist under $resources" >&2
+    return 1
+  fi
+}
+
 do_phase release && {
   rel="$VSETUP_RELEASE/app"
   mkdir -p "$rel"
   log " Setting up the vphone-cli $VPHONE_CLI_PUBLIC release bundle (ROMs + guest resources)"
   zip="$VSETUP_RELEASE/VPhone-$VPHONE_CLI_PUBLIC.zip"
-  if [ ! -d "$rel/VPhone.bundle/Contents/Resources/OpenAVB" ]; then
+  target="$rel/VPhone.bundle"
+  if ! release_bundle_check "$target" >/dev/null 2>&1; then
     [ -f "$zip" ] || curl -L --retry 3 -o "$zip" \
       "https://github.com/Lakr233/vphone-cli/releases/download/$VPHONE_CLI_PUBLIC/VPhone-$VPHONE_CLI_PUBLIC.zip"
-    [ -d "$rel/VPhone.bundle" ] || unzip -q -n "$zip" -d "$rel"
-    # The bundle can land at any nesting depth (2.12: app/VPhone.bundle;
-    # 2.13's zip itself starts with an app/ folder: app/app/VPhone.bundle).
-    # Find it wherever it is and normalize to $rel/VPhone.bundle.
-    bundle=$(find "$rel" -type d -name VPhone.bundle -print -quit)
-    if [ -n "$bundle" ] && [ "$bundle" != "$rel/VPhone.bundle" ]; then
-      log " Normalizing bundle path: $bundle -> $rel/VPhone.bundle"
-      rm -rf "$rel/VPhone.bundle" 2>/dev/null
-      mv "$bundle" "$rel/VPhone.bundle"
+    stage=$(mktemp -d "$rel/.VPhone.bundle.stage.XXXXXXXX")
+    unzip -q -n "$zip" -d "$stage" || die "could not extract $zip to $stage"
+
+    # Release zips have used more than one nesting depth (for example,
+    # app/VPhone.bundle and app/app/VPhone.bundle). Extract to a fresh
+    # directory, then normalize and validate before touching the current bundle.
+    bundle=$(find "$stage" -type d -name VPhone.bundle -print -quit)
+    [ -n "$bundle" ] || die "VPhone.bundle not found in $zip; extracted files are preserved at $stage"
+    if [ "$bundle" != "$stage/VPhone.bundle" ]; then
+      mv "$bundle" "$stage/VPhone.bundle" || die "could not normalize VPhone.bundle in $stage"
+      bundle="$stage/VPhone.bundle"
     fi
+
+    release_bundle_check "$bundle" ||
+      die "release bundle is incomplete; extracted files are preserved at $stage"
+
+    backup=
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      stamp=$(date +%Y%m%d%H%M%S)
+      backup="$rel/VPhone.bundle.incomplete.$stamp.$$"
+      suffix=0
+      while [ -e "$backup" ] || [ -L "$backup" ]; do
+        suffix=$((suffix + 1))
+        backup="$rel/VPhone.bundle.incomplete.$stamp.$$.$suffix"
+      done
+      mv "$target" "$backup" || die "could not preserve the incomplete bundle at $backup"
+      log " Preserved incomplete bundle for inspection: $backup"
+    fi
+    if ! mv "$bundle" "$target"; then
+      if [ -n "$backup" ] && [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        mv "$backup" "$target" || warn "the previous bundle remains at $backup"
+      fi
+      die "could not promote the validated bundle from $stage"
+    fi
+    rm -rf "$stage"
   fi
-  [ -d "$rel/VPhone.bundle/Contents/Resources/OpenAVB" ] ||
-    die "VPhone.bundle not found, or missing ROMs in $rel — check the download and re-run './setup.sh release'"
-  r="$rel/VPhone.bundle/Contents/Resources"
+  release_bundle_check "$target" || die "VPhone release bundle is incomplete at $target"
+  r="$target/Contents/Resources"
   ( cd "$VSETUP_SRC"
     ln -sfn "$r/guest-resources" guest-resources
     mkdir -p OpenAVB OpenSEP

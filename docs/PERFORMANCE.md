@@ -51,6 +51,11 @@ Most changes have a switch, so each can be turned off for an A/B comparison.
 | `apple-gxf` no longer advertises BTI (no Apple core has it) | | Guarded-page checks (about 1.3%) gone |
 | **Jump cache lookup at `BR`/`BLR`/`RET`** without the generic lookup helper: `1` inline in the generated code, `2` the same check in `helper_vphone_lookup_fast` with the TB's flags as constants (smaller code: 322 instead of 346 host bytes per TB) | `VPHONE_INLINE_LOOKUP` (default 2) | Guest code 42% → 50% of vCPU time; `tb_lookup_ptr` 10.2% → 3.4%; `helper_lookup_tb_ptr` 4.3% → 1.0% |
 | **Return-address prefetch**: at each call, the generated code loads the return address's jump cache entry, so the return's lookup does not stall on a cache miss (38% of that lookup's time had been this miss). `2` inline, `1` through a helper, `0` off | `VPHONE_RET_PREFETCH` (launcher default 2) | QEMU's share of vCPU time while paging the home screen 47.8% → 44.6% |
+| **Return-address stack**: each call pushes its return address and the block that call site last returned to on a 32-entry ring per vCPU; a `RET`/`RETAA`/`RETAB` whose target is the top entry jumps straight to that block, without the jump cache lookup, when the block is still valid (a per-vCPU stamp that every jump-cache generation, epoch, ASID switch and flush changes; not invalidated; same flags). Any other return takes the lookup. Checked by `tests/tcg/vphone-ras/` in the QEMU fork | `VPHONE_RAS` (default on, `0` off; `VPHONE_RAS_STATS=1` logs hit rates) | iOS 27 Duo, boot to unlock: 98.6% of returns hit. Under guestbench, QEMU's share of vCPU time 44.4% → 35.0% (`helper_vphone_lookup_fast` 9.6% → 5.4%, qht 2.5% → 0.5%); guestbench 4-9% faster at equal guest load; app switches and unlock (155-160 vs 159-166 s) no slower |
+| **Cross-page link refill**: when a checked cross-page link misses because an address-space switch emptied the destination's code TLB entry, the slow way refills that entry from the jump cache, so the link hits again next time | `VPHONE_XPAGE_REFILL` (default on) | Cross-page slow ways 6.5% → 1.3% of lookups (guestbench), 10.3% → 2.3% (app switching) |
+| **Indirect-branch cache**: each `BR`/`BLR`/`BRAA`/`BLRAA` (and zero-modifier forms) site keeps the block it last went to and jumps there when the target's code TLB entry still maps to that block's host address, the block is valid and its keys match; a valid slot is replaced only on every 8th miss to another target. Not used on cores with BTI. Checked by `tests/tcg/vphone-ibc/` | `VPHONE_IBC` (default on), `VPHONE_IBC_REPLACE` | 83-88% hit rate. With the refill: host cycles −2.7% ±1.2 at equal guest load (branchy phase −13%), lookup functions 11.3% → 6.1% of vCPU time |
+| **DC ZVA in generated code**: the iOS kernel zero-fills every new page with `DC ZVA` (about 4.4M/s); it now writes the zeros through the normal store fast path instead of two C helpers, with the same fault address. Checked by `tests/tcg/vphone-zva/` | `VPHONE_INLINE_ZVA` (default on) | Host cycles −3.7% ±0.8, mmap phase −14% |
+| **Acquire/release fences on x86 hosts**: upstream puts a fence before every release store and after every acquire load, which still lets `STLR;LDAR` reorder (a 2-vCPU litmus test saw forbidden outcomes in 1-6% of runs). Now one fence after each release store: about 20× fewer fences and no forbidden outcome. Checked by `tests/tcg/vphone-fence/` | `VPHONE_FENCE` (default 1, `0` upstream) | Correctness fix; speed within noise (−0.9% ±1.1) |
 | **Larger minimum TLB size**: `CPU_TLB_DYN_MIN_BITS` raised from 6 to 10 (compile time). The softmmu TLBs no longer shrink to 64 entries under iOS's constant flushes. 12 made boot 13% slower | | QEMU's share of vCPU time 44.6% → 43.0% |
 | **2 GiB code cache** (x86-64's maximum). iOS's boot alone generates about 5 GB of translated code. With 1 GiB the cache filled every ~3.5 minutes of use (14 full flushes in 49 minutes), and each flush retranslates everything the guest runs next | `TB_SIZE` (launcher, MiB, default 2048) | |
 | **Neon float32 on the host's SIMD**: `FADD`/`FSUB`/`FMUL`/`FMLA`/`FMLS` (vector and by element) compute all lanes with SSE/FMA when the result is exactly softfloat's (inexact already raised, round to nearest, inputs zero or normal, results finite and not tiny); any other vector takes the per-lane path. Checked against softfloat by `tests/fp/vphone-f32-fast.c` in the QEMU fork | `VPHONE_FAST_F32` (default on, `0` off) | iOS 27 (iPhone Duo), app switching: floating point 11.1% → 5.7% of QEMU's time |
@@ -59,6 +64,8 @@ Most changes have a switch, so each can be turned off for an A/B comparison.
 | **Tile functions over extended-range attachments** (metal2vulkan): a tile function may now read and write a `BGR10_XR`, `BGRA10_XR` or `RGB10A8_2P_XR10` attachment, which its staging decodes to the `half` values Metal's tile memory holds and encodes back. iOS 27's lock-screen poster renderer (`MercuryPosterExt`) downsamples its wallpaper this way; its refused pipeline made it retry about 20 times a second | | `MercuryPosterExt` from about 92% of a guest CPU to none; an idle iPhone Duo guest from about 3 busy CPUs to about 1.1 |
 | **Jump cache generations per address space and per bucket**: every TLB flush used to mark the whole jump cache stale, so each entry had to be checked against the TLB again, and an ASID switch (about 550 a second per vCPU) is such a flush. Now an ASID switch only changes the address space: entries filled under an ASID are current again when it returns, unless a TLB invalidation came in between. A page flush starts a new generation of the page's bucket (one store) instead of marking its entries, so range flushes up to 512 pages no longer reset the cache | `VPHONE_JC_RANGE_PAGES` (default now 512) | Stale rechecks 52% → 37% of slow lookups. iPhone Duo guest benchmark: 5.87 s → 4.76 s (−19%); boot to unlock about 205 s → 182 s |
 | **Broadcast TLB flushes as a barrier**: XNU broadcasts TLB invalidations (`TLBI ...IS`) thousands of times a second, and QEMU synchronized each one with an exclusive section, which stops every vCPU (43-74 ms of every second under load, invisible to CPU profiles). Now each vCPU flushes its own TLB from its work queue and the source waits for them; only when one is late (1 ms) or another exclusive section is pending does it fall back on the exclusive section. The old barrier mode gave up instead of falling back, and on iOS 27 that let vCPUs run with stale TLB entries (a boot that never drew its UI) | `QEMU_TLB_UNSYNCED` (launcher default 2; 0 = an exclusive section per flush), `VPHONE_TLB_BARRIER_US` | iPhone Duo guest benchmark: 5.38 s → 4.81 s; boot to unlock 189-197 s → 171-187 s |
+| The barrier waits only for vCPUs that are running guest code: a halted or stopped vCPU runs its queued flush before it runs guest code again, so waking it and waiting for it only cost time (at rest, 7% of backboardd's time was this wait) | | Barrier wait at rest 3.6% → 0.95% of QEMU's time; guest benchmark unchanged at low load, up to 15% faster with a busy guest |
+| **Invalidating code no longer empties every jump cache**: ARM64 translations are position-independent, so when the guest reused memory that held code, QEMU emptied every vCPU's whole jump cache (131,072 entries each) to drop the stale translation: 8.3% of QEMU's time while switching apps. Now each vCPU starts a new jump cache epoch at its next lookup, and an older entry is used again only after its translation has been checked to be still valid | `VPHONE_JC_LAZY_INVAL` (default on; 0 = empty the caches) | iPhone Duo app switching, 3 fresh boots each: first Calendar launch 22.6 / 42.9 / timed out s → 12.7 / 19.6 / 17.4 s; time over the switches 258-374 s → 238 s |
 
 Tried, and left off by default:
 
@@ -80,8 +87,14 @@ Tried, and left off by default:
 - **Pinning each thread** (`tools/pin-threads.sh`: one vCPU per physical P-core, GPU threads on the
   siblings, the rest on E-cores): no difference on the Settings scroll. It is kept for experiments.
 
-Next candidates, from the profiles: a per-vCPU return-address stack checked at `RET`; indirect `BRAA`/`BR`
-jumps; an ASID-tagged softmmu TLB, so a context switch costs no full flush.
+All four rows above together: host cycles −6.8% ±0.8 and host instructions −11.0% ±0.7 for the
+same guestbench work (`VPHONE_MARK` metric, vCPU threads pinned, 27 runs per arm, equal guest load);
+guestbench 3.73 s vs 4.00 s. Boot to unlock unchanged (151-158 s); app switching not yet remeasured.
+Pinning the vCPU threads (`tools/pin-threads.sh`) alone brought guestbench from 4.4-4.9 s to 4.0-4.2 s;
+the launcher does not pin yet.
+
+Next candidates, from the profiles: CAS and LSE atomics inline (now C helpers, about 2.5% of vCPU
+time); an ASID-tagged softmmu TLB, so a context switch costs no full flush.
 
 ### Guest settings
 
@@ -127,6 +140,29 @@ Where vCPU time goes while scrolling Settings (per guest process, from the recip
 SpringBoard about 6%, MTLCompilerService about 4%. In every process roughly half of the time is QEMU
 overhead (lookups, TLB refills, helpers) rather than translated guest code.
 
+### GPU stack vphone-next4 (release check, 2026-11-09)
+
+The release's GPU stack (reims-vgpu `310da07`, metal2vulkan `8279756`) against v0.4's (reims-vgpu
+`960bf4b`, metal2vulkan `f359ce2`), both linked into the same QEMU (`108e142`). Guest: iPhone 16
+(iPhone17,3), iOS 26.6.2, as `create-vm.sh` makes it (1x, 430x932), 8 vCPUs, RTX 4080 SUPER, the
+disk image on a USB SSD. Each boot measured boot to unlock, then home-screen paging (12 swipes) and a
+Settings scroll (12 swipes), with reims-vgpu's frame statistics (`REIMS_VGPU_STATS=1`). Warm runs
+reuse the first boot's shader and pipeline caches.
+
+| | New stack | v0.4 stack |
+|---|---|---|
+| Boot to unlock, cold caches | 65 s | 63 s |
+| Boot to unlock, warm (3 boots) | 62, 62, 86 s | 155, 121, 72 s |
+| Settings scroll, warm (frames/s, average) | 51, 71, 58 | 13, 35, 60 |
+| Home-screen paging, warm (frames/s, average) | 30, 24, 38 | 8 (then a 24 s stall), no frames, 26 |
+| Either, cold caches (frames/s) | about 20 | about 20 |
+
+On its good boot the v0.4 stack scrolls and pages as fast as the new one. The new stack's gain here
+is consistency: every boot unlocked in about a minute and drew every swipe, where two of three v0.4
+boots unlocked late and stalled on the home screen. With cold caches both are held to about
+20 frames/s by first-use shader compiles. Single boots vary a lot (other work on the host, iOS's
+background activity), so treat these as indications.
+
 ### Earlier end-to-end measurements
 
 Taken before the latest TCG changes:
@@ -153,6 +189,7 @@ Environment variables read by `run-vphone.sh`:
 | `WINDOW` | `0` | `1` opens reims-vgpu's window (sets `REIMS_VGPU_WINDOW`) |
 | `GFX_RES` | the VM's `gfx-res` file, else `1290x2796` | Framebuffer size (`apple-gfx-mmio.resolution`). At 1x `430x932` (`448x932` with the width a multiple of 32: fewer GPU copies, generic layout) |
 | `GFX_MODES` | `$GFX_RES@60` | Display modes offered to the guest (machine `gfx-modes`, `/`-separated) |
+| `GFX_PPI` | unset | Optional explicit physical display density (`apple-gfx-mmio.pixels-per-inch`), an integer from 1 to 65535. The launcher does not read this value from `config.plist`. Set it only when QEMU supports the property, which [qemu-vphone#3](https://github.com/YahiaAngelo/qemu-vphone/pull/3) adds. The QEMU version pinned on `development` does not have it, and QEMU refuses to start when it is set. When unset or empty, QEMU keeps its default physical size. When set, the first `GFX_MODES` mode must describe the native physical panel |
 | `GFX_ISOLATION` | `on` | `apple-gfx-mmio.process-isolation`: per-task GPU processes. Keep it on |
 | `REIMS_VGPU_WINDOW_TITLE` | `vphone-linux` | Title of reims-vgpu's window |
 | `VK_DRIVER_FILES` | NVIDIA's ICD if present | Vulkan ICD for QEMU and every GPU task process |
@@ -181,10 +218,18 @@ the launcher overrides some of them (above).
 | `VPHONE_TARGET_PAGE_BITS` | 12 | Target page size of `vresearch101` (12..16). Fixed before machine options are parsed, hence an env var | `hw/vmapple/vresearch101.c` |
 | `VPHONE_TLB_RANGE_PAGES` | off | Page-count range-flush check | `accel/tcg/cputlb.c` |
 | `VPHONE_JC_RANGE_PAGES` | 512 | Range flushes of this many pages or more start a new jump cache epoch instead of a new generation per page bucket | `accel/tcg/cputlb.c` |
+| `VPHONE_JC_LAZY_INVAL` | on | Invalidating a position-independent translation makes each vCPU start a new jump cache epoch at its next lookup; `0` empties every vCPU's jump cache instead (QEMU's) | `accel/tcg/tb-maint.c`, `tb-jmp-cache.h` |
 | `QEMU_TLB_UNSYNCED` | 2 (launcher) | How a broadcast TLB flush synchronizes: 0 an exclusive section per flush (QEMU's), 2 a barrier that falls back on one when a vCPU is late, 1 unsynchronized (not safe) |
 | `QEMU_TLB_UNSYNCED` | 0 | Broadcast TLB flush mode: 0 synced (upstream), 1 fully async, 2 barrier (flush, then wait up to 1 ms for the others). Relaxed modes are experimental | `accel/tcg/cputlb.c` |
 | `VPHONE_XPAGE_LINKS` | off | Checked cross-page links | `target/arm/tcg/translate-a64.c` |
 | `VPHONE_RET_PREFETCH` | off | Return-address prefetch at calls: `2` inline, `1` through a helper, `0` off (the launcher sets 2) | `target/arm/tcg/translate-a64.c` |
+| `VPHONE_RAS` | on | Return-address stack checked at `RET`/`RETAA`/`RETAB`; `0` = the jump cache lookup for every return. `VPHONE_RAS_STATS=1` (with `-d guest_errors`) logs hits and miss causes | `target/arm/tcg/translate-a64.c`, `accel/tcg/tb-jmp-cache.h` |
+| `VPHONE_XPAGE_REFILL` | on | Cross-page link slow way refills the code TLB entry; `0` = old slow way | `accel/tcg/cpu-exec.c`, `accel/tcg/cputlb.c`, `target/arm/tcg/translate-a64.c` |
+| `VPHONE_IBC` | on | Per-site indirect-branch cache; `0` = jump cache lookup. `VPHONE_IBC_REPLACE` sets how many other-target misses replace a valid slot (default 8) | `target/arm/tcg/translate-a64.c`, `accel/tcg/cpu-exec.c` |
+| `VPHONE_INLINE_ZVA` | on | `DC ZVA` in generated code; `0` = helpers | `target/arm/tcg/translate-a64.c` |
+| `VPHONE_FENCE` | 1 | Acquire/release on a TSO host: one fence per release store; `0` = upstream mapping | `target/arm/tcg/translate-a64.c` |
+| `VPHONE_FAST_CNT` | off | Counter reads without the BQL or a TB exit (no measured effect on iOS) | `target/arm/helper.c`, `target/arm/tcg/translate-a64.c` |
+| `VPHONE_MARK` | off | Diagnostic: `hint #0x7e` phase markers log host instructions/cycles/CPU time per guest phase; `VPHONE_INSN_STATS`, `VPHONE_SYSREG_STATS` count instruction classes and system registers | `target/arm/tcg/translate-a64.c` |
 | `VPHONE_NATIVE_FP` | on | A64 FP/Neon as host SSE/AVX instructions; `0` = helpers (and softfloat's hardfloat) as before | `target/arm/tcg/host-fpcr.h`, `translate-a64.c` |
 | `VPHONE_FAST_F32` | on | Neon float32 add/sub/mul/fused multiply-add on the host's SIMD; `0` = softfloat lane by lane | `target/arm/tcg/vec-f32-fast.h` |
 | `VPHONE_INLINE_LOOKUP` | **2** | Jump cache lookup at `BR`/`BLR`/`RET`: `0` off (generic lookup), `1` inline check in generated code, `2` the same check in `helper_vphone_lookup_fast` with the TB's flags as constants (smaller code) | `target/arm/tcg/translate-a64.c` |

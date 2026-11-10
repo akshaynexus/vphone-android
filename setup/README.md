@@ -2,7 +2,8 @@
 
 The two-step Linux setup, part of this checkout: **build everything, then pick a device and an iOS
 version and create the VM.** The scripts build THIS checkout (VSETUP_SRC defaults to the repo root)
-and keep all state in `~/vphone-setup-work/` plus one directory per VM.
+and keep build/release state in `~/vphone-setup-work/`, firmware in `~/.cache/vphone`, and each VM
+in its own directory.
 
 ```sh
 # from the repo root:
@@ -31,8 +32,8 @@ Non-interactive:
 
 | Device | iOS | cloudOS | Preset | State |
 |---|---|---|---|---|
-| `iPhone17,3` (iPhone 16 Pro) | **26.6.2** (23G90) | `26.4-23E5207q` | standard | end-to-end: home screen |
-| `iPhone17,3` (iPhone 16 Pro) | **27.0.1** (24A446) | `26.4-23E5207q` | standard | end-to-end with create-vm.sh: home screen at 2x |
+| `iPhone17,3` (iPhone 16) | **26.6.2** (23G90) | `26.4-23E5207q` | standard | end-to-end: home screen |
+| `iPhone17,3` (iPhone 16) | **27.0.1** (24A446) | `26.4-23E5207q` | standard | end-to-end with create-vm.sh: home screen at 2x |
 | `iPhone19,4` (iPhone Duo) | **27.1** (24A94425) | `26.4-23E5207q` | standard | home screen (keep at 3x) |
 
 iOS 27 pairings need this repo's QEMU (it implements FEAT_CSSC — without it the
@@ -65,7 +66,7 @@ macOS kmutil (refused here).
 and menus down to one of the tested pairings — e.g.
 
 ```text
-iPhone17,3 (iPhone 16 Pro)
+iPhone17,3 (iPhone 16)
   iOS 26.6.2 | build 23G90 | cloudOS 26.4-23E5207q | standard | linux-tested recommended
   iOS 27.0.1 | build 24A446 | cloudOS 26.4-23E5207q | standard | linux-tested mac-tested
 iPhone18,2 (iPhone 17 Pro Max)
@@ -99,6 +100,7 @@ macOS instructions instead of pretending they work on Linux alone.
 | `--cid N` | the VM's vsock CID (default 3; pick another next to a running VM) |
 | `GPU_DRIVER_BUNDLE=` | path to `AppleParavirtGPUMetalIOGPUFamily.bundle` |
 | `IPSW_URL=`, `CLOUDOS_IPSW_URL=` | restore-image URLs instead of local files |
+| `VSETUP_CACHE=` | firmware cache and GPU-driver lookup directory (default `~/.cache/vphone`); set it to use a filesystem with more space |
 
 Pairings labeled **TESTED-ON-LINUX** in `--list` are fully supported here
 (today: iPhone17,3 + iOS 26.6.2 and 27.0.1, iPhone19,4 + iOS 27.1); everything else is

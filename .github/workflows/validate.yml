@@ -2,7 +2,7 @@ name: validate
 
 on:
   push:
-    paths: ['**.sh', 'setup/**', '.github/workflows/validate.yml']
+    paths: ['**.sh', 'setup/**', 'tools/**', 'linux-create/**', 'run-vphone.sh', '**.py', 'tools/window/**', 'tests/sshramdisk-bootstrap/**', '.github/workflows/validate.yml']
   pull_request:
   schedule:
     - cron: '0 3 * * 1'   # weekly: catch pairing/validation drift early
@@ -13,13 +13,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  swiftly-private-prefix:
+    name: private Swiftly installation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned, signed Swiftly binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          task_root="$RUNNER_TEMP/swiftly-1.2.0"
+          gpg_home="$RUNNER_TEMP/swiftly-gnupg"
+          mkdir -p "$task_root" "$gpg_home"
+          chmod 700 "$gpg_home"
+          archive="$task_root/swiftly-1.2.0-x86_64.tar.gz"
+          signature="$archive.sig"
+          curl -fsSL --retry 3 -o "$archive" \
+            https://download.swift.org/swiftly/linux/swiftly-1.2.0-x86_64.tar.gz
+          curl -fsSL --retry 3 -o "$signature" \
+            https://download.swift.org/swiftly/linux/swiftly-1.2.0-x86_64.tar.gz.sig
+          curl --compressed -fsSL --retry 3 -o "$task_root/swift.org-keys.asc" \
+            https://www.swift.org/keys/all-keys.asc
+          printf '%s  %s\n' \
+            0b26b568811404374c7d7f07276b6aad4145db5d1893a45f307de6a94ca8d9c3 "$archive" \
+            | sha256sum --check --status
+          GNUPGHOME="$gpg_home" gpg --batch --import "$task_root/swift.org-keys.asc"
+          verification=$(GNUPGHOME="$gpg_home" gpg --batch --status-fd 1 \
+            --verify "$signature" "$archive" 2>&1)
+          grep -Fq '[GNUPG:] VALIDSIG E813C892820A6FA13755B268F167DF1ACF9CE069' \
+            <<<"$verification"
+          tar -xzf "$archive" -C "$task_root" swiftly
+          bash setup/test/swiftly-private-prefix.sh "$task_root/swiftly"
+
+  cfw-connection:
+    name: CFW connection construction
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install local transport test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev openssh-client
+      - name: Compile and check literal connection arguments
+        run: |
+          swiftc --version
+          uv run --python 3.12 linux-create/tests/test_guest_connection.py
+          uv run --python 3.12 linux-create/tests/test_ssh_wrappers.py
+
   lint:
     name: shellcheck + syntax
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: SSH ramdisk ECID and signed-artifact regressions
+        run: |
+          bash tests/test-sshramdisk-bootstrap.sh
+          python3 -m unittest discover -s tests -p 'test_sshramdisk_bootstrap.py' -v
+      - name: CLI source ref selection and checkout preservation
+        run: bash setup/test/cli-source-ref.sh
+      - name: Explicit ECID selection regressions
+        run: python3 -m unittest discover -s tests -p 'test_usbmux_connect.py' -v
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: USB/IP framing and timeout regressions
+        run: python3 tools/test_vusb_usbip.py
       - name: bash -n (parse every script)
         run: |
           set -e
@@ -45,6 +101,8 @@ jobs:
             shellcheck -x --severity=warning "$f" || status=1
           done
           exit "$status"
+      - name: Window VSOCK portability tests
+        run: python3 -m unittest discover -s tools/window -p 'test_vsock.py' -v
 
   data:
     name: compatibility data
@@ -55,6 +113,14 @@ jobs:
         run: python3 setup/lib/json_query.py validate
       - name: --list renders
         run: ./setup/create-vm.sh --list
+
+  window-controls:
+    name: window controls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise window controls with mocked RPC
+        run: python3 -m unittest discover -s tools/window -p 'test_*.py' -v
 
   packages:
     name: package names resolve (${{ matrix.image }})
@@ -190,10 +256,12 @@ jobs:
     needs: [lint, data]
     steps:
       - uses: actions/checkout@v4
+      - name: First-boot QMP launcher regression (no VM)
+        run: bash setup/test/first-boot-qmp.sh
       - name: Install the suite's dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck jq git python3-yaml curl unzip
+          sudo apt-get install -y shellcheck jq git python3-yaml curl unzip zip
       - name: Run test/smoke.sh (everything, one shot)
         env:
           # a clean isolated work area; no network needed, nothing boots
@@ -204,7 +272,7 @@ jobs:
           bash setup/test/smoke.sh             # no built tools: the firmware step must degrade cleanly
           # The built-tools path is exercised on dev machines, where linux-create
           # has been built under $VSETUP_SRC — run the suite again against it:
-          if [ -x "$PWD/linux-create/.build/out/out/Products/Debug-linux-x86_64/vphone-cli" ]; then
+          if [ -x "$PWD/linux-create/.build/out/out/Products/Release-linux-$(uname -m)/vphone-cli" ]; then
             VSETUP_SRC=$PWD VSETUP_RELEASE=$PWD VSETUP_DEVICES=/tmp/e2e-devices2 \
               bash setup/test/smoke.sh
           fi
