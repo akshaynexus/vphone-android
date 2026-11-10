@@ -15,6 +15,7 @@ pub mod paths;
 pub mod platform;
 pub mod preflight;
 pub mod qmp;
+pub mod rootboost;
 pub mod runtime;
 pub mod services;
 pub mod share;

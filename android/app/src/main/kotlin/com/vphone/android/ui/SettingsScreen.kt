@@ -72,6 +72,7 @@ data class VmSettings(
     val lighterVisuals: Boolean = true,
     val longerLaunchLimits: Boolean = true,
     val verboseKernelLog: Boolean = false,
+    val rootBoost: Boolean = false,
 )
 
 private typealias RowContent = @Composable (ListItemShapes) -> Unit
@@ -164,6 +165,17 @@ fun SettingsScreen(
                             "Tell Android how busy the emulated CPUs are, through its Performance Hint service.",
                             s.performanceHints,
                         ) { v -> s = s.copy(performanceHints = v) }
+                    },
+                    {
+                        SwitchRow(
+                            it,
+                            "Root boost",
+                            "Needs root: allow vPhone in KernelSU's Superuser list (or Magisk, APatch). While the VM runs, " +
+                                "the CPU, GPU and memory clocks are held at their highest past the vendor's caps, every core " +
+                                "stays awake, and QEMU's threads get the big cores and the highest priorities. The phone gets " +
+                                "warm: the clocks are given back at 44 °C battery, and everything when the VM ends.",
+                            s.rootBoost,
+                        ) { v -> s = s.copy(rootBoost = v) }
                     },
                 )
                 Group(
@@ -400,7 +412,7 @@ private val SettingsSaver = androidx.compose.runtime.saveable.listSaver<VmSettin
         listOf(
             it.version, it.vcpus, it.ramMib, it.tbMib, it.performance, it.refreshHz, it.performanceHints, it.services,
             it.network, it.sound, it.display, it.gpuCompression, it.gpuDiagnostics, it.softwareDisplay, it.swapchainLayout,
-            it.lighterVisuals, it.longerLaunchLimits, it.verboseKernelLog,
+            it.lighterVisuals, it.longerLaunchLimits, it.verboseKernelLog, it.rootBoost,
         )
     },
     restore = {
@@ -408,6 +420,7 @@ private val SettingsSaver = androidx.compose.runtime.saveable.listSaver<VmSettin
             it[0] as Int, it[1] as Int, it[2] as Int, it[3] as Int, it[4] as String, it[5] as Int, it[6] as Boolean,
             it[7] as String, it[8] as Boolean, it[9] as Boolean, it[10] as Boolean, it[11] as Boolean, it[12] as Boolean,
             it[13] as Boolean, it[14] as String, it[15] as Boolean, it[16] as Boolean, it[17] as Boolean,
+            it[18] as Boolean,
         )
     },
 )

@@ -546,6 +546,7 @@ fn start(name: &str) -> Result<(), String> {
         .spawn(move || {
             let code = run_qemu(qemu, args);
             QEMU_DONE.store(true, Ordering::SeqCst);
+            crate::rootboost::stop(&Paths::get().files);
             log_line(&format!("QEMU returned {code}"));
             let message = if code == 0 {
                 String::new()
@@ -573,6 +574,9 @@ fn start(name: &str) -> Result<(), String> {
         .name("vm-status".into())
         .spawn(move || status_lines(vcpus, refresh_hz, &status_dir))
         .map_err(|e| e.to_string())?;
+    if cfg.root_boost {
+        crate::rootboost::start(&Paths::get().files, log_line);
+    }
     if cfg.performance_hints {
         #[cfg(target_os = "android")]
         crate::adpf::start(cfg.vcpus, cfg.performance, || QEMU_DONE.load(Ordering::SeqCst), log_line);

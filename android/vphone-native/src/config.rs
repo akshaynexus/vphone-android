@@ -114,6 +114,11 @@ pub struct VmConfig {
     /// "Verbose kernel log": off, NVRAM's `boot-args` keep IOLog and kprintf off the serial line
     /// (`crate::bootargs`); on, the kernel prints everything iBoot's arguments ask for.
     pub verbose_kernel_log: bool,
+    /// "Root boost" (`crate::rootboost`): on a rooted phone, a root script lifts the clock caps,
+    /// pins the CPU, GPU and memory clocks high, keeps cores awake and gives QEMU's threads the
+    /// big cores and the highest priorities while the VM runs. Off by default: it needs root and
+    /// makes the phone warm.
+    pub root_boost: bool,
 }
 
 impl Default for VmConfig {
@@ -153,6 +158,7 @@ impl VmConfig {
             lighter_visuals: true,
             longer_launch_limits: true,
             verbose_kernel_log: false,
+            root_boost: false,
         }
     }
 
@@ -325,6 +331,15 @@ mod tests {
         assert!(!set.lighter_visuals && !set.longer_launch_limits && set.verbose_kernel_log);
         let json = serde_json::to_string(&set).unwrap();
         assert!(json.contains(r#""lighterVisuals":false"#) && json.contains(r#""longerLaunchLimits":false"#) && json.contains(r#""verboseKernelLog":true"#), "{json}");
+    }
+
+    /// Root boost is off unless a file says otherwise.
+    #[test]
+    fn root_boost_is_asked_for() {
+        assert!(!VmConfig::for_phone(11 * 1024, 8).root_boost);
+        let on: VmConfig = serde_json::from_str(r#"{"rootBoost":true}"#).unwrap();
+        assert!(on.root_boost);
+        assert!(serde_json::to_string(&on).unwrap().contains(r#""rootBoost":true"#));
     }
 
     /// The GPU switches name the driver's flags.

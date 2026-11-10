@@ -50,6 +50,7 @@ class VmSettingsActivity : ComponentActivity() {
             lighterVisuals = config.optBoolean("lighterVisuals", true),
             longerLaunchLimits = config.optBoolean("longerLaunchLimits", true),
             verboseKernelLog = config.optBoolean("verboseKernelLog", false),
+            rootBoost = config.optBoolean("rootBoost", false),
         )
         setContent {
             VphoneTheme {
@@ -93,6 +94,7 @@ class VmSettingsActivity : ComponentActivity() {
             .put("lighterVisuals", s.lighterVisuals)
             .put("longerLaunchLimits", s.longerLaunchLimits)
             .put("verboseKernelLog", s.verboseKernelLog)
+            .put("rootBoost", s.rootBoost)
         val error = Native.saveVmConfig(name, saved.toString())
         if (error.isNotEmpty()) {
             dialogs.show(DialogSpec.error("$name's settings were not saved", error))
