@@ -71,6 +71,11 @@ pub fn cpu_times(reply: &Value) -> Option<CpuTimes> {
 /// of time the guest's processes used between two samples `secs` apart, and who used the most. A
 /// process that started in between counts from zero; one that ended is not seen.
 pub fn top_line(before: &CpuTimes, after: &CpuTimes, secs: f64) -> String {
+    top(before, after, secs).1
+}
+
+/// The number [`top_line`] starts with, and the line: the guest CPUs' worth of time used.
+pub fn top(before: &CpuTimes, after: &CpuTimes, secs: f64) -> (f64, String) {
     let secs = secs.max(0.001);
     let mut rows: Vec<(f64, &str)> = after
         .iter()
@@ -80,12 +85,13 @@ pub fn top_line(before: &CpuTimes, after: &CpuTimes, secs: f64) -> String {
     rows.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)));
     let total = rows.iter().fold(0.0, |sum, r| sum + r.0);
     let top: Vec<String> = rows.iter().take(TOP).map(|(used, name)| format!("{name} {:.2}", used / secs)).collect();
-    format!(
+    let line = format!(
         "{:.2} guest CPUs busy: {}; {} processes",
         total / secs,
         if top.is_empty() { "none used any".to_owned() } else { top.join(", ") },
         after.len()
-    )
+    );
+    (total / secs, line)
 }
 
 /// `setup.status` in a few words.
@@ -247,6 +253,7 @@ mod tests {
             "1.35 guest CPUs busy: installd 1.00, mediaanalysisd 0.20, launchd 0.10, searchd 0.05; 5 processes"
         );
         assert_eq!(top_line(&after, &after, 30.0), "0.00 guest CPUs busy: none used any; 5 processes");
+        assert!((top(&before, &after, 30.0).0 - 1.35).abs() < 1e-9);
         let many = times(&[(1, "a", 6.0), (2, "b", 5.0), (3, "c", 4.0), (4, "d", 3.0), (5, "e", 2.0), (6, "f", 1.0)]);
         let line = top_line(&CpuTimes::new(), &many, 1.0);
         assert!(line.starts_with("21.00 guest CPUs busy: a 6.00, b 5.00, c 4.00, d 3.00, e 2.00; 6"), "{line}");

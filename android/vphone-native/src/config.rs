@@ -103,6 +103,17 @@ pub struct VmConfig {
     /// plugin drive) that plays on this phone through AAudio. Off, the machine has no sound
     /// device, as every VM had before 0.6.5, and iOS has no audio route.
     pub sound: bool,
+    /// "Lighter iOS visuals": no compressed or deep framebuffer for CoreAnimation, Reduce Motion
+    /// and Reduce Transparency (`vphone_create_steps::prefs`, its `Visuals` group), written into
+    /// the guest after the unlock when missing. Off, the keys this app set are removed.
+    pub lighter_visuals: bool,
+    /// "Longer app launch limits": FrontBoard's launch limits times four and backboardd's
+    /// watchdogs off (the same module's `Watchdogs` group), so that a launch that is slow on
+    /// emulated CPUs is not killed and started again.
+    pub longer_launch_limits: bool,
+    /// "Verbose kernel log": off, NVRAM's `boot-args` keep IOLog and kprintf off the serial line
+    /// (`crate::bootargs`); on, the kernel prints everything iBoot's arguments ask for.
+    pub verbose_kernel_log: bool,
 }
 
 impl Default for VmConfig {
@@ -139,6 +150,9 @@ impl VmConfig {
             services: crate::services::Level::Unchanged,
             network: true,
             sound: true,
+            lighter_visuals: true,
+            longer_launch_limits: true,
+            verbose_kernel_log: false,
         }
     }
 
@@ -298,6 +312,19 @@ mod tests {
         let off: VmConfig = serde_json::from_str(r#"{"sound":false}"#).unwrap();
         assert!(!off.sound && off.network);
         assert!(serde_json::to_string(&off).unwrap().contains(r#""sound":false"#));
+    }
+
+    /// Settings saved before 0.6.6 get the lighter preferences and the quiet kernel log.
+    #[test]
+    fn the_guest_tuning_defaults_and_can_be_turned_off() {
+        let fresh = VmConfig::for_phone(11 * 1024, 8);
+        assert!(fresh.lighter_visuals && fresh.longer_launch_limits && !fresh.verbose_kernel_log);
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"version":2,"sound":false}"#).unwrap();
+        assert!(old.lighter_visuals && old.longer_launch_limits && !old.verbose_kernel_log);
+        let set: VmConfig = serde_json::from_str(r#"{"lighterVisuals":false,"longerLaunchLimits":false,"verboseKernelLog":true}"#).unwrap();
+        assert!(!set.lighter_visuals && !set.longer_launch_limits && set.verbose_kernel_log);
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(json.contains(r#""lighterVisuals":false"#) && json.contains(r#""longerLaunchLimits":false"#) && json.contains(r#""verboseKernelLog":true"#), "{json}");
     }
 
     /// The GPU switches name the driver's flags.

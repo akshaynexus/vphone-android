@@ -98,7 +98,7 @@ see the build report.
 
 *Boot* checks the bundle, the app's libraries and free memory, then starts the VM. Boot takes several
 minutes on a phone: the screen shows the phase until iOS is up, and the app unlocks the screen once `vphoned`
-answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, iOS's background services, the network, sound, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
+answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, iOS's background services, its lighter preferences and kernel log (see *Reading a boot log for speed*), the network, sound, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
 RAM and a 1024 MiB code cache on a 12 GB phone; 6 GiB and 2048 MiB from 16 GB; 8 GiB and 2048 MiB from 24 GB.
 
 | Control | What it does |
@@ -276,15 +276,55 @@ with background work.
 
 - *Trimmed* applies the guest agent's `trimmed` profile (the about 137 daemons creation's option disables:
   Siri and the intelligence services, Find My, Wallet, Watch, Home, iCloud and Mail sync, analytics, media
-  analysis, the App Store) and `com.apple.momentsd`.
-- *Fewest* (experimental, not run on a guest) also disables `com.apple.sharingd` (AirDrop, Handoff) and
-  `com.apple.chronod` (every widget). If `guest top` then shows a process busier than before, go back.
+  analysis, the App Store) and four more: `com.apple.momentsd` (Journal's suggestions),
+  `com.apple.coreduetd`, `com.apple.modelcatalogd` and `com.apple.mediastream.mstreamd`. The last three are
+  the labels UniXNU-sheng read from iPadOS 27.0.1's LaunchDaemons, where coreduetd kept more than half a
+  core busy for a whole boot; their effect in this app's guest is not measured.
+- *Fewest* (experimental, not run on a guest) also disables `com.apple.sharingd` (AirDrop, Handoff),
+  `com.apple.chronod` (every widget), `com.apple.apsd` (push notifications), `com.apple.fairplayd.H2`
+  (FairPlay, which App Store apps need to start), `com.apple.mobile.obliteration` (Erase All Content and
+  Settings), `com.apple.spindump`, `com.apple.tailspind` and `com.apple.aggregated` (hang reports) and
+  `com.apple.activityawardsd`. These labels are from iOS 16 lists and Apple's naming, not from iOS 27. If
+  `guest top` then shows a process busier than before, go back.
 - The app asks the guest's agent once after the unlock, whenever the setting differs from what it last
-  applied (`<vm>/services.json`), and the log says `[vphone] services: ...`. iOS honours it from its next
-  start, so shut the VM down and start it again. *As they are* turns back on what the app turned off.
-- The labels could not be checked against an iOS 27 `launchd.plist` here. BackgroundShortcutRunner is an XPC
-  service started for widgets' App Intents and locationd is one the agent refuses to disable; neither can
-  be switched off this way.
+  applied (`<vm>/services.json`), so a VM already set to *Trimmed* gets this version's longer list at its
+  next start. iOS honours it from the start after that, so shut the VM down and start it again. *As they
+  are* turns back on what the app turned off.
+- No label was read from an iPhone's iOS 27 `launchd.plist` on the build machine. Instead the app asks
+  the guest's launchd (`services.list`, `services.disabled`) before it disables anything, and the log's
+  `[vphone] services: ...` line sorts the labels: disabled now, already off (left alone, also when the
+  level goes down), or not in this iOS's launchd (not asked for).
+- BackgroundShortcutRunner is an XPC service started for widgets' App Intents and locationd is one the
+  agent refuses to disable; neither can be switched off this way.
+
+**In the VM's settings:** *Lighter iOS visuals* and *Longer app launch limits*, both on by default. After
+each unlock the app reads three preference files of the guest and writes what is missing; the first boot
+of a new VM does the same. SpringBoard and backboardd read these when they start, so a key written now
+counts from iOS's next start. Turning a setting off removes the keys the app wrote (`<vm>/prefs.json`)
+and leaves a key you set yourself.
+
+| Setting | Keys | Where | What is known |
+|---|---|---|---|
+| Lighter iOS visuals | `CAEnableDeepFramebuffer`, `CAEnableFramebufferCompression`, `CAEnableIOSurfaceCompression` = false | `/private/var/preferences/.GlobalPreferences.plist` (any user) | The file vphone-cli 2.14.2 writes the same keys to for iOS 18 guests, checked there across a reboot. UniXNU and AdrenoMetal set the same keys. Not run on iOS 27: what they save is unmeasured |
+| Lighter iOS visuals | `ReduceMotionEnabled`, `EnhancedBackgroundContrastEnabled` = true (Reduce Motion, Reduce Transparency) | `com.apple.Accessibility`, user mobile | The names iOS has used since iOS 7; not checked on iOS 27. If Settings does not show both switches on after a restart, the names are wrong for this iOS |
+| Longer app launch limits | `FBLaunchWatchdogScale` = 4 | `com.apple.springboard`, user mobile | Measured on the desktop test VM (docs/TROUBLESHOOTING.md): FrontBoard multiplies its launch limits by it |
+| Longer app launch limits | `BKNoWatchdogs` = true | `com.apple.springboard`, user mobile | As UniXNU seeds it; not checked on iOS 27 |
+
+**In the VM's settings:** *Verbose kernel log*, off by default. iBoot gives the kernel `serial=3 -v
+debug=0x2014e` and then NVRAM's `boot-args`. The first part is patched into the VM's LLB at creation and
+stays. With the setting off the app writes `serial=0x13 debug=0x20146` into `nvram.bin` before each start
+(`bootargs.rs`): the drivers' IOLog lines and the kernel's kprintf stay off the serial line, whose every
+byte stops a vCPU for QEMU's UART. The console is still the serial line, so a panic's text is still
+printed, and the other `debug` bits are unchanged. An existing VM gets it at its next start; nothing is
+created again.
+
+- The flag values, and that the kernel takes the later of two `serial=` or `debug=`, were read in XNU's
+  published source (xnu-12377.1.9: `serial_protos.h`, `debug.h`, `pexpert/gen/bootargs.c`). `debug=0x20146`
+  keeps `DB_PRT` (0x2), "always-on panic print to serial".
+- Not run on a guest: iOS 27's kernel may differ from that source, and how much the serial line costs
+  on a phone is unmeasured. The `status` line's `serial N B/s` is there to show both: compare it with the
+  setting on and off.
+- `-v` cannot be dropped this way. It would need the LLB patched again.
 
 **In iOS:** remove the Weather, Clock and other widgets from the Home Screen and Today view (they ran at
 0.2 to 0.4 of a guest CPU each, and their App Intents kept BackgroundShortcutRunner at 0.6 to 0.8), and turn
@@ -323,7 +363,17 @@ rate (`best second` is the burst's own).
   transfer took the report; and the sum. All of that is the host's side. What iOS does after its driver has
   the report (backboardd, the app, the frame) is not visible from the host: a delay you feel with these
   figures at a few milliseconds is the guest's, and follows `guest top` and the `gpu` line's frame time.
-- `[vphone] services: ...`: what the VM's *iOS background services* setting asked of the guest's agent.
+- `[vphone] services: ...`: what the VM's *iOS background services* setting asked of the guest's agent,
+  and which labels were disabled now, were already off, or are not in this iOS's launchd.
+- `[vphone] guest prefs: ...`: once after the unlock, the keys of *Lighter iOS visuals* and *Longer app
+  launch limits* that were set now, were already there, were removed or could not be written.
+- `[vphone] kernel log: ...`: before QEMU starts, whether NVRAM's `boot-args` ask for a quiet kernel.
+  The `status` line's `serial N B/s` is what QEMU's standard output carried since the last line: the
+  guest's serial console and the little QEMU prints there itself.
+- `[vphone] guest load: ...` and the end of each `guest top` line: the settings this start runs with
+  (the services a start before it applied, the preferences found in the guest, the kernel log), the mean
+  of `guest top`'s busy CPUs from 3 minutes after the unlock, and the mean of the last start that ran
+  with other settings (`<vm>/guest-load.json`). That pair is the before and after of a change.
 - `[vphone] cpu ...` (QEMU's `vphone_android_cpu_line`): how often the guest ran `WFE` and `YIELD`, which
   are NOPs under multi-threaded TCG, so a guest that spins on them burns host cores: tens of thousands a
   second is iOS at rest, millions is a spin; the share of the vCPU threads' time spent halted (the guest
