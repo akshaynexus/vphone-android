@@ -280,24 +280,57 @@ mod stack {
     }
 }
 
-/// Memory and storage, for telling a crash from Android ending the process.
-fn resources(files: &std::path::Path) -> String {
-    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+/// The kernel's limit of mappings a process may hold. An app may not read
+/// `/proc/sys/vm/max_map_count` (SELinux) and nothing can raise it there, so where it does not
+/// read this is the kernel's default, which reims-vgpu's budget of views assumes too.
+fn max_map_count() -> u64 {
+    fs::read_to_string("/proc/sys/vm/max_map_count").ok().and_then(|l| l.trim().parse().ok()).unwrap_or(65_530)
+}
+
+/// How many mappings `/proc/self/maps` lists, and the bytes of them that are the GPU's memory
+/// (KGSL's device node, which RSS does not count).
+fn maps_summary(maps: &str) -> (usize, u64) {
+    let mut gpu = 0u64;
+    let mut count = 0;
+    for line in maps.lines() {
+        count += 1;
+        if !line.contains("kgsl") {
+            continue;
+        }
+        let span = line.split_ascii_whitespace().next().and_then(|r| r.split_once('-'));
+        if let Some((Ok(low), Ok(high))) = span.map(|(a, b)| (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16))) {
+            gpu += high.saturating_sub(low);
+        }
+    }
+    (count, gpu)
+}
+
+/// The memory line: what the process holds by kind, what the phone has left, and the mappings
+/// against their limit. `anon` is QEMU's own memory and its translated code, `shm` the guest RAM
+/// it has touched (a memfd), `gpu` the GPU memory mapped into the process.
+fn resources_line(status: &str, meminfo: &str, maps: &str, limit: u64, free_gb: u64) -> String {
     let kb = |text: &str, key: &str| -> u64 {
         text.lines()
             .find_map(|l| l.strip_prefix(key)?.split_ascii_whitespace().next()?.parse().ok())
             .unwrap_or(0)
     };
-    let free = crate::create::engine::free_bytes(files) >> 30;
-    // A process near its limit of mappings fails its next mmap, which QEMU treats as fatal.
-    let maps = fs::read("/proc/self/maps").map_or(0, |b| b.iter().filter(|c| **c == b'\n').count());
+    let (count, gpu) = maps_summary(maps);
     format!(
-        "rss {}M avail {}M disk {}G maps {maps}",
-        kb(&status, "VmRSS:") / 1024,
-        kb(&meminfo, "MemAvailable:") / 1024,
-        free
+        "rss {}M (anon {}M shm {}M) gpu {}M avail {}M disk {free_gb}G maps {count}/{limit}",
+        kb(status, "VmRSS:") / 1024,
+        kb(status, "RssAnon:") / 1024,
+        kb(status, "RssShmem:") / 1024,
+        gpu >> 20,
+        kb(meminfo, "MemAvailable:") / 1024,
     )
+}
+
+/// Memory, storage and mappings, for telling a crash from Android ending the process, and for
+/// seeing the mappings near their limit before the GPU library's views are refused there.
+fn resources(files: &std::path::Path, limit: u64) -> String {
+    let read = |path: &str| fs::read_to_string(path).unwrap_or_default();
+    let free = crate::create::engine::free_bytes(files) >> 30;
+    resources_line(&read("/proc/self/status"), &read("/proc/meminfo"), &read("/proc/self/maps"), limit, free)
 }
 
 /// What Android has this process confined to, for telling a kill from a crash.
@@ -374,6 +407,7 @@ pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
         // SAFETY: sysconf has no preconditions.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
         let started = Instant::now();
+        let limit = max_map_count();
         let mut last = threads();
         let mut tick = 0u32;
         loop {
@@ -393,7 +427,7 @@ pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
             let line = format!(
                 "t={}s {} total {:.0}%: {}",
                 started.elapsed().as_secs(),
-                resources(&files),
+                resources(&files, limit),
                 total,
                 busy_list(&rows)
             );
@@ -460,6 +494,21 @@ mod tests {
             out.hex(u64::MAX).dec(i64::MIN);
         }
         assert_eq!(out.bytes().len(), 512);
+    }
+
+    #[test]
+    fn the_memory_line_counts_mappings_against_their_limit_and_the_gpus_memory() {
+        let status = "VmRSS:\t 5427200 kB\nRssAnon:\t 1843200 kB\nRssFile:\t 10240 kB\nRssShmem:\t 3573760 kB\n";
+        let meminfo = "MemTotal: 15728640 kB\nMemAvailable:   1228800 kB\n";
+        let maps = "7000000000-7000100000 rw-s 00000000 00:05 12 /dev/kgsl-3d0\n\
+                    7000100000-7000104000 rw-p 00000000 00:00 0 [anon:scudo]\n\
+                    7000200000-7000a00000 rw-s 00100000 00:05 12 /dev/kgsl-3d0\n";
+        assert_eq!(maps_summary(maps), (3, 9 << 20));
+        assert_eq!(
+            resources_line(status, meminfo, maps, 65_530, 31),
+            "rss 5300M (anon 1800M shm 3490M) gpu 9M avail 1200M disk 31G maps 3/65530"
+        );
+        assert_eq!(resources_line("", "", "", 65_530, 0), "rss 0M (anon 0M shm 0M) gpu 0M avail 0M disk 0G maps 0/65530");
     }
 
     #[test]
