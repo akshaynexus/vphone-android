@@ -38,7 +38,7 @@ const GIGALOCKER_SH: &str = r#"x=; for n in 1 2 3 4 5 6 7; do t=$(/System/Librar
 /sbin/mount_apfs "$x" /mnt7 2>/dev/null
 if [ -f /mnt7/AA.gl ]; then
   out=$(/usr/libexec/seputil --gigalocker-init /mnt7 2>&1)
-  case $out in *"doesn'"'"'t exist"*) want=${out#*Gigalocker file (}; want=${want%%)*}; mv /mnt7/AA.gl "$want" && echo "gigalocker: AA.gl -> $want";; esac
+  case $out in *"doesn't exist"*) want=${out#*Gigalocker file (}; want=${want%%)*}; mv /mnt7/AA.gl "$want" && echo "gigalocker: AA.gl -> $want";; esac
 fi
 true"#;
 const MOUNT_SH: &str = "/usr/bin/mount_filesystems; /sbin/mount";
@@ -600,6 +600,23 @@ pub fn first_boot(params: &FirstBoot) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_scripts_sent_to_the_guest_parse() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for script in [GIGALOCKER_SH, MOUNT_SH, UNMOUNT_SH] {
+            let mut sh = Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            sh.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+            let out = sh.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
     use super::*;
     use std::io::Write;
     use std::os::unix::net::UnixListener;
