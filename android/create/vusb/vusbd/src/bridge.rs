@@ -307,6 +307,10 @@ impl Bridge {
             self.link.wait_detached();
             self.link.clear_detached();
             self.publish(None);
+            // A guest with no USB device function up (a booted iOS, say) keeps this loop going for
+            // good: say so when the reason changes, and then once a minute, not every 200 ms.
+            let mut said: Option<(String, std::time::Instant)> = None;
+            let mut unsaid = 0u32;
             loop {
                 thread::sleep(REDISCOVER_DELAY);
                 self.link.clear_detached();
@@ -320,7 +324,23 @@ impl Bridge {
                         self.publish(Some(device));
                         break;
                     }
-                    Err(e) => eprintln!("vusbd: waiting for the next stage's device ({e})"),
+                    Err(e) => {
+                        let reason = e.to_string();
+                        let repeat = said.as_ref().is_some_and(|(r, at)| {
+                            *r == reason && at.elapsed() < std::time::Duration::from_secs(60)
+                        });
+                        if repeat {
+                            unsaid += 1;
+                        } else {
+                            if unsaid > 0 {
+                                eprintln!("vusbd: still waiting for the next stage's device ({reason}; {unsaid} more checks since)");
+                            } else {
+                                eprintln!("vusbd: waiting for the next stage's device ({reason})");
+                            }
+                            said = Some((reason, std::time::Instant::now()));
+                            unsaid = 0;
+                        }
+                    }
                 }
             }
         }
