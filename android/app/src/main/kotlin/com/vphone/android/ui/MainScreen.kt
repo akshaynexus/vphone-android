@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.ButtonGroupScope
@@ -395,11 +396,11 @@ fun VmCard(vm: VmCardUi, actions: MainActions, modifier: Modifier = Modifier) {
                     else -> action("Boot", Icons.Filled.PlayArrow, primary = true, enabled = ok && status is VmStatus.Stopped) { actions.boot(vm.name) }
                 }
                 if (status !is VmStatus.Creating) {
-                    action("Settings", Icons.Filled.Settings) { actions.settings(vm.name) }
-                    action("Send", Icons.AutoMirrored.Filled.Send, enabled = ok) { actions.send(vm.name) }
+                    action("Settings", Icons.Filled.Settings, onColour = running) { actions.settings(vm.name) }
+                    action("Send", Icons.AutoMirrored.Filled.Send, enabled = ok, onColour = running) { actions.send(vm.name) }
                 }
-                action("Log", VIcons.Log) { actions.log(vm) }
-                action("Delete…", Icons.Filled.Delete) { actions.delete(vm.name) }
+                action("Log", VIcons.Log, onColour = running) { actions.log(vm) }
+                action("Delete…", Icons.Filled.Delete, onColour = running) { actions.delete(vm.name) }
             }
         }
     }
@@ -423,6 +424,8 @@ private fun ButtonGroupScope.action(
     icon: ImageVector,
     primary: Boolean = false,
     enabled: Boolean = true,
+    /** On the running VM's coloured card, where the usual tonal button would not stand out. */
+    onColour: Boolean = false,
     onClick: () -> Unit,
 ) {
     customItem(
@@ -437,7 +440,19 @@ private fun ButtonGroupScope.action(
             if (primary) {
                 Button(onClick, Modifier.animateWidth(source), enabled, contentPadding = padding, interactionSource = source) { content() }
             } else {
-                FilledTonalButton(onClick, Modifier.animateWidth(source), enabled, contentPadding = padding, interactionSource = source) { content() }
+                val scheme = MaterialTheme.colorScheme
+                FilledTonalButton(
+                    onClick,
+                    Modifier.animateWidth(source),
+                    enabled,
+                    colors = if (onColour) {
+                        ButtonDefaults.filledTonalButtonColors(containerColor = scheme.surfaceContainerLowest.copy(alpha = 0.6f), contentColor = scheme.onSurface)
+                    } else {
+                        ButtonDefaults.filledTonalButtonColors()
+                    },
+                    contentPadding = padding,
+                    interactionSource = source,
+                ) { content() }
             }
         },
         menuContent = { menu ->

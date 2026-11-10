@@ -47,6 +47,9 @@ class VmSettingsActivity : ComponentActivity() {
             gpuDiagnostics = config.optBoolean("gpuDiagnostics", false),
             softwareDisplay = config.optBoolean("softwareDisplay", false),
             swapchainLayout = config.optString("swapchainLayout", "auto"),
+            lighterVisuals = config.optBoolean("lighterVisuals", true),
+            longerLaunchLimits = config.optBoolean("longerLaunchLimits", true),
+            verboseKernelLog = config.optBoolean("verboseKernelLog", false),
         )
         setContent {
             VphoneTheme {
@@ -55,7 +58,7 @@ class VmSettingsActivity : ComponentActivity() {
                     initial = initial,
                     cpus = info.getInt("cpus"),
                     totalMib = info.getLong("totalMib"),
-                    onSave = { save(name, it) },
+                    onSave = { save(name, config, it) },
                     onBack = ::finish,
                 )
                 dialogs.current?.let { spec ->
@@ -65,9 +68,13 @@ class VmSettingsActivity : ComponentActivity() {
         }
     }
 
-    /** The native side checks the values; what it refuses is shown, and the screen stays. */
-    private fun save(name: String, s: VmSettings) {
-        val saved = JSONObject()
+    /**
+     * The native side checks the values; what it refuses is shown, and the screen stays. The
+     * save starts from the settings as they were read, so a field this screen does not know yet
+     * keeps its value instead of going back to its default.
+     */
+    private fun save(name: String, read: JSONObject, s: VmSettings) {
+        val saved = JSONObject(read.toString())
             .put("vcpus", s.vcpus)
             .put("ramMib", s.ramMib)
             .put("tbMib", s.tbMib)
@@ -83,6 +90,9 @@ class VmSettingsActivity : ComponentActivity() {
             .put("gpuDiagnostics", s.gpuDiagnostics)
             .put("softwareDisplay", s.softwareDisplay)
             .put("swapchainLayout", s.swapchainLayout)
+            .put("lighterVisuals", s.lighterVisuals)
+            .put("longerLaunchLimits", s.longerLaunchLimits)
+            .put("verboseKernelLog", s.verboseKernelLog)
         val error = Native.saveVmConfig(name, saved.toString())
         if (error.isNotEmpty()) {
             dialogs.show(DialogSpec.error("$name's settings were not saved", error))

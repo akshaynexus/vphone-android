@@ -69,6 +69,9 @@ data class VmSettings(
     val gpuDiagnostics: Boolean = false,
     val softwareDisplay: Boolean = false,
     val swapchainLayout: String = "auto",
+    val lighterVisuals: Boolean = true,
+    val longerLaunchLimits: Boolean = true,
+    val verboseKernelLog: Boolean = false,
 )
 
 private typealias RowContent = @Composable (ListItemShapes) -> Unit
@@ -194,12 +197,29 @@ fun SettingsScreen(
                             RadioChoice(
                                 listOf(
                                     Triple("unchanged", "As they are", ""),
-                                    Triple("trimmed", "Trimmed", "About 138 off: Siri, iCloud sync, analytics, Journal…"),
-                                    Triple("fewest", "Fewest", "Experimental: also no widgets, no AirDrop."),
+                                    Triple("trimmed", "Trimmed", "About 141 off: Siri, iCloud sync, analytics, Journal, CoreDuet…"),
+                                    Triple("fewest", "Fewest", "Experimental: also no widgets, AirDrop, push notifications, FairPlay."),
                                 ),
                                 s.services,
                             ) { v -> s = s.copy(services = v) }
                         }
+                    },
+                    {
+                        SwitchRow(
+                            it,
+                            "Lighter iOS visuals",
+                            "Reduce Motion, Reduce Transparency, and no compressed or deep framebuffer. " +
+                                "From iOS's next start after it is applied.",
+                            s.lighterVisuals,
+                        ) { v -> s = s.copy(lighterVisuals = v) }
+                    },
+                    {
+                        SwitchRow(
+                            it,
+                            "Longer app launch limits",
+                            "iOS waits four times as long before it kills a slow launch.",
+                            s.longerLaunchLimits,
+                        ) { v -> s = s.copy(longerLaunchLimits = v) }
                     },
                 )
                 Group(
@@ -250,6 +270,15 @@ fun SettingsScreen(
                             s.gpuDiagnostics,
                         ) { v -> s = s.copy(gpuDiagnostics = v) }
                     },
+                    {
+                        SwitchRow(
+                            it,
+                            "Verbose kernel log",
+                            "iOS's kernel prints driver and debug lines on the serial line, which costs emulated CPU. " +
+                                "A panic's text is printed either way.",
+                            s.verboseKernelLog,
+                        ) { v -> s = s.copy(verboseKernelLog = v) }
+                    },
                 )
             }
         }
@@ -291,6 +320,7 @@ private fun SwitchRow(shapes: ListItemShapes, title: String, note: String, check
         checked = checked,
         onCheckedChange = onChange,
         shapes = shapes,
+        colors = ListItemDefaults.segmentedColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
         supportingContent = { Text(note) },
         // The whole row is the switch: the control itself is not a second target.
         trailingContent = { Switch(checked = checked, onCheckedChange = null) },
@@ -303,6 +333,7 @@ private fun SwitchRow(shapes: ListItemShapes, title: String, note: String, check
 private fun ControlRow(shapes: ListItemShapes, title: String, note: String, control: @Composable () -> Unit) {
     SegmentedListItem(
         shapes = shapes,
+        colors = ListItemDefaults.segmentedColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
         supportingContent = {
             Column {
                 Text(note)
@@ -369,13 +400,14 @@ private val SettingsSaver = androidx.compose.runtime.saveable.listSaver<VmSettin
         listOf(
             it.version, it.vcpus, it.ramMib, it.tbMib, it.performance, it.refreshHz, it.performanceHints, it.services,
             it.network, it.sound, it.display, it.gpuCompression, it.gpuDiagnostics, it.softwareDisplay, it.swapchainLayout,
+            it.lighterVisuals, it.longerLaunchLimits, it.verboseKernelLog,
         )
     },
     restore = {
         VmSettings(
             it[0] as Int, it[1] as Int, it[2] as Int, it[3] as Int, it[4] as String, it[5] as Int, it[6] as Boolean,
             it[7] as String, it[8] as Boolean, it[9] as Boolean, it[10] as Boolean, it[11] as Boolean, it[12] as Boolean,
-            it[13] as Boolean, it[14] as String,
+            it[13] as Boolean, it[14] as String, it[15] as Boolean, it[16] as Boolean, it[17] as Boolean,
         )
     },
 )

@@ -224,10 +224,12 @@ fun ProgressCard(
                 Text(ui.detail, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 6.dp))
             }
             val described = Modifier.fillMaxWidth().padding(top = 14.dp).semantics { contentDescription = ui.title }
+            // The default track is the colour of these cards, and would not show on them.
+            val track = MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
             if (ui.fraction != null) {
-                LinearWavyProgressIndicator(progress = { ui.fraction.coerceIn(0f, 1f) }, modifier = described)
+                LinearWavyProgressIndicator(progress = { ui.fraction.coerceIn(0f, 1f) }, modifier = described, trackColor = track)
             } else {
-                LinearWavyProgressIndicator(modifier = described)
+                LinearWavyProgressIndicator(modifier = described, trackColor = track)
             }
             if (ui.stats.isNotEmpty()) StatRow(ui.stats, Modifier.padding(top = 12.dp))
             extra()

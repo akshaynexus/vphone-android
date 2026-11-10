@@ -353,12 +353,13 @@ fun CreateProgressScreen(ui: CreateProgressUi, actions: CreateProgressActions) {
                         if (ui.barVisible) {
                             val bar = Modifier.fillMaxWidth().padding(top = 14.dp).semantics { contentDescription = "This step's progress" }
                             val fraction = ui.fraction
+                            val track = MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
                             if (fraction != null) {
-                                LinearWavyProgressIndicator(progress = { fraction.coerceIn(0f, 1f) }, modifier = bar)
+                                LinearWavyProgressIndicator(progress = { fraction.coerceIn(0f, 1f) }, modifier = bar, trackColor = track)
                             } else if (ui.busy) {
-                                LinearWavyProgressIndicator(modifier = bar)
+                                LinearWavyProgressIndicator(modifier = bar, trackColor = track)
                             } else {
-                                LinearWavyProgressIndicator(progress = { 0f }, modifier = bar)
+                                LinearWavyProgressIndicator(progress = { 0f }, modifier = bar, trackColor = track)
                             }
                         }
                         Text(ui.eta, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))

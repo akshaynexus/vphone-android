@@ -69,7 +69,7 @@ import java.io.File
 private const val PHONE = "w412dp-h915dp-xxhdpi"
 
 /** The same width, long enough to show a whole scrolling screen. */
-private const val TALL = "w412dp-h2200dp-xxhdpi"
+private const val TALL = "w412dp-h2600dp-xxhdpi"
 private const val TABLET = "w1280dp-h800dp-xhdpi"
 private const val CARD = "w412dp-h360dp-xxhdpi"
 
@@ -117,7 +117,7 @@ class ScreenshotTest {
     )
 
     private fun main(update: UpdateUi = UpdateUi.Hidden, failure: FailureUi? = null, sending: ProgressUi? = null) = MainUi(
-        version = "0.6.5",
+        version = "0.6.6",
         device = "8 CPU cores, 11 GiB RAM, 6 GiB free",
         vms = vms,
         vmsPath = "/storage/emulated/0/Android/data/com.vphone.android/files/vms/<name>/",
@@ -136,10 +136,10 @@ class ScreenshotTest {
     @Test fun vmListEmptyDark() = shot("vm-list-empty", true) { MainScreen(main().copy(vms = emptyList()), MainActions()) }
 
     @Config(qualifiers = TABLET)
-    @Test fun vmListTabletLight() = shot("vm-list-tablet", false) { MainScreen(main(UpdateUi.Available("0.6.6", 187)), MainActions()) }
+    @Test fun vmListTabletLight() = shot("vm-list-tablet", false) { MainScreen(main(UpdateUi.Available("0.6.7", 187)), MainActions()) }
 
     @Config(qualifiers = TABLET)
-    @Test fun vmListTabletDark() = shot("vm-list-tablet", true) { MainScreen(main(UpdateUi.Available("0.6.6", 187)), MainActions()) }
+    @Test fun vmListTabletDark() = shot("vm-list-tablet", true) { MainScreen(main(UpdateUi.Available("0.6.7", 187)), MainActions()) }
 
     private val failure = FailureUi(
         "Test bench",
@@ -171,12 +171,12 @@ class ScreenshotTest {
     @Test fun vmListTransferDark() = shot("vm-list-transfer", true) { MainScreen(main(sending = transfer).copy(vms = vms.drop(2).map { if (it.name == "Test bench") it.copy(status = VmStatus.Sending(0.37f)) else it }), MainActions()) }
 
     @Config(qualifiers = CARD)
-    @Test fun updateAvailableLight() = shot("update-card-available", false) { Cards { UpdateCard(UpdateUi.Available("0.6.6", 187), MainActions()) } }
+    @Test fun updateAvailableLight() = shot("update-card-available", false) { Cards { UpdateCard(UpdateUi.Available("0.6.7", 187), MainActions()) } }
 
     @Config(qualifiers = CARD)
-    @Test fun updateAvailableDark() = shot("update-card-available", true) { Cards { UpdateCard(UpdateUi.Available("0.6.6", 187), MainActions()) } }
+    @Test fun updateAvailableDark() = shot("update-card-available", true) { Cards { UpdateCard(UpdateUi.Available("0.6.7", 187), MainActions()) } }
 
-    private val downloading = UpdateUi.Downloading("0.6.6", 81 * MIB, 187 * MIB, 9 * MIB + MIB / 2)
+    private val downloading = UpdateUi.Downloading("0.6.7", 81 * MIB, 187 * MIB, 9 * MIB + MIB / 2)
 
     @Config(qualifiers = CARD)
     @Test fun updateDownloadingLight() = shot("update-card-downloading", false) { Cards { UpdateCard(downloading, MainActions()) } }

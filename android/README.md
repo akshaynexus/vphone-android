@@ -19,6 +19,13 @@ Rust tests run on the build machine:
     . android/env.sh; cd android/vphone-native
     CARGO_TARGET_DIR=../build/vphone-native-target cargo test --target x86_64-unknown-linux-gnu
 
+### The screens, without a phone
+
+The app's screens are Jetpack Compose with Material 3 Expressive (`app/src/main/kotlin/com/vphone/android/ui/`);
+the activities beside them hold the logic and hand each screen its state. `scripts/ui-screenshots.sh`
+draws the screens on this computer with made-up state, in light and dark, and writes PNGs to
+`build/ui-screenshots/` (Robolectric and Roborazzi; no phone and no native library).
+
 ## Install
 
     adb install -r android/build/out/vphone-android-debug.apk
