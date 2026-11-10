@@ -286,6 +286,18 @@ pub extern "system" fn Java_com_vphone_android_Native_home(_env: JNIEnv, _this: 
     quiet(runtime::home);
 }
 
+/// Whether iOS is playing a sound now.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_audioPlaying(_env: JNIEnv, _this: JObject) -> jni::sys::jboolean {
+    std::panic::catch_unwind(runtime::audio_playing).unwrap_or(false) as jni::sys::jboolean
+}
+
+/// Silences what the phone plays of the VM, or lets it be heard again.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_setAudioMuted(_env: JNIEnv, _this: JObject, muted: jni::sys::jboolean) {
+    quiet(|| runtime::set_audio_muted(muted != 0));
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_vphone_android_Native_lock(_env: JNIEnv, _this: JObject) {
     quiet(runtime::lock);

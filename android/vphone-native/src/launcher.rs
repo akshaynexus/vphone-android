@@ -78,6 +78,8 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
         "-device",
         &format!("virtio-vsock-uds-pci,guest-cid={GUEST_CID},uds-path={vsock}"),
     ]);
+    // After every other device, so that each of them keeps the PCI slot it had without sound.
+    push(&sound_args(cfg.sound));
     let qmp = opt(&paths.qmp_socket().to_string_lossy());
     push(&["-qmp", &format!("unix:{qmp},server=on,wait=off")]);
     // Names the vCPU threads "CPU n/TCG", which is how the performance hints find them.
@@ -140,6 +142,33 @@ pub fn net_args(network: bool) -> [&'static str; 2] {
         ["-nic", "user,model=virtio-net-pci,ipv6=off"]
     } else {
         ["-net", "nic"]
+    }
+}
+
+/// The machine's sound device and where it plays, or nothing.
+///
+/// - `virtio-sound-pci` is virtio device 0x19, which iOS's kernel matches (`AppleVirtIOSound`)
+///   and the CFW's HAL plugin (`VPhoneVirtIOSound.driver`) drives. `streams=1` is one output
+///   stream and no input (the microphone is not made). `vectors=5` gives the device's four
+///   queues and its configuration an MSI-X vector each; QEMU's default is 2.
+/// - `-audiodev aaudio` is Android's AAudio (`qemu/audio/aaudio.c`). The plugin takes 48 kHz
+///   float where the device offers it, and QEMU's device offers every format, so that is what
+///   the phone is asked to play and QEMU's mixer converts nothing; the backend falls back to
+///   16-bit where the phone refuses float.
+///
+/// Both come last among the devices: vresearch101 makes its own PCI devices (USB, the network
+/// card, the two disks) before any `-device`, and those take their slots in the order given, so
+/// the vsock device before this one is where it was.
+pub fn sound_args(sound: bool) -> Vec<&'static str> {
+    if sound {
+        vec![
+            "-audiodev",
+            "aaudio,id=snd0,out.frequency=48000,out.format=f32,out.channels=2",
+            "-device",
+            "virtio-sound-pci,audiodev=snd0,streams=1,vectors=5",
+        ]
+    } else {
+        Vec::new()
     }
 }
 
@@ -286,6 +315,35 @@ mod tests {
         // Nothing else differs.
         assert_eq!(on.args.len(), off.args.len());
         assert_eq!(on.env.len(), off.env.len() + 1);
+    }
+
+    #[test]
+    fn sound_is_one_output_stream_on_aaudio_after_every_other_device() {
+        let dir = fixture("speaker");
+        let bundle = Bundle::open(&dir).unwrap();
+        let on = build(&bundle, &cfg(), &paths());
+        let line = on.args.join(" ");
+        assert!(
+            line.contains(
+                "-device virtio-vsock-uds-pci,guest-cid=3,uds-path=/data/files/vsock/3.sock \
+                 -audiodev aaudio,id=snd0,out.frequency=48000,out.format=f32,out.channels=2 \
+                 -device virtio-sound-pci,audiodev=snd0,streams=1,vectors=5 -qmp "
+            ),
+            "{line}"
+        );
+        let count = |l: &Launch, flag: &str| l.args.iter().filter(|a| *a == flag).count();
+        assert_eq!((count(&on, "-audiodev"), count(&on, "-audio"), count(&on, "-device")), (1, 0, 2));
+        // The sound device is the last device: the ones before it are where they were.
+        let devices: Vec<&String> =
+            on.args.iter().zip(on.args.iter().skip(1)).filter(|(flag, _)| *flag == "-device").map(|(_, d)| d).collect();
+        assert!(devices[0].starts_with("virtio-vsock-uds-pci,") && devices[1].starts_with("virtio-sound-pci,"));
+
+        // Off: no sound device and no backend, and nothing else differs.
+        let off = build(&bundle, &VmConfig { sound: false, ..cfg() }, &paths());
+        assert!(!off.args.iter().any(|a| a.contains("snd") || a.contains("audio") || a.contains("sound")), "{:?}", off.args);
+        assert_eq!(on.args.len(), off.args.len() + 4);
+        assert_eq!(on.env, off.env);
+        assert!(sound_args(false).is_empty());
     }
 
     #[test]

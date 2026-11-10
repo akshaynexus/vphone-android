@@ -98,7 +98,7 @@ see the build report.
 
 *Boot* checks the bundle, the app's libraries and free memory, then starts the VM. Boot takes several
 minutes on a phone: the screen shows the phase until iOS is up, and the app unlocks the screen once `vphoned`
-answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, iOS's background services, the network, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
+answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, iOS's background services, the network, sound, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
 RAM and a 1024 MiB code cache on a 12 GB phone; 6 GiB and 2048 MiB from 16 GB; 8 GiB and 2048 MiB from 24 GB.
 
 | Control | What it does |
@@ -145,6 +145,62 @@ of a creation (restore, SSH ramdisk, first boot) are always without it.
   QEMU's stderr, which is in the same log. A VM that came from a Mac with its address pinned by
   vphone-cli is set back to DHCP (`network.ipv4.set`), and the log says so.
 - The guest's agent (vsock) and usbmuxd (virtual USB) do not use this network.
+
+## Sound
+
+iOS plays through the phone: the speaker, or whatever Android routes media to (wired headphones,
+Bluetooth). *Settings > Sound* turns it off for a VM, which then has no sound device, as every VM had
+before 0.6.5; without one iOS has no audio route at all and players such as Safari's do not start.
+
+- **The guest's side was already there.** The iOS 27 kernel has `AppleVirtIOSound`, which matches virtio
+  device 0x19, and the CFW installs vphone-cli's HAL plugin `VPhoneVirtIOSound.driver`, which drives it
+  from audiomxd (vphone-cli `Research/Guest/virtio_sound.md`). A VM whose CFW has no plugin stays silent,
+  and the log says so (below).
+- **The machine** gets `-device virtio-sound-pci,audiodev=snd0,streams=1,vectors=5`: one output stream,
+  no input. It is the last device on the command line, so the network card, the disks and the vsock
+  device keep the PCI slots they had (`vphone-native/src/launcher.rs`, `sound_args`). The boots of a
+  creation do not have it.
+- **The phone's side** is a QEMU audio backend for Android's AAudio, `qemu/audio/aaudio.c`
+  (`-audiodev aaudio`, built with `--audio-drv-list=aaudio`; the NDK has the library). It opens one
+  low-latency stream at 48 kHz, 32-bit float, stereo, which is what the plugin sends (16-bit where the
+  phone refuses float), with AAudio's buffer at two bursts. QEMU's audio timer writes into a 40 ms ring
+  and AAudio's callback plays from it, starting once the ring is half full. The stream starts when iOS
+  starts playing and stops a second after it stops. When Android takes the output away (headphones
+  unplugged, Bluetooth off) the stream is opened again on the new output; while there is no stream the
+  guest plays unheard at the right speed.
+- **Volume and focus.** On the VM's screen the volume keys move Android's media volume. The app takes
+  the audio focus once iOS has played for two seconds and gives it back five seconds after it falls
+  silent (`VmAudio.kt`), so that a short sound need not stop another app's music and a video does; how
+  long iOS keeps its stream open after a click has not been measured on a phone.
+  While another app holds the focus (a call) the VM is silenced on the phone and iOS plays on.
+- **Picture against sound.** The plugin queues about 170 ms ahead (vphone-cli's figure, on a Mac) and
+  reports it to iOS as latency. What
+  the phone adds after that (the ring and AAudio's own figure for the output) is measured while a sound
+  plays and told to the guest with vphoned's `audio.host_latency`, when it differs by 15 ms or more from
+  what the guest has stored: the plugin restarts its stream to take a new figure, a short break.
+- **The log.** `sound: ...` at the start; QEMU's `aaudio: stream open: 48000 Hz, float32, 2 channels,
+  burst ... frames, buffer ... frames, low latency, device N` when the stream opens; after the unlock one
+  line read from the plugin's own log in the guest (`/var/mobile/vpquery.log`):
+
+      [vphone] audio: iOS's sound driver loaded at 11:58:02 UTC: published 1 virtio sound device(s); stream 0: output, 48000 Hz, 2 channels, 32-bit float, ...
+
+  and, with the status lines every 30 s, one line for each interval in which iOS played:
+
+      [vphone] audio 4:30 aaudio started, 48000 Hz float32 2 ch, burst 192, buffer 384 of 3072 frames, ring 1920; in 30.0 s: 1440000 frames from iOS (30.0 s), 1439040 played, 0 underruns (0 ms silent), 0 device xruns, 1 starts, 0 reopens; latency 46 ms (ring 22 + device 24)
+
+  `frames from iOS` is what the guest wrote to the device; `underruns` counts the times the ring ran dry
+  while iOS played (the phone then plays silence until it is half full again), `device xruns` AAudio's own
+  count of a late callback. After a sound ends the plugin's count of it follows: `iOS's driver, its last
+  sound: stream 0: 9.08 s, 108 writes, 0 starved, ...`, where `starved` are the periods that found the
+  device with nothing left to play.
+- **Not there: the microphone.** It would take `streams=2` (QEMU makes the second stream an input), an
+  input stream in `aaudio.c` (an AAudio input stream filling the generic capture buffer), the
+  `RECORD_AUDIO` permission with its prompt, and a foreground service of type `microphone` for recording
+  with the screen off. The plugin already publishes a `Digital Mic` device for an input stream
+  (vphone-cli `Research/Guest/virtio_sound_microphone.md`).
+- If TCG is too slow for a stream the plugin's `starved` count rises; its lead can be raised from the
+  default 2 periods (85 ms each) with vphoned's `settings.set` of `VPhoneVirtIOSoundLeadPeriods` (up to 8)
+  in the `com.apple.coreaudio` domain, read when audiomxd loads the plugin. The app has no setting for it.
 
 ## Logs and failures
 

@@ -210,6 +210,818 @@ index 3b72dcf06ada12685de4621e41d6ecdfc89ba03e..5495096b130f37d6942e41502db2fb18
      return tb;
  }
  
+diff --git a/audio/aaudio.c b/audio/aaudio.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..19553a96bf5b75ec92993a095782f1600466c72c
+--- /dev/null
++++ b/audio/aaudio.c
+@@ -0,0 +1,765 @@
++/*
++ * QEMU AAudio audio driver: playback through Android's native audio API.
++ *
++ * QEMU's audio timer, on the main loop, writes the mixed sound into a ring
++ * (the generic buffer of audio.c); AAudio's callback, on a thread of its own,
++ * plays from the ring. The ring is short, so the guest's device is paced by
++ * what the phone plays, and long enough for a late timer.
++ *
++ * The stream is opened once, in low-latency mode with a buffer of a few
++ * bursts, and started when the guest starts playing. It is stopped a second
++ * after the guest stops, so what is left in the ring is heard and a phone
++ * with a quiet guest keeps no audio stream running. When Android takes the
++ * output device away (headphones, Bluetooth) AAudio reports an error, and the
++ * stream is opened again on the device that is the output by then. While
++ * there is no stream at all the ring is emptied at the rate it would have
++ * played, so the guest's player keeps its time and nothing is heard.
++ *
++ * It does not record.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ */
++
++#include "qemu/osdep.h"
++#include <aaudio/AAudio.h>
++#include <pthread.h>
++#include "qemu/module.h"
++#include "qemu/thread.h"
++#include "qemu/timer.h"
++#include "qemu/atomic.h"
++#include "qapi/error.h"
++#include "audio.h"
++
++#define AUDIO_CAP "aaudio"
++#include "audio_int.h"
++
++/* The ring between QEMU's timer and the callback, when the audiodev names none. */
++#define AAUDIO_RING_USECS 40000
++/* How long the stream runs on after the guest stops, playing what is left. */
++#define AAUDIO_LINGER_MS 1000
++/* How long before another try at a stream that would not open or start. */
++#define AAUDIO_RETRY_MS 2000
++
++typedef struct AAudioVoiceOut {
++    HWVoiceOut hw;
++    Audiodev *dev;
++    aaudio_format_t format;
++    uint32_t bursts;
++    QEMUTimer *linger;
++
++    /*
++     * Guards the ring (hw.buf_emul, pos_emul, pending_emul), `stream` as a
++     * pointer, and everything below it. The callback takes it for the copy.
++     */
++    QemuMutex lock;
++    AAudioStream *stream;
++    bool enabled;               /* the guest is playing */
++    bool primed;                /* the ring has filled since it last ran dry */
++    bool starved;               /* it ran dry while the guest played, and has not refilled */
++    int64_t null_since_ns;      /* with no stream: when the ring was last emptied */
++
++    /* The stream as AAudio opened it. */
++    int32_t burst;
++    int32_t buffer_frames;
++    int32_t capacity_frames;
++    int32_t xruns_tuned;        /* the stream's xruns its buffer has been raised for */
++
++    /* Since the last status line. */
++    uint64_t frames_in;         /* written by QEMU */
++    uint64_t frames_out;        /* of those, handed to AAudio */
++    uint64_t frames_gap;        /* silence handed to AAudio while the guest played */
++    uint64_t underruns;         /* times the ring ran dry while the guest played */
++    uint64_t fill_sum;          /* frames in the ring at each callback, summed */
++    uint64_t fill_count;
++    uint32_t starts;
++    uint32_t reopens;
++    int32_t xruns_said;         /* of the stream, at the last line */
++    int64_t line_ns;
++    bool said;                  /* a status line has been written */
++
++    /* The time from a frame leaving the ring to its being heard; -1 unknown. */
++    int64_t device_latency_us;
++    int64_t ring_latency_us;
++
++    /* The main loop's alone. */
++    bool started;
++    int64_t retry_at_ms;
++    bool open_failure_said;
++
++    /* Set by AAudio's error callback, taken by the main loop. */
++    int disconnected;
++    int last_error;
++} AAudioVoiceOut;
++
++/* The one voice, for the calls of the app; guarded by aaudio_voice_lock. */
++static pthread_mutex_t aaudio_voice_lock = PTHREAD_MUTEX_INITIALIZER;
++static AAudioVoiceOut *aaudio_voice;
++/* The app lost the audio focus: the guest plays on, and nothing is heard. */
++static int aaudio_muted;
++
++static int64_t aaudio_now_ns(void)
++{
++    struct timespec ts;
++
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++static const char *aaudio_format_name(aaudio_format_t format)
++{
++    switch (format) {
++    case AAUDIO_FORMAT_PCM_FLOAT:
++        return "float32";
++    case AAUDIO_FORMAT_PCM_I16:
++        return "s16";
++    case AAUDIO_FORMAT_PCM_I32:
++        return "s32";
++    default:
++        return "?";
++    }
++}
++
++static aaudio_data_callback_result_t aaudio_data_cb(AAudioStream *stream,
++                                                    void *opaque,
++                                                    void *audio,
++                                                    int32_t frames)
++{
++    AAudioVoiceOut *v = opaque;
++    HWVoiceOut *hw = &v->hw;
++    size_t bpf = hw->info.bytes_per_frame;
++    size_t len = (size_t)frames * bpf;
++    uint8_t *buf = audio;
++    bool muted = qatomic_read(&aaudio_muted);
++
++    qemu_mutex_lock(&v->lock);
++    if (stream == v->stream) {
++        /*
++         * A callback AAudio ran late is an xrun of its buffer: one burst more,
++         * as far as the buffer goes, each time there has been one.
++         */
++        int32_t xruns = AAudioStream_getXRunCount(stream);
++
++        if (xruns > v->xruns_tuned) {
++            v->xruns_tuned = xruns;
++            if (v->buffer_frames + v->burst <= v->capacity_frames) {
++                int32_t size = AAudioStream_setBufferSizeInFrames(
++                    stream, v->buffer_frames + v->burst);
++
++                if (size > 0) {
++                    v->buffer_frames = size;
++                }
++            }
++        }
++    }
++    if (v->primed) {
++        v->fill_sum += hw->pending_emul / bpf;
++        v->fill_count++;
++    } else if ((hw->size_emul && hw->pending_emul >= hw->size_emul / 2) ||
++               (!v->enabled && hw->pending_emul)) {
++        /* Half full, or the last of a sound the guest has stopped. */
++        v->primed = true;
++        v->starved = false;
++    }
++    if (v->primed) {
++        while (hw->pending_emul && len) {
++            size_t start = audio_ring_posb(hw->pos_emul, hw->pending_emul,
++                                           hw->size_emul);
++            size_t n = MIN(MIN(hw->pending_emul, len), hw->size_emul - start);
++
++            if (muted) {
++                memset(buf, 0, n);
++            } else {
++                memcpy(buf, hw->buf_emul + start, n);
++            }
++            hw->pending_emul -= n;
++            v->frames_out += n / bpf;
++            len -= n;
++            buf += n;
++        }
++        if (len) {
++            /* Dry: wait for half a ring again rather than play in crumbs. */
++            v->primed = false;
++            if (v->enabled) {
++                v->underruns++;
++                v->starved = true;
++            }
++        }
++    }
++    if (len && v->enabled && v->starved) {
++        v->frames_gap += len / bpf;
++    }
++    qemu_mutex_unlock(&v->lock);
++
++    if (len) {
++        audio_pcm_info_clear_buf(&hw->info, buf, len / bpf);
++    }
++    return AAUDIO_CALLBACK_RESULT_CONTINUE;
++}
++
++static void aaudio_error_cb(AAudioStream *stream, void *opaque,
++                            aaudio_result_t error)
++{
++    AAudioVoiceOut *v = opaque;
++
++    /* The stream cannot be closed from its own callback: the main loop does. */
++    qatomic_set(&v->last_error, error);
++    qatomic_set(&v->disconnected, 1);
++}
++
++/*
++ * A stream of the voice's rate, channels and format, or NULL. `callback_frames`
++ * is the size of each callback, or 0 for AAudio's own, which is a burst.
++ */
++static AAudioStream *aaudio_open_sized(AAudioVoiceOut *v, int freq,
++                                       int nchannels, aaudio_format_t format,
++                                       int32_t callback_frames,
++                                       aaudio_result_t *why)
++{
++    AAudioStreamBuilder *builder;
++    AAudioStream *stream = NULL;
++    aaudio_result_t res;
++
++    res = AAudio_createStreamBuilder(&builder);
++    if (res != AAUDIO_OK) {
++        *why = res;
++        return NULL;
++    }
++    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
++    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
++    AAudioStreamBuilder_setPerformanceMode(builder,
++                                           AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
++    AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
++    AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
++    AAudioStreamBuilder_setSampleRate(builder, freq);
++    AAudioStreamBuilder_setChannelCount(builder, nchannels);
++    AAudioStreamBuilder_setFormat(builder, format);
++    if (callback_frames > 0) {
++        AAudioStreamBuilder_setFramesPerDataCallback(builder, callback_frames);
++    }
++    AAudioStreamBuilder_setDataCallback(builder, aaudio_data_cb, v);
++    AAudioStreamBuilder_setErrorCallback(builder, aaudio_error_cb, v);
++    res = AAudioStreamBuilder_openStream(builder, &stream);
++    AAudioStreamBuilder_delete(builder);
++    if (res != AAUDIO_OK) {
++        *why = res;
++        return NULL;
++    }
++    if (AAudioStream_getSampleRate(stream) != freq ||
++        AAudioStream_getChannelCount(stream) != nchannels ||
++        AAudioStream_getFormat(stream) != format) {
++        AAudioStream_close(stream);
++        *why = AAUDIO_ERROR_INVALID_FORMAT;
++        return NULL;
++    }
++    return stream;
++}
++
++static AAudioStream *aaudio_open(AAudioVoiceOut *v, int freq, int nchannels,
++                                 aaudio_format_t format, aaudio_result_t *why)
++{
++    AAudioStream *stream = aaudio_open_sized(v, freq, nchannels, format, 0, why);
++    size_t ring = v->hw.samples;
++
++    /*
++     * The ring's size was settled when the voice was made. An output opened
++     * later whose bursts are too long for it (four to the ring) is asked for
++     * callbacks the ring can feed, and AAudio makes its bursts of them.
++     */
++    if (stream && ring && (size_t)AAudioStream_getFramesPerBurst(stream) > ring / 4) {
++        AAudioStream_close(stream);
++        stream = aaudio_open_sized(v, freq, nchannels, format, ring / 4, why);
++    }
++    return stream;
++}
++
++/* Takes a stream just opened as the voice's, and says what it is. */
++static void aaudio_adopt(AAudioVoiceOut *v, AAudioStream *stream)
++{
++    int32_t burst = AAudioStream_getFramesPerBurst(stream);
++    int32_t buffer = AAudioStream_setBufferSizeInFrames(stream,
++                                                        v->bursts * burst);
++
++    if (buffer < 0) {
++        buffer = AAudioStream_getBufferSizeInFrames(stream);
++    }
++    qemu_mutex_lock(&v->lock);
++    v->stream = stream;
++    v->burst = burst;
++    v->buffer_frames = buffer;
++    v->capacity_frames = AAudioStream_getBufferCapacityInFrames(stream);
++    v->xruns_said = 0;
++    v->xruns_tuned = 0;
++    v->device_latency_us = -1;
++    qemu_mutex_unlock(&v->lock);
++    v->started = false;
++    v->open_failure_said = false;
++    dolog("stream open: %d Hz, %s, %d channels, burst %d frames, buffer %d of "
++          "%d frames, %s, device %d\n",
++          AAudioStream_getSampleRate(stream),
++          aaudio_format_name(AAudioStream_getFormat(stream)),
++          AAudioStream_getChannelCount(stream), burst, buffer,
++          v->capacity_frames,
++          AAudioStream_getPerformanceMode(stream) ==
++              AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? "low latency" :
++              "not low latency",
++          AAudioStream_getDeviceId(stream));
++}
++
++/* Main loop. Without the lock held: closing waits for the callback. */
++static void aaudio_close(AAudioVoiceOut *v)
++{
++    AAudioStream *stream;
++
++    qemu_mutex_lock(&v->lock);
++    stream = v->stream;
++    v->stream = NULL;
++    v->null_since_ns = aaudio_now_ns();
++    qemu_mutex_unlock(&v->lock);
++    v->started = false;
++    if (stream) {
++        AAudioStream_requestStop(stream);
++        AAudioStream_close(stream);
++    }
++}
++
++static void aaudio_start(AAudioVoiceOut *v)
++{
++    aaudio_result_t res;
++
++    if (!v->stream || v->started) {
++        return;
++    }
++    res = AAudioStream_requestStart(v->stream);
++    if (res == AAUDIO_ERROR_INVALID_STATE) {
++        /* Still stopping from the last sound. */
++        aaudio_stream_state_t next;
++
++        AAudioStream_waitForStateChange(v->stream, AAUDIO_STREAM_STATE_STOPPING,
++                                        &next, 200 * 1000000LL);
++        res = AAudioStream_requestStart(v->stream);
++    }
++    if (res != AAUDIO_OK) {
++        dolog("the stream did not start: %s; it is opened again\n",
++              AAudio_convertResultToText(res));
++        aaudio_close(v);
++        v->retry_at_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
++                         AAUDIO_RETRY_MS;
++        return;
++    }
++    v->started = true;
++    v->starts++;
++}
++
++/*
++ * Main loop, at every tick of the audio timer while the guest plays: the
++ * stream Android took away is closed, and a voice with no stream gets one.
++ */
++static void aaudio_service(AAudioVoiceOut *v)
++{
++    int64_t now_ms;
++
++    if (qatomic_xchg(&v->disconnected, 0)) {
++        dolog("the stream ended (%s): opening one on the output device of now\n",
++              AAudio_convertResultToText(qatomic_read(&v->last_error)));
++        aaudio_close(v);
++        v->reopens++;
++        v->retry_at_ms = 0;
++    }
++    if (v->stream || !v->enabled) {
++        return;
++    }
++    now_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    if (now_ms >= v->retry_at_ms) {
++        aaudio_result_t why = AAUDIO_OK;
++        AAudioStream *stream = aaudio_open(v, v->hw.info.freq,
++                                           v->hw.info.nchannels, v->format,
++                                           &why);
++
++        if (stream) {
++            aaudio_adopt(v, stream);
++            aaudio_start(v);
++        } else {
++            if (!v->open_failure_said) {
++                dolog("no stream: %s; the guest plays unheard, and it is "
++                      "tried again every %d s\n",
++                      AAudio_convertResultToText(why), AAUDIO_RETRY_MS / 1000);
++                v->open_failure_said = true;
++            }
++            v->retry_at_ms = now_ms + AAUDIO_RETRY_MS;
++        }
++    }
++}
++
++/* With no stream the ring empties as if it played. Called with the lock held. */
++static void aaudio_null_play(AAudioVoiceOut *v)
++{
++    HWVoiceOut *hw = &v->hw;
++    int64_t now = aaudio_now_ns();
++    int64_t frames = (now - v->null_since_ns) * hw->info.freq / 1000000000LL;
++    size_t bytes;
++
++    if (frames <= 0) {
++        return;
++    }
++    v->null_since_ns = now;
++    bytes = MIN((size_t)frames * hw->info.bytes_per_frame, hw->pending_emul);
++    hw->pending_emul -= bytes;
++}
++
++static size_t aaudio_buffer_get_free(HWVoiceOut *hw)
++{
++    AAudioVoiceOut *v = (AAudioVoiceOut *)hw;
++    size_t ret;
++
++    aaudio_service(v);
++    qemu_mutex_lock(&v->lock);
++    if (!v->stream) {
++        aaudio_null_play(v);
++    }
++    ret = audio_generic_buffer_get_free(hw);
++    qemu_mutex_unlock(&v->lock);
++    return ret;
++}
++
++static void *aaudio_get_buffer_out(HWVoiceOut *hw, size_t *size)
++{
++    AAudioVoiceOut *v = (AAudioVoiceOut *)hw;
++    void *ret;
++
++    qemu_mutex_lock(&v->lock);
++    ret = audio_generic_get_buffer_out(hw, size);
++    qemu_mutex_unlock(&v->lock);
++    return ret;
++}
++
++static size_t aaudio_put_buffer_out(HWVoiceOut *hw, void *buf, size_t size)
++{
++    AAudioVoiceOut *v = (AAudioVoiceOut *)hw;
++    size_t ret;
++
++    qemu_mutex_lock(&v->lock);
++    ret = audio_generic_put_buffer_out(hw, buf, size);
++    v->frames_in += ret / hw->info.bytes_per_frame;
++    qemu_mutex_unlock(&v->lock);
++    return ret;
++}
++
++/* A second after the guest stopped: what was in the ring has been played. */
++static void aaudio_linger_done(void *opaque)
++{
++    AAudioVoiceOut *v = opaque;
++
++    aaudio_service(v);
++    if (v->enabled) {
++        return;
++    }
++    if (v->stream && v->started) {
++        AAudioStream_requestStop(v->stream);
++        v->started = false;
++    }
++    qemu_mutex_lock(&v->lock);
++    v->hw.pending_emul = 0;
++    v->primed = false;
++    qemu_mutex_unlock(&v->lock);
++}
++
++static void aaudio_enable_out(HWVoiceOut *hw, bool enable)
++{
++    AAudioVoiceOut *v = (AAudioVoiceOut *)hw;
++
++    qemu_mutex_lock(&v->lock);
++    v->enabled = enable;
++    v->null_since_ns = aaudio_now_ns();
++    qemu_mutex_unlock(&v->lock);
++    if (enable) {
++        timer_del(v->linger);
++        aaudio_service(v);
++        aaudio_start(v);
++    } else {
++        timer_mod(v->linger, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
++                             AAUDIO_LINGER_MS);
++    }
++}
++
++static int aaudio_init_out(HWVoiceOut *hw, struct audsettings *as,
++                           void *drv_opaque)
++{
++    AAudioVoiceOut *v = (AAudioVoiceOut *)hw;
++    Audiodev *dev = drv_opaque;
++    AudiodevPerDirectionOptions *pdo = dev->u.aaudio.out;
++    struct audsettings obt = *as;
++    aaudio_result_t why = AAUDIO_OK;
++    AAudioStream *stream;
++
++    qemu_mutex_init(&v->lock);
++    v->dev = dev;
++    v->bursts = dev->u.aaudio.has_bursts ? MAX(1, dev->u.aaudio.bursts) : 2;
++    v->device_latency_us = -1;
++    v->ring_latency_us = -1;
++    v->line_ns = aaudio_now_ns();
++    v->null_since_ns = v->line_ns;
++    v->linger = timer_new_ms(QEMU_CLOCK_REALTIME, aaudio_linger_done, v);
++
++    obt.endianness = AUDIO_HOST_ENDIANNESS;
++    if (obt.nchannels < 1 || obt.nchannels > 2) {
++        obt.nchannels = 2;
++    }
++    switch (obt.fmt) {
++    case AUDIO_FORMAT_S16:
++        v->format = AAUDIO_FORMAT_PCM_I16;
++        break;
++    case AUDIO_FORMAT_S32:
++        v->format = AAUDIO_FORMAT_PCM_I32;
++        break;
++    default:
++        obt.fmt = AUDIO_FORMAT_F32;
++        v->format = AAUDIO_FORMAT_PCM_FLOAT;
++        break;
++    }
++
++    stream = aaudio_open(v, obt.freq, obt.nchannels, v->format, &why);
++    if (!stream && v->format != AAUDIO_FORMAT_PCM_I16) {
++        dolog("no %s stream at %d Hz (%s): trying s16\n",
++              aaudio_format_name(v->format), obt.freq,
++              AAudio_convertResultToText(why));
++        stream = aaudio_open(v, obt.freq, obt.nchannels,
++                             AAUDIO_FORMAT_PCM_I16, &why);
++        if (stream) {
++            obt.fmt = AUDIO_FORMAT_S16;
++            v->format = AAUDIO_FORMAT_PCM_I16;
++        }
++    }
++
++    audio_pcm_init_info(&hw->info, &obt);
++    hw->samples = audio_buffer_frames(pdo, &obt, AAUDIO_RING_USECS);
++    if (stream) {
++        aaudio_adopt(v, stream);
++        /* The callback takes a burst at a time, more on a slow path. */
++        hw->samples = MAX(hw->samples, (size_t)4 * v->burst);
++    } else {
++        /* The VM starts all the same; aaudio_service() goes on trying. */
++        dolog("no stream: %s; the guest plays unheard until one opens\n",
++              AAudio_convertResultToText(why));
++        v->open_failure_said = true;
++    }
++    dolog("ring of %zu frames (%zu ms) between QEMU and the callback\n",
++          hw->samples, hw->samples * 1000 / hw->info.freq);
++
++    pthread_mutex_lock(&aaudio_voice_lock);
++    aaudio_voice = v;
++    pthread_mutex_unlock(&aaudio_voice_lock);
++    return 0;
++}
++
++static void aaudio_fini_out(HWVoiceOut *hw)
++{
++    AAudioVoiceOut *v = (AAudioVoiceOut *)hw;
++
++    pthread_mutex_lock(&aaudio_voice_lock);
++    if (aaudio_voice == v) {
++        aaudio_voice = NULL;
++    }
++    pthread_mutex_unlock(&aaudio_voice_lock);
++    timer_free(v->linger);
++    aaudio_close(v);
++    qemu_mutex_destroy(&v->lock);
++}
++
++/*
++ * How late a frame leaving the ring is heard, from AAudio's account of a
++ * frame it has presented; -1 where the stream gives none (it is not
++ * playing, or the device does not say). Called with the lock held.
++ */
++static int64_t aaudio_measure_device_latency(AAudioVoiceOut *v)
++{
++    int64_t position, at_ns, written, frames;
++    int32_t rate = v->hw.info.freq;
++
++    if (!v->stream ||
++        AAudioStream_getState(v->stream) != AAUDIO_STREAM_STATE_STARTED ||
++        AAudioStream_getTimestamp(v->stream, CLOCK_MONOTONIC, &position,
++                                  &at_ns) != AAUDIO_OK) {
++        return -1;
++    }
++    written = AAudioStream_getFramesWritten(v->stream);
++    frames = written - (position + (aaudio_now_ns() - at_ns) * rate /
++                                   1000000000LL);
++    if (frames < 0 || frames > rate * 2) {
++        return -1;
++    }
++    return frames * 1000000LL / rate;
++}
++
++static const char *aaudio_state_word(AAudioVoiceOut *v)
++{
++    if (!v->stream) {
++        return "no stream";
++    }
++    switch (AAudioStream_getState(v->stream)) {
++    case AAUDIO_STREAM_STATE_STARTING:
++    case AAUDIO_STREAM_STATE_STARTED:
++        return "started";
++    case AAUDIO_STREAM_STATE_STOPPING:
++    case AAUDIO_STREAM_STATE_STOPPED:
++        return "stopped";
++    case AAUDIO_STREAM_STATE_OPEN:
++        return "open";
++    case AAUDIO_STREAM_STATE_DISCONNECTED:
++        return "disconnected";
++    default:
++        return "other";
++    }
++}
++
++/*
++ * For the app's log: the stream, and what was played since the last call.
++ * Empty when there is no voice, and when nothing has happened since a line
++ * was last written. Returns the length written, at most `capacity`.
++ */
++size_t vphone_android_audio_line(uint8_t *out, size_t capacity);
++size_t vphone_android_audio_line(uint8_t *out, size_t capacity)
++{
++    AAudioVoiceOut *v;
++    char line[640];
++    int n = 0;
++
++    pthread_mutex_lock(&aaudio_voice_lock);
++    v = aaudio_voice;
++    if (v) {
++        int64_t now = aaudio_now_ns();
++        int rate = v->hw.info.freq;
++        int32_t xruns;
++        int64_t device;
++
++        qemu_mutex_lock(&v->lock);
++        xruns = v->stream ? AAudioStream_getXRunCount(v->stream) : 0;
++        device = aaudio_measure_device_latency(v);
++        if (device >= 0) {
++            v->device_latency_us = device;
++        }
++        if (v->fill_count) {
++            v->ring_latency_us = v->fill_sum / v->fill_count * 1000000LL / rate;
++        }
++        if (!v->said || v->frames_in || v->frames_out || v->underruns ||
++            v->starts || v->reopens || xruns != v->xruns_said) {
++            char latency[96] = "latency not measured yet";
++
++            if (v->device_latency_us >= 0 && v->ring_latency_us >= 0) {
++                snprintf(latency, sizeof(latency),
++                         "latency %" PRId64 " ms (ring %" PRId64
++                         " + device %" PRId64 ")",
++                         (v->ring_latency_us + v->device_latency_us) / 1000,
++                         v->ring_latency_us / 1000,
++                         v->device_latency_us / 1000);
++            }
++            n = snprintf(line, sizeof(line),
++                         "aaudio %s%s, %d Hz %s %d ch, burst %d, buffer %d of "
++                         "%d frames, ring %zu; in %.1f s: %" PRIu64
++                         " frames from iOS (%.1f s), %" PRIu64 " played, %"
++                         PRIu64 " underruns (%" PRIu64 " ms silent), %d device "
++                         "xruns, %u starts, %u reopens; %s",
++                         aaudio_state_word(v),
++                         qatomic_read(&aaudio_muted) ? ", muted (no audio focus)"
++                                                     : "",
++                         rate, aaudio_format_name(v->format),
++                         v->hw.info.nchannels, v->burst, v->buffer_frames,
++                         v->capacity_frames, v->hw.samples,
++                         (now - v->line_ns) / 1e9, v->frames_in,
++                         (double)v->frames_in / rate, v->frames_out,
++                         v->underruns, v->frames_gap * 1000 / rate,
++                         xruns - v->xruns_said, v->starts, v->reopens, latency);
++            v->said = true;
++            v->frames_in = v->frames_out = v->frames_gap = v->underruns = 0;
++            v->fill_sum = v->fill_count = 0;
++            v->starts = v->reopens = 0;
++            v->xruns_said = xruns;
++        }
++        v->line_ns = now;
++        qemu_mutex_unlock(&v->lock);
++    }
++    pthread_mutex_unlock(&aaudio_voice_lock);
++
++    if (n <= 0 || !out) {
++        return 0;
++    }
++    n = MIN((size_t)n, MIN(capacity, sizeof(line) - 1));
++    memcpy(out, line, n);
++    return n;
++}
++
++/*
++ * The app's other calls. 0: whether the guest is playing (1 or 0). 1 and 2:
++ * mute and unmute what is heard, for the audio focus; the guest plays on
++ * either way. 3: the time from QEMU's write to the sound, in microseconds,
++ * or -1 while it has not been measured.
++ */
++int64_t vphone_android_audio_ctl(int op);
++int64_t vphone_android_audio_ctl(int op)
++{
++    AAudioVoiceOut *v;
++    int64_t ret = -1;
++
++    switch (op) {
++    case 1:
++        qatomic_set(&aaudio_muted, 1);
++        return 0;
++    case 2:
++        qatomic_set(&aaudio_muted, 0);
++        return 0;
++    }
++    pthread_mutex_lock(&aaudio_voice_lock);
++    v = aaudio_voice;
++    if (v) {
++        qemu_mutex_lock(&v->lock);
++        if (op == 0) {
++            ret = v->enabled;
++        } else if (op == 3 && v->device_latency_us >= 0 &&
++                   v->ring_latency_us >= 0) {
++            ret = v->device_latency_us + v->ring_latency_us;
++        }
++        qemu_mutex_unlock(&v->lock);
++    } else if (op == 0) {
++        ret = 0;
++    }
++    pthread_mutex_unlock(&aaudio_voice_lock);
++    return ret;
++}
++
++static void *aaudio_audio_init(Audiodev *dev, Error **errp)
++{
++    return dev;
++}
++
++static void aaudio_audio_fini(void *opaque)
++{
++}
++
++static struct audio_pcm_ops aaudio_pcm_ops = {
++    .init_out = aaudio_init_out,
++    .fini_out = aaudio_fini_out,
++    /* Through the three below, each of which takes the lock. */
++    .write = audio_generic_write,
++    .buffer_get_free = aaudio_buffer_get_free,
++    .get_buffer_out = aaudio_get_buffer_out,
++    .put_buffer_out = aaudio_put_buffer_out,
++    .enable_out = aaudio_enable_out,
++};
++
++static struct audio_driver aaudio_audio_driver = {
++    .name = "aaudio",
++    .descr = "Android AAudio (playback)",
++    .init = aaudio_audio_init,
++    .fini = aaudio_audio_fini,
++    .pcm_ops = &aaudio_pcm_ops,
++    .max_voices_out = 1,
++    .max_voices_in = 0,
++    .voice_size_out = sizeof(AAudioVoiceOut),
++    .voice_size_in = 0,
++};
++
++static void register_audio_aaudio(void)
++{
++    audio_driver_register(&aaudio_audio_driver);
++}
++type_init(register_audio_aaudio);
+diff --git a/audio/audio.c b/audio/audio.c
+index 89f091bc882371ccc41931a028f7c57ebffbffb3..948e39c9fabb436c204ac71913478f64fea47ef5 100644
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -2012,6 +2012,9 @@ void audio_create_pdos(Audiodev *dev)
+         break
+ 
+         CASE(NONE, none, );
++#ifdef CONFIG_AUDIO_AAUDIO
++        CASE(AAUDIO, aaudio, );
++#endif
+ #ifdef CONFIG_AUDIO_ALSA
+         CASE(ALSA, alsa, Alsa);
+ #endif
+diff --git a/audio/audio_template.h b/audio/audio_template.h
+index c29d79c44392b3c68d17f905928c95f39e931913..8b133b56f940d8d513a0694ebd3a284dcf5a923d 100644
+--- a/audio/audio_template.h
++++ b/audio/audio_template.h
+@@ -344,6 +344,10 @@ AudiodevPerDirectionOptions *glue(audio_get_pdo_, TYPE)(Audiodev *dev)
+     switch (dev->driver) {
+     case AUDIODEV_DRIVER_NONE:
+         return dev->u.none.TYPE;
++#ifdef CONFIG_AUDIO_AAUDIO
++    case AUDIODEV_DRIVER_AAUDIO:
++        return dev->u.aaudio.TYPE;
++#endif
+ #ifdef CONFIG_AUDIO_ALSA
+     case AUDIODEV_DRIVER_ALSA:
+         return qapi_AudiodevAlsaPerDirectionOptions_base(dev->u.alsa.TYPE);
+diff --git a/audio/meson.build b/audio/meson.build
+index 59f0a431d51117b37b3b2c922d9ce7b024a0a5cf..31add63c500037839fe1c9dfb1dff572d61a685f 100644
+--- a/audio/meson.build
++++ b/audio/meson.build
+@@ -12,6 +12,7 @@ system_ss.add(when: dsound, if_true: files('dsoundaudio.c', 'audio_win_int.c'))
+ 
+ audio_modules = {}
+ foreach m : [
++  ['aaudio', aaudio, files('aaudio.c')],
+   ['alsa', alsa, files('alsaaudio.c')],
+   ['oss', oss, files('ossaudio.c')],
+   ['pa', pulse, files('paaudio.c')],
 diff --git a/backends/hostmem-memfd.c b/backends/hostmem-memfd.c
 index 923239f9cf695743dc79bc1bef8b4d9e1c729e5d..79cc0e17a600b5795683dbeb53b6008ba1f814c1 100644
 --- a/backends/hostmem-memfd.c
@@ -2141,7 +2953,7 @@ index 26225f4f1e15b3f4fc5de63108a37e6294c88014..0310d994315a8557877700a02130cca3
   * memory_region_init_ram_from_fd:  Initialize RAM memory region with a
   *                                  mmap-ed backend.
 diff --git a/meson.build b/meson.build
-index 1380d7c4dc98fbccae3d116483eb9f6525226d41..5a237506b3c14b5248e04f6754265e37f61c8d4f 100644
+index 1380d7c4dc98fbccae3d116483eb9f6525226d41..42cfb3ac1c52524385899a69ed7c538065ea1180 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -64,6 +64,8 @@ sh = find_program('sh')
@@ -2175,7 +2987,29 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..5a237506b3c14b5248e04f6754265e37
    if host_os != 'darwin' and cc.links(ucontext_probe)
      supported_backends += ['ucontext']
    endif
-@@ -2400,6 +2408,7 @@ config_host_data.set('CONFIG_GNUTLS_CRYPTO', gnutls_crypto.found())
+@@ -1646,6 +1654,13 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
+                          required: get_option('coreaudio'))
+ endif
+ 
++# Android's native audio API (NDK), for audio/aaudio.c: no pkg-config file, and nothing to
++# enable but naming it in audio_drv_list.
++aaudio = not_found
++if host_is_android and have_system and cc.has_header('aaudio/AAudio.h')
++  aaudio = cc.find_library('aaudio', required: false)
++endif
++
+ opengl = not_found
+ if not get_option('opengl').auto() or have_system
+   epoxy = dependency('epoxy', method: 'pkg-config',
+@@ -2153,6 +2168,7 @@ config_host_data = configuration_data()
+ audio_drivers_selected = []
+ if have_system
+   audio_drivers_available = {
++    'aaudio': aaudio.found(),
+     'alsa': alsa.found(),
+     'coreaudio': coreaudio.found(),
+     'dsound': dsound.found(),
+@@ -2400,6 +2416,7 @@ config_host_data.set('CONFIG_GNUTLS_CRYPTO', gnutls_crypto.found())
  config_host_data.set('CONFIG_GNUTLS_BUG1717_WORKAROUND', gnutls_bug1717_workaround)
  config_host_data.set('CONFIG_TASN1', tasn1.found())
  config_host_data.set('CONFIG_GCRYPT', gcrypt.found())
@@ -2183,7 +3017,7 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..5a237506b3c14b5248e04f6754265e37
  config_host_data.set('CONFIG_NETTLE', nettle.found())
  config_host_data.set('CONFIG_CRYPTO_SM4', crypto_sm4.found())
  config_host_data.set('CONFIG_CRYPTO_SM3', crypto_sm3.found())
-@@ -2498,7 +2507,8 @@ config_host_data.set('CONFIG_ALIGNED_MALLOC', cc.has_function('_aligned_malloc')
+@@ -2498,7 +2515,8 @@ config_host_data.set('CONFIG_ALIGNED_MALLOC', cc.has_function('_aligned_malloc')
  config_host_data.set('CONFIG_VALLOC', cc.has_function('valloc'))
  config_host_data.set('CONFIG_MEMALIGN', cc.has_function('memalign'))
  config_host_data.set('CONFIG_PPOLL', cc.has_function('ppoll'))
@@ -2193,7 +3027,7 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..5a237506b3c14b5248e04f6754265e37
  config_host_data.set('CONFIG_PTHREAD_FCHDIR_NP', cc.has_function('pthread_fchdir_np'))
  config_host_data.set('CONFIG_SENDFILE', cc.has_function('sendfile'))
  config_host_data.set('CONFIG_SETNS', cc.has_function('setns') and cc.has_function('unshare'))
-@@ -3889,6 +3899,20 @@ endif
+@@ -3889,6 +3907,22 @@ endif
  
  traceable = []
  emulators = {}
@@ -2207,14 +3041,16 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..5a237506b3c14b5248e04f6754265e37
 +                 'rvg_android_pointer', 'rvg_android_perf_line']
 +    android_link_args += '-Wl,-u,' + sym
 +  endforeach
-+else
-+  # The map names reims-vgpu's symbols, which a build without it does not have.
++endif
++if not pvg.found() or not aaudio.found()
++  # The map names reims-vgpu's symbols and the AAudio driver's, which a build without them
++  # does not have.
 +  android_link_args += '-Wl,--undefined-version'
 +endif
  foreach target : target_dirs
    config_target = config_target_mak[target]
    target_name = config_target['TARGET_NAME']
-@@ -4002,14 +4026,25 @@ foreach target : target_dirs
+@@ -4002,14 +4036,25 @@ foreach target : target_dirs
        exe_name += '-unsigned'
      endif
  
@@ -2248,10 +3084,27 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..5a237506b3c14b5248e04f6754265e37
  
      if host_os == 'darwin'
        icon = 'pc-bios/qemu.rsrc'
+@@ -4415,6 +4460,7 @@ if host_os not in ['darwin', 'haiku', 'windows']
+   summary_info += {'sndio support':   sndio}
+ elif host_os == 'darwin'
+   summary_info += {'CoreAudio support': coreaudio}
++  summary_info += {'AAudio support':  aaudio}
+ elif host_os == 'windows'
+   summary_info += {'DirectSound support': dsound}
+ endif
 diff --git a/meson_options.txt b/meson_options.txt
-index 17e417da47696dc846f055161643843317935c7a..2acec2f17a686df4d9880c79d4d8162cb7ab20d1 100644
+index 17e417da47696dc846f055161643843317935c7a..63e9cbf73c7cdfa9ef3a3f5b3afd622a7a5cff79 100644
 --- a/meson_options.txt
 +++ b/meson_options.txt
+@@ -19,7 +19,7 @@ option('tls_priority', type : 'string', value : 'NORMAL',
+ option('default_devices', type : 'boolean', value : true,
+        description: 'Include a default selection of devices in emulators')
+ option('audio_drv_list', type: 'array', value: ['default'],
+-       choices: ['alsa', 'coreaudio', 'default', 'dsound', 'jack', 'oss', 'pa', 'pipewire', 'sdl', 'sndio'],
++       choices: ['aaudio', 'alsa', 'coreaudio', 'default', 'dsound', 'jack', 'oss', 'pa', 'pipewire', 'sdl', 'sndio'],
+        description: 'Set audio driver list')
+ option('block_drv_rw_whitelist', type : 'string', value : '',
+        description: 'set block driver read-write whitelist (by default affects only QEMU, not tools like qemu-img)')
 @@ -32,7 +32,7 @@ option('rtsig_map', type : 'string', value : 'NULL',
  option('trace_file', type: 'string', value: 'trace',
         description: 'Trace file prefix for simple backend')
@@ -2261,6 +3114,65 @@ index 17e417da47696dc846f055161643843317935c7a..2acec2f17a686df4d9880c79d4d8162c
         value: 'auto', description: 'coroutine backend to use')
  
  # Everything else can be set via --enable/--disable-* option
+diff --git a/qapi/audio.json b/qapi/audio.json
+index 53142080f7216d967748649ba6e6349212c9222a..b539ebe1ce9483da8714d11603d20f16c9f982fb 100644
+--- a/qapi/audio.json
++++ b/qapi/audio.json
+@@ -438,6 +438,31 @@
+     '*out':  'AudiodevPerDirectionOptions',
+     '*path': 'str' } }
+ 
++##
++# @AudiodevAaudioOptions:
++#
++# Options of the AAudio backend (Android's native audio API).  It
++# plays; it does not record.
++#
++# @in: options of the capture stream, which the backend does not
++#     have
++#
++# @out: options of the playback stream.  @buffer-length is the
++#     length of the buffer between QEMU and AAudio's callback, 40 ms
++#     by default
++#
++# @bursts: the size of AAudio's own buffer, in bursts of the device
++#     (default 2)
++#
++# Since: 10.0
++##
++{ 'struct': 'AudiodevAaudioOptions',
++  'data': {
++    '*in':     'AudiodevPerDirectionOptions',
++    '*out':    'AudiodevPerDirectionOptions',
++    '*bursts': 'uint32' },
++  'if': 'CONFIG_AUDIO_AAUDIO' }
++
+ ##
+ # @AudioFormat:
+ #
+@@ -469,10 +494,13 @@
+ #
+ # @jack: JACK audio backend (since 5.1)
+ #
++# @aaudio: Android's AAudio backend, playback only (vphone)
++#
+ # Since: 4.0
+ ##
+ { 'enum': 'AudiodevDriver',
+   'data': [ 'none',
++            { 'name': 'aaudio', 'if': 'CONFIG_AUDIO_AAUDIO' },
+             { 'name': 'alsa', 'if': 'CONFIG_AUDIO_ALSA' },
+             { 'name': 'coreaudio', 'if': 'CONFIG_AUDIO_COREAUDIO' },
+             { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
+@@ -508,6 +536,8 @@
+   'discriminator': 'driver',
+   'data': {
+     'none':      'AudiodevGenericOptions',
++    'aaudio':    { 'type': 'AudiodevAaudioOptions',
++                   'if': 'CONFIG_AUDIO_AAUDIO' },
+     'alsa':      { 'type': 'AudiodevAlsaOptions',
+                    'if': 'CONFIG_AUDIO_ALSA' },
+     'coreaudio': { 'type': 'AudiodevCoreaudioOptions',
 diff --git a/qapi/qom.json b/qapi/qom.json
 index c483fda69e5baedb2da63b67a268e7512b73af48..1f003b1bc820a089482ddbd59ca91651b8c96471 100644
 --- a/qapi/qom.json
@@ -2285,12 +3197,28 @@ index c483fda69e5baedb2da63b67a268e7512b73af48..1f003b1bc820a089482ddbd59ca91651
    'if': 'CONFIG_LINUX' }
  
  ##
+diff --git a/scripts/meson-buildoptions.sh b/scripts/meson-buildoptions.sh
+index b91ccc7fba78c59de16e9e9a5c8ed777f046b024..17e31910c041df015a04cd6d518d74e0208b81d3 100644
+--- a/scripts/meson-buildoptions.sh
++++ b/scripts/meson-buildoptions.sh
+@@ -1,8 +1,8 @@
+ # This file is generated by meson-buildoptions.py, do not edit!
+ meson_options_help() {
+-  printf "%s\n" '  --audio-drv-list=CHOICES Set audio driver list [default] (choices: alsa/co'
+-  printf "%s\n" '                           reaudio/default/dsound/jack/oss/pa/pipewire/sdl/s'
+-  printf "%s\n" '                           ndio)'
++  printf "%s\n" '  --audio-drv-list=CHOICES Set audio driver list [default] (choices: aaudio/'
++  printf "%s\n" '                           alsa/coreaudio/default/dsound/jack/oss/pa/pipewi'
++  printf "%s\n" '                           re/sdl/sndio)'
+   printf "%s\n" '  --bindir=VALUE           Executable directory [bin]'
+   printf "%s\n" '  --block-drv-ro-whitelist=VALUE'
+   printf "%s\n" '                           set block driver read-only whitelist (by default'
 diff --git a/system/android-exports.map b/system/android-exports.map
 new file mode 100644
-index 0000000000000000000000000000000000000000..2423645b318c077e8387b5d19e65c00034bfd6a4
+index 0000000000000000000000000000000000000000..6bf6548e1735908868242d8e7dbd9a4e89c7ed8a
 --- /dev/null
 +++ b/system/android-exports.map
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,19 @@
 +/*
 + * What libqemu-vphone.so shows to the app: QEMU's entry point and the entry
 + * points the app calls in reims-vgpu's static library.
@@ -2305,6 +3233,8 @@ index 0000000000000000000000000000000000000000..2423645b318c077e8387b5d19e65c000
 +    vphone_android_cpu_line;
 +    vphone_android_touch_mark;
 +    vphone_android_touch_line;
++    vphone_android_audio_line;
++    vphone_android_audio_ctl;
 +  local:
 +    *;
 +};

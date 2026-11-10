@@ -728,6 +728,10 @@ class MainActivity : Activity() {
             text = "Network (internet for iOS through this phone's connection; IPv4 only)"
             isChecked = config.optBoolean("network", true)
         }
+        val sound = CheckBox(this).apply {
+            text = "Sound (iOS plays through this phone's speaker or headphones; no microphone)"
+            isChecked = config.optBoolean("sound", true)
+        }
         val display = CheckBox(this).apply {
             text = "Show the screen (off: iOS runs with nothing drawn)"
             isChecked = config.optBoolean("display", true)
@@ -767,6 +771,7 @@ class MainActivity : Activity() {
         labelled(form, "Performance", performance)
         form.addView(hints)
         form.addView(network)
+        form.addView(sound)
         labelled(
             form,
             "iOS background services. Fewer leave more of the emulated CPUs to the screen. A change is " +
@@ -797,6 +802,7 @@ class MainActivity : Activity() {
                     .put("performanceHints", hints.isChecked)
                     .put("services", servicesValues[services.selectedItemPosition.coerceIn(0, 2)])
                     .put("network", network.isChecked)
+                    .put("sound", sound.isChecked)
                     .put("display", display.isChecked)
                     .put("gpuCompression", compression.isChecked)
                     .put("gpuDiagnostics", diagnostics.isChecked)

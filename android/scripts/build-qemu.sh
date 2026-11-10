@@ -49,6 +49,9 @@ configure_args=(
   --enable-nettle --disable-gnutls --disable-gcrypt --enable-png
   # The user-mode network (NAT): the guest's way to the internet through the app's sockets.
   --enable-slirp
+  # Sound: the guest's virtio sound device plays through Android's AAudio (qemu/audio/aaudio.c),
+  # which is in the NDK and needs nothing built.
+  --audio-drv-list=aaudio
   $pvg
 )
 # A build directory configured with other options is configured again: QEMU's configure drops
@@ -64,6 +67,7 @@ if [ ! -f "$QBUILD/build.ninja" ] || [ "$(cat "$configured" 2>/dev/null)" != "$w
   printf '%s\n' "$wanted" > "$configured"
 fi
 grep -q '^#define CONFIG_SLIRP' "$QBUILD/config-host.h" || { echo "QEMU was configured without slirp" >&2; exit 1; }
+grep -q '^#define CONFIG_AUDIO_AAUDIO' "$QBUILD/config-host.h" || { echo "QEMU was configured without the AAudio driver" >&2; exit 1; }
 
 ninja -C "$QBUILD" -j"$JOBS" libqemu-vphone.so
 

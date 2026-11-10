@@ -119,6 +119,12 @@ pub(crate) struct Qemu {
     /// events' time went on their way to the guest since the last call. Absent in an older QEMU.
     touch_mark: Option<unsafe extern "C" fn(u32, i64, i64)>,
     touch_line: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
+    /// `vphone_android_audio_line`: the AAudio stream and what it played since the last call
+    /// (empty when nothing happened), and `vphone_android_audio_ctl`: 0 whether the guest is
+    /// playing, 1 and 2 mute and unmute what is heard, 3 the time from QEMU's write to the sound
+    /// in microseconds or -1 (`qemu/audio/aaudio.c`). Absent in an older QEMU.
+    audio_line: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
+    audio_ctl: Option<unsafe extern "C" fn(c_int) -> i64>,
 }
 static QEMU: OnceLock<Qemu> = OnceLock::new();
 
@@ -289,6 +295,8 @@ pub(crate) fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
             cpu_line: dlsym(h, c"vphone_android_cpu_line").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
             touch_mark: dlsym(h, c"vphone_android_touch_mark").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
             touch_line: dlsym(h, c"vphone_android_touch_line").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
+            audio_line: dlsym(h, c"vphone_android_audio_line").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
+            audio_ctl: dlsym(h, c"vphone_android_audio_ctl").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
         }
     };
     Ok(QEMU.get_or_init(|| q))
@@ -462,6 +470,11 @@ fn start(name: &str) -> Result<(), String> {
     if !cfg.display {
         notice("This VM's screen is off in its settings: iOS runs, and nothing is drawn".into());
     }
+    log_line(if cfg.sound {
+        "sound: a virtio sound device for iOS, played through Android's AAudio at 48 kHz"
+    } else {
+        "sound: off in this VM's settings; the machine has no sound device"
+    });
     log_line(&if cfg.network {
         crate::net::boot_line(paths)
     } else {
@@ -551,6 +564,7 @@ fn start(name: &str) -> Result<(), String> {
     }
     let services = cfg.services;
     let network = cfg.network;
+    let sound = cfg.sound;
     let vm_dir = dir.clone();
     std::thread::Builder::new()
         .name("vphoned-watch".into())
@@ -559,6 +573,11 @@ fn start(name: &str) -> Result<(), String> {
             if watch(client.clone()) {
                 if network {
                     network_line(&client);
+                }
+                if sound {
+                    // Whether iOS has the sound driver, and what it did with the sound device.
+                    let rpc = |method: &str, params: serde_json::Value| client.rpc(method, params, Duration::from_secs(60));
+                    log_line(&crate::audio::check(&rpc));
                 }
                 // After the unlock, which the user waits for; the guest's agent is up.
                 crate::services::apply(&client, &vm_dir, services, &|line| {
@@ -647,6 +666,41 @@ fn touch_line(qemu: &Qemu) -> String {
     }
 }
 
+/// QEMU's line of the sound it played since the last call; empty when it played none, and for
+/// a VM without sound.
+fn audio_line(qemu: &Qemu) -> String {
+    let Some(line) = qemu.audio_line else {
+        return String::new();
+    };
+    let mut buffer = vec![0u8; 1024];
+    // SAFETY: the buffer holds the capacity given; the call writes at most that.
+    let written = unsafe { line(buffer.as_mut_ptr(), buffer.len()) };
+    buffer.truncate(written.min(buffer.len()));
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// `vphone_android_audio_ctl(op)` of the running QEMU; `None` without one that has it.
+fn audio_ctl(op: c_int) -> Option<i64> {
+    let ctl = qemu_running()?.audio_ctl?;
+    // SAFETY: the call takes the operation's number and touches QEMU's sound backend under
+    // its own locks.
+    Some(unsafe { ctl(op) })
+}
+
+/// Whether iOS is playing a sound now, for the app's audio focus.
+pub fn audio_playing() -> bool {
+    audio_ctl(0) == Some(1)
+}
+
+/// Silences what the phone plays of the VM, or lets it be heard again: iOS plays on either
+/// way. For when another app has the audio focus.
+pub fn set_audio_muted(muted: bool) {
+    audio_ctl(if muted { 1 } else { 2 });
+}
+
+/// How often the sound driver's counters in the guest are read at most: its log can be 4 MiB.
+const GUEST_SOUND_EVERY: Duration = Duration::from_secs(120);
+
 /// How many 16 KiB pages of guest code are dumped in one run: each is a line of the log.
 const CODE_PAGES_SAID: usize = 12;
 /// The words dumped before a PC and from it on.
@@ -688,6 +742,11 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
     let mut last_top: Option<(Instant, vphone_create_steps::firstboot::CpuTimes)> = None;
     let mut code_said: Vec<u64> = Vec::new();
     let agent = Client::new(&paths.vsock_socket());
+    // Sound: the latency the guest has stored, the last of its driver's counters said, and when
+    // they were last read.
+    let mut guest_latency: Option<f64> = None;
+    let mut guest_sound = String::new();
+    let mut guest_sound_read: Option<Instant> = None;
     while sleep_until_done(STATUS_EVERY) {
         let s = state();
         let elapsed = crate::create::state::now_ms().saturating_sub(s.started_ms) / 1000;
@@ -725,6 +784,25 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
         // Where the touches' time went between the screen and the guest's read of them.
         if let Some(line) = QEMU.get().map(touch_line).filter(|l| !l.is_empty()) {
             log_line(&format!("touch {at} {line}"));
+        }
+        // The sound played since the last line: said only when there was some.
+        if let Some(line) = QEMU.get().map(audio_line).filter(|l| !l.is_empty()) {
+            log_line(&format!("audio {at} {line}"));
+            if s.phase == Phase::Running {
+                let rpc = |method: &str, params: serde_json::Value| agent.rpc(method, params, Duration::from_secs(30));
+                // How late the phone plays, for the guest's players to hold their picture by.
+                if let Some(line) = crate::audio::sync_latency(&rpc, audio_ctl(3).unwrap_or(-1), &mut guest_latency) {
+                    log_line(&line);
+                }
+                // The guest's own count of the sound that just ended: its writes, and the
+                // ones that found the device with nothing left to play.
+                if !audio_playing() && guest_sound_read.is_none_or(|t| t.elapsed() >= GUEST_SOUND_EVERY) {
+                    guest_sound_read = Some(Instant::now());
+                    if let Some(line) = crate::audio::guest_run(&rpc, &mut guest_sound) {
+                        log_line(&format!("audio {at} iOS's driver, its last sound: {line}"));
+                    }
+                }
+            }
         }
         // Which of the guest's processes used its CPUs since the last line, once its agent is up.
         if matches!(s.phase, Phase::Unlocking | Phase::Running) {

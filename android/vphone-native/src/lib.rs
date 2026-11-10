@@ -1,6 +1,7 @@
 //! The native half of the vphone Android app: everything that is not an Android framework call.
 //! Kotlin holds the Activity, the Service and SAF, and calls into [`jni_api`].
 
+pub mod audio;
 pub mod bundle;
 pub mod config;
 pub mod create;

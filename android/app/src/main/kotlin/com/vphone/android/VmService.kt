@@ -115,7 +115,9 @@ class VmService : Service() {
                 if (vmActive && phase in ENDED) {
                     vmActive = false
                     VmNetwork.stop(this)
+                    VmAudio.stop(this)
                 }
+                if (vmActive) VmAudio.tick(this)
                 if (!vmActive && !importing && !transferring) break
                 val text = when {
                     importing -> importText()

@@ -28,6 +28,9 @@ object Native {
     external fun layoutImage(width: Int, height: Int): IntArray
     /** [eventNanos] is `MotionEvent.getEventTimeNanos`: when Android read the touch. */
     external fun touch(action: Int, x: Float, y: Float, eventNanos: Long)
+    /** Whether iOS is playing a sound now, and silencing what this phone plays of it: see [VmAudio]. */
+    external fun audioPlaying(): Boolean
+    external fun setAudioMuted(muted: Boolean)
     external fun home()
     external fun lock()
     external fun importBegin(folder: String, totalBytes: Long): String

@@ -99,6 +99,10 @@ pub struct VmConfig {
     /// the app's own sockets, IPv4 only. Off, iOS still has its network card, with nothing on
     /// the other end, as every VM had before 0.6.4.
     pub network: bool,
+    /// Give the VM a sound device (virtio-snd, which iOS's `AppleVirtIOSound` and the CFW's HAL
+    /// plugin drive) that plays on this phone through AAudio. Off, the machine has no sound
+    /// device, as every VM had before 0.6.5, and iOS has no audio route.
+    pub sound: bool,
 }
 
 impl Default for VmConfig {
@@ -134,6 +138,7 @@ impl VmConfig {
             software_display: false,
             services: crate::services::Level::Unchanged,
             network: true,
+            sound: true,
         }
     }
 
@@ -282,6 +287,17 @@ mod tests {
         let off: VmConfig = serde_json::from_str(r#"{"network":false}"#).unwrap();
         assert!(!off.network);
         assert!(serde_json::to_string(&off).unwrap().contains(r#""network":false"#));
+    }
+
+    /// Settings saved before sound had a setting get sound.
+    #[test]
+    fn sound_is_on_unless_a_file_says_otherwise() {
+        assert!(VmConfig::for_phone(11 * 1024, 8).sound);
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"version":2,"network":false}"#).unwrap();
+        assert!(old.sound);
+        let off: VmConfig = serde_json::from_str(r#"{"sound":false}"#).unwrap();
+        assert!(!off.sound && off.network);
+        assert!(serde_json::to_string(&off).unwrap().contains(r#""sound":false"#));
     }
 
     /// The GPU switches name the driver's flags.
