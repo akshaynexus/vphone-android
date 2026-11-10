@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.AlertDialog
+import android.app.PendingIntent
 import android.app.ApplicationExitInfo
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -187,6 +188,7 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+        registerReceiver(usbPermission, android.content.IntentFilter(UsbVmSource.ACTION_PERMISSION), RECEIVER_NOT_EXPORTED)
         handleIntent(intent)
     }
 
@@ -220,17 +222,107 @@ class MainActivity : Activity() {
     private fun askImport() {
         AlertDialog.Builder(this)
             .setTitle("Import a VM")
-            .setItems(arrayOf("A .vphone file (sent from another phone)", "A VM folder")) { _, which ->
-                if (which == 0) {
-                    startActivityForResult(
+            .setItems(arrayOf("A .vphone file (sent from another phone)", "From a phone plugged in by USB", "A VM folder")) { _, which ->
+                when (which) {
+                    0 -> startActivityForResult(
                         Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"),
                         PICK_VM_FILE,
                     )
-                } else {
-                    pickFolder()
+                    1 -> usbImport()
+                    else -> pickFolder()
                 }
             }
             .show()
+    }
+
+    private val usbPermission = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context, intent: Intent) {
+            val device = intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE, android.hardware.usb.UsbDevice::class.java) ?: return
+            if (intent.getBooleanExtra(android.hardware.usb.UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                listUsbFiles(device)
+            } else {
+                Toast.makeText(this@MainActivity, "vphone needs USB access to read the other phone", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** A VM from another phone on the cable: that phone in File transfer mode, this one in control. */
+    private fun usbImport() {
+        val devices = UsbVmSource.devices(this)
+        if (devices.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("No phone found on USB")
+                .setMessage(
+                    "1. On the sending phone, open the VM list, tap Send, then Save to… and choose Downloads.\n" +
+                        "2. Connect the two phones with a USB-C cable.\n" +
+                        "3. On the sending phone, tap the USB notification and choose File transfer. Keep it unlocked.\n" +
+                        "4. On this phone, if Android asks, choose USB controlled by: This device.\n" +
+                        "5. Tap Import a VM → From a phone plugged in by USB again.",
+                )
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        if (devices.size == 1) {
+            usbAccess(devices[0])
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Which device?")
+            .setItems(devices.map { UsbVmSource.label(it) }.toTypedArray()) { _, i -> usbAccess(devices[i]) }
+            .show()
+    }
+
+    private fun usbAccess(device: android.hardware.usb.UsbDevice) {
+        val usb = getSystemService(android.hardware.usb.UsbManager::class.java)
+        if (usb.hasPermission(device)) {
+            listUsbFiles(device)
+            return
+        }
+        val pending = PendingIntent.getBroadcast(
+            this, 5, Intent(UsbVmSource.ACTION_PERMISSION).setPackage(packageName), PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        usb.requestPermission(device, pending)
+    }
+
+    private fun listUsbFiles(device: android.hardware.usb.UsbDevice) {
+        Toast.makeText(this, "Looking for .vphone files on ${UsbVmSource.label(device)}", Toast.LENGTH_SHORT).show()
+        Thread {
+            val result = runCatching {
+                val mtp = UsbVmSource.open(this, device)
+                try { UsbVmSource.find(mtp, device.deviceName) } finally { mtp.close() }
+            }
+            handler.post {
+                result.exceptionOrNull()?.let {
+                    AlertDialog.Builder(this).setTitle("Cannot read ${UsbVmSource.label(device)}").setMessage(it.message ?: it.toString())
+                        .setPositiveButton("OK", null).setNeutralButton("Copy") { _, _ -> App.copy(this, it.message ?: it.toString()) }.show()
+                    return@post
+                }
+                val files = result.getOrThrow()
+                if (files.isEmpty()) {
+                    AlertDialog.Builder(this).setTitle("No VM files on ${UsbVmSource.label(device)}")
+                        .setMessage("No .vphone file was found in its shared folders. On that phone, use Send → Save to… → Downloads, then try again.")
+                        .setPositiveButton("OK", null).show()
+                    return@post
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Import from ${UsbVmSource.label(device)}")
+                    .setItems(files.map { "${it.name}  (${it.size / MIB} MB, ${it.folder})" }.toTypedArray()) { _, i ->
+                        if (JSONObject(Native.shareProgress()).optBoolean("active")) {
+                            Toast.makeText(this, "Another VM is being sent or received", Toast.LENGTH_LONG).show()
+                        } else {
+                            VmService.receiveVmFromUsb(this, files[i])
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }.start()
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(usbPermission) }
+        super.onDestroy()
     }
 
     private fun confirmReceive(uri: Uri) {
