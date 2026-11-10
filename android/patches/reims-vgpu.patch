@@ -1122,10 +1122,18 @@ index 2f03c4ea6340c18d1148e7047c320f1a28453ca6..544818a87a76aedefd0ebf7864e54ae2
      let request = util_floor_request(floor);
      // SAFETY: the calling thread's attributes, from a live `sched_attr` of the size it names.
 diff --git a/crates/reims-vgpu-vulkan/src/os/linux/import.rs b/crates/reims-vgpu-vulkan/src/os/linux/import.rs
-index 2a3ae16e4ac57ae54b88e30af35ebdf7f0f6b9a4..b201a5f20f93fc95def4339c76f809d30fb97286 100644
+index 2a3ae16e4ac57ae54b88e30af35ebdf7f0f6b9a4..1cb68be943def13e3e380758e2637b6d120878b6 100644
 --- a/crates/reims-vgpu-vulkan/src/os/linux/import.rs
 +++ b/crates/reims-vgpu-vulkan/src/os/linux/import.rs
-@@ -989,7 +989,7 @@ mod tests {
+@@ -441,6 +441,7 @@ impl Drop for Twin {
+         // SAFETY: the twin's own mapping, which the runtime let go of (it freed the import and
+         // dropped its keep-alive, or the call that would import it was refused).
+         unsafe { libc::munmap(vm::ptr(self.first), self.length.to_usize()) };
++        vm::mappings_changed(self.first, self.length);
+         budget::twins_hold(self.mappings, false);
+     }
+ }
+@@ -989,7 +990,7 @@ mod tests {
              address: first,
              length: PAGE,
          }];
@@ -1134,7 +1142,7 @@ index 2a3ae16e4ac57ae54b88e30af35ebdf7f0f6b9a4..b201a5f20f93fc95def4339c76f809d3
          let at = alias.first();
          let view = import_view(at, 3 * PAGE);
          let twin = addr(view.at());
-@@ -1007,9 +1007,9 @@ mod tests {
+@@ -1007,9 +1008,9 @@ mod tests {
          assert!(vm.deallocate(guest, PAGE).is_success());
      }
  
@@ -1147,7 +1155,7 @@ index 2a3ae16e4ac57ae54b88e30af35ebdf7f0f6b9a4..b201a5f20f93fc95def4339c76f809d3
      #[test]
      fn a_gather_of_pages_without_a_file_is_the_hosts_refusal() {
          use reims_vgpu_core::platform::types::ResourceAddressRange;
-@@ -1022,9 +1022,6 @@ mod tests {
+@@ -1022,9 +1023,6 @@ mod tests {
              address: at.addr().to_u64(),
              length: PAGE,
          }];
@@ -1189,7 +1197,7 @@ index 3ffff61013765ff8e7e7d632d0e303bb52f464be..61cb2e112adaa873e972816a452fc40e
      /// one range, or of its own memory, has no view to lend
      #[test]
 diff --git a/crates/reims-vgpu-vulkan/src/os/linux/vm.rs b/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
-index a80f3599661b3926d6b523f98a5e7a196fb8e99b..38328439ee02d0ab580bd1c1e45b123d652e0f12 100644
+index a80f3599661b3926d6b523f98a5e7a196fb8e99b..aef3276d4517512c4d68474e2363e4b4145f8983 100644
 --- a/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
 +++ b/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
 @@ -14,7 +14,7 @@
@@ -1217,7 +1225,80 @@ index a80f3599661b3926d6b523f98a5e7a196fb8e99b..38328439ee02d0ab580bd1c1e45b123d
      (mappings, limit)
  }
  
-@@ -1038,25 +1039,25 @@ impl HostVm for LinuxVm {
+@@ -442,6 +443,16 @@ fn prot_bits(prot: VmProt) -> i32 {
+     prot.raw() & (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC)
+ }
+ 
++/// Tells the Vulkan runtime that the process's mappings over `length` bytes at `first` changed
++/// (`rt::host_mappings_changed`): said after every `mmap`, `munmap` and `mprotect` this library
++/// makes of memory it may hand the runtime, whether or not the call took. Where the kernel
++/// refuses the runtime `PROCMAP_QUERY` (an Android app's process) it keeps its last reading of
++/// `/proc/self/maps` and answers from it only where no change was said since, so a change not
++/// said here could leave it believing a page writable that no longer is.
++pub(super) fn mappings_changed(first: u64, length: u64) {
++    metal2vulkan_runtime::host_mappings_changed(first, length);
++}
++
+ /// A pointer to `at` in the process's address space.
+ pub(super) fn ptr(at: u64) -> *mut libc::c_void {
+     std::ptr::with_exposed_provenance_mut(at.to_usize())
+@@ -464,8 +475,12 @@ pub(super) fn anonymous(at: Option<u64>, length: u64, what: &str) -> Result<u64,
+         )
+     };
+     if mapped == libc::MAP_FAILED {
++        if let Some(at) = at {
++            mappings_changed(at, length);
++        }
+         return Err(refused(what, false));
+     }
++    mappings_changed(mapped.addr().to_u64(), length);
+     Ok(mapped.addr().to_u64())
+ }
+ 
+@@ -492,8 +507,12 @@ pub(super) fn file(
+         )
+     };
+     if mapped == libc::MAP_FAILED {
++        if let Some(at) = at {
++            mappings_changed(at, length);
++        }
+         return Err(refused("a view of guest pages", false));
+     }
++    mappings_changed(mapped.addr().to_u64(), length);
+     Ok(mapped.addr().to_u64())
+ }
+ 
+@@ -571,6 +590,7 @@ impl Drop for OwnMemory {
+         drop(self.registration.take());
+         // SAFETY: the mapping this made, which nothing uses once its holder lets go of it.
+         let _ = unsafe { libc::munmap(ptr(self.first), self.length.to_usize()) };
++        mappings_changed(self.first, self.length);
+         budget::own_hold(1, false);
+     }
+ }
+@@ -679,9 +699,11 @@ fn put_back(at: u64, length: u64) {
+                 mapped
+             })
+         } else {
+-            anonymous(Some(from), to - from, "a failed remap's put-back").is_ok()
++            let put_back = anonymous(Some(from), to - from, "a failed remap's put-back").is_ok()
+                 // SAFETY: the zeros just mapped, a reservation of the remap's caller (above).
+-                && unsafe { libc::mprotect(ptr(from), (to - from).to_usize(), libc::PROT_NONE) } == 0
++                && unsafe { libc::mprotect(ptr(from), (to - from).to_usize(), libc::PROT_NONE) } == 0;
++            mappings_changed(from, to - from);
++            put_back
+         };
+         if !restored {
+             log::error!(
+@@ -813,6 +835,7 @@ fn through(
+                 0,
+             )
+         };
++        mappings_changed(target + buf.at, buf.length);
+         mapped == libc::MAP_FAILED
+     });
+     let mut refusal = None;
+@@ -1038,25 +1061,25 @@ impl HostVm for LinuxVm {
          allocate_aliasable(len)
      }
  
@@ -1255,7 +1336,29 @@ index a80f3599661b3926d6b523f98a5e7a196fb8e99b..38328439ee02d0ab580bd1c1e45b123d
              Ok(())
          })
      }
-@@ -1615,6 +1616,40 @@ pub(crate) mod tests {
+@@ -1159,7 +1182,9 @@ impl HostVm for LinuxVm {
+         }
+         // SAFETY: lowering or raising a range's protection is the caller's decision; a later
+         // access it forbids faults (a process death).
+-        if unsafe { libc::mprotect(ptr(first), length.to_usize(), bits) } != 0 {
++        let protected = unsafe { libc::mprotect(ptr(first), length.to_usize(), bits) };
++        mappings_changed(first, length);
++        if protected != 0 {
+             return Err(refused("protect_max", true));
+         }
+         files::protect(first, length, bits);
+@@ -1192,7 +1217,9 @@ impl HostVm for LinuxVm {
+             let _views = views();
+             files::forget(at, now);
+             // SAFETY: the range is one core allocated and no longer uses (its owner's drop).
+-            if unsafe { libc::munmap(ptr(at), now.to_usize()) } != 0 {
++            let unmapped = unsafe { libc::munmap(ptr(at), now.to_usize()) };
++            mappings_changed(at, now);
++            if unmapped != 0 {
+                 return refused("deallocate", true);
+             }
+             at += now;
+@@ -1615,6 +1642,40 @@ pub(crate) mod tests {
          }
      }
  
@@ -1296,7 +1399,7 @@ index a80f3599661b3926d6b523f98a5e7a196fb8e99b..38328439ee02d0ab580bd1c1e45b123d
      /// A view of more mappings than a piece of a deallocation holds, and a part piece past them,
      /// is unmapped and forgotten whole, and the pages either side of it stay mapped
      #[test]
-@@ -1851,10 +1886,10 @@ pub(crate) mod tests {
+@@ -1851,10 +1912,10 @@ pub(crate) mod tests {
      /// An alias of a guest page with zeros past it, as a heap of less than the runtime's 16 KiB
      /// is made over, has a file behind every byte, writable or read-only, so a dma-buf can be
      /// made of all of it, as the runtime asks where the device refuses file pages as host memory
@@ -1309,7 +1412,7 @@ index a80f3599661b3926d6b523f98a5e7a196fb8e99b..38328439ee02d0ab580bd1c1e45b123d
          use reims_vgpu_core::platform::types::ResourceAddressRange;
          let p = page();
          for read_only in [false, true] {
-@@ -1864,7 +1899,7 @@ pub(crate) mod tests {
+@@ -1864,7 +1925,7 @@ pub(crate) mod tests {
                  address: guest.addr().to_u64(),
                  length: p,
              }];
@@ -1333,10 +1436,10 @@ index 55921c3f35ad4826e945ee8c9e6b5c0c9fbfdbf4..c83407395ec27de4cd7603509f6e0efc
              (in_view, in_view),
 diff --git a/crates/reims-vgpu-vulkan/src/perf_counts.rs b/crates/reims-vgpu-vulkan/src/perf_counts.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..0fe01a8284f34b7b4ac28ad187b288b65f032b76
+index 0000000000000000000000000000000000000000..8e5fddaaa4eb7804bab878a982e489e39d1d5525
 --- /dev/null
 +++ b/crates/reims-vgpu-vulkan/src/perf_counts.rs
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,110 @@
 +//! The runtime's work counts a host's frame-path line reads (`reims_vgpu::perf_line`): the few
 +//! of `rt::WorkCounts` that say where a frame's host time went, from the first device adopted. A
 +//! diagnostic: nothing here is read unless a host asks, and a reading has the runtime settle its
@@ -1383,6 +1486,14 @@ index 0000000000000000000000000000000000000000..0fe01a8284f34b7b4ac28ad187b288b6
 +    pub maps_reads: u64,
 +    /// Nanoseconds those readings took.
 +    pub maps_read_nanos: u64,
++    /// Checks answered from the kept reading instead, with no reading
++    /// (`rt::host_mappings_changed`).
++    pub maps_kept: u64,
++    /// Texels the shadow copies moved into images, and back to the textures' bytes.
++    pub shadow_texels_in: u64,
++    pub shadow_texels_back: u64,
++    /// Shadow copies in that moved nothing: the image still held the bytes.
++    pub shadow_copies_skipped: u64,
 +}
 +
 +impl Counts {
@@ -1404,6 +1515,12 @@ index 0000000000000000000000000000000000000000..0fe01a8284f34b7b4ac28ad187b288b6
 +            mappings_queried: self.mappings_queried.saturating_sub(earlier.mappings_queried),
 +            maps_reads: self.maps_reads.saturating_sub(earlier.maps_reads),
 +            maps_read_nanos: self.maps_read_nanos.saturating_sub(earlier.maps_read_nanos),
++            maps_kept: self.maps_kept.saturating_sub(earlier.maps_kept),
++            shadow_texels_in: self.shadow_texels_in.saturating_sub(earlier.shadow_texels_in),
++            shadow_texels_back: (self.shadow_texels_back)
++                .saturating_sub(earlier.shadow_texels_back),
++            shadow_copies_skipped: (self.shadow_copies_skipped)
++                .saturating_sub(earlier.shadow_copies_skipped),
 +        }
 +    }
 +}
@@ -1427,6 +1544,10 @@ index 0000000000000000000000000000000000000000..0fe01a8284f34b7b4ac28ad187b288b6
 +        mappings_queried: work.host_mappings_queried,
 +        maps_reads,
 +        maps_read_nanos,
++        maps_kept: rt::host_maps_kept_answers(),
++        shadow_texels_in: work.shadow_texels_copied_in,
++        shadow_texels_back: work.shadow_texels_copied_back,
++        shadow_copies_skipped: work.shadow_copies_in_skipped_by_standing,
 +    })
 +}
 diff --git a/crates/reims-vgpu-vulkan/src/remap.rs b/crates/reims-vgpu-vulkan/src/remap.rs
@@ -3075,10 +3196,10 @@ index 8e00fe240133d3e407643e048360f3b459e5ce2b..665e180b80d194b4cd8fe8ad45996499
 +}
 diff --git a/crates/reims-vgpu/src/perf.rs b/crates/reims-vgpu/src/perf.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c2a135966
+index 0000000000000000000000000000000000000000..c4b76687c2cb6c8ac83ab8f1cdeb742696b9dc87
 --- /dev/null
 +++ b/crates/reims-vgpu/src/perf.rs
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,303 @@
 +//! One line saying where a guest frame's time goes, for a host that asks ([`line`]; the Android
 +//! app writes it as `[vphone] gpu ...` every 30 seconds). A diagnostic: nothing the guest sees.
 +//!
@@ -3127,6 +3248,8 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +    /// The guest's presents, and the longest gap between two in nanoseconds; `None` where the
 +    /// statistics are off.
 +    pub guest: Option<(u64, Option<u64>)>,
++    /// The most presents in one second of the reading.
++    pub best: u64,
 +    /// The window's draws, and of those with a GPU time, how many and their nanoseconds.
 +    pub drawn: (u64, u64, u64),
 +    /// How the window presents ([`PRESENTS_WITH`]).
@@ -3163,6 +3286,7 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +        cap_hz,
 +        seconds: taken.map_or(0.0, |t| t.seconds),
 +        guest: taken.map(|t| (t.guest, t.guest_gap)),
++        best: taken.map_or(0, |t| t.guest_best),
 +        drawn: taken.map_or((0, 0, 0), |t| (t.drawn, t.gpu.0, t.gpu.1)),
 +        mode: PRESENTS_WITH.load(Relaxed),
 +        stages: STAGES.map(perf::take),
@@ -3208,7 +3332,7 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +                    if let Some(gap) = gap {
 +                        let _ = write!(out, ", longest gap {:.0} ms", ms(gap));
 +                    }
-+                    out.push(')');
++                    let _ = write!(out, ", best second {} fps)", self.best);
 +                }
 +            }
 +        }
@@ -3274,7 +3398,8 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +                let _ = write!(
 +                    out,
 +                    "; runtime: {:.1} command buffers, submit {}, pipelines {}, host steps {}, \
-+                     held {}, slot waits {}, maps reads {:.1} = {}, shadow copies {:.1}, \
++                     held {}, slot waits {}, maps reads {:.1} = {} (kept answers {:.1}), \
++                     shadow copies {:.1} ({:.2} Mtexel in, {:.2} back, {:.1} skipped), \
 +                     translated {}",
 +                    c.command_buffers as f64 / per,
 +                    share(c.submit_nanos),
@@ -3284,7 +3409,11 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +                    share(c.slot_wait_nanos),
 +                    c.maps_reads as f64 / per,
 +                    share(c.maps_read_nanos),
++                    c.maps_kept as f64 / per,
 +                    c.shadow_copies as f64 / per,
++                    c.shadow_texels_in as f64 / per / 1e6,
++                    c.shadow_texels_back as f64 / per / 1e6,
++                    c.shadow_copies_skipped as f64 / per,
 +                    c.translated
 +                );
 +            }
@@ -3305,6 +3434,7 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +            cap_hz: 120,
 +            seconds: 30.0,
 +            guest: Some((120, Some(800 * MS))),
++            best: 37,
 +            drawn: (120, 120, 240 * MS),
 +            mode: 1,
 +            stages: [
@@ -3321,6 +3451,9 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +                submit_nanos: 120 * 2 * MS,
 +                maps_reads: 600,
 +                maps_read_nanos: 600 * 12 * MS,
++                maps_kept: 1_800,
++                shadow_copies: 240,
++                shadow_texels_in: 120 * 3_000_000,
 +                ..Counts::default()
 +            }),
 +        };
@@ -3328,7 +3461,7 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +        assert!(
 +            line.starts_with(
 +                "guest 4.0 fps of 120 (250.0 ms a frame, 30.0x the 8.3 ms budget, longest gap \
-+                 800 ms); window 4.0 fps MAILBOX; per guest frame: guest 200.0 ms (2400%), \
++                 800 ms, best second 37 fps); window 4.0 fps MAILBOX; per guest frame: guest 200.0 ms (2400%), \
 +                 barriers 10.0 ms (120%), host 50.0 ms (600%) in 75 commands [Debug 25.0 ms \
 +                 x2.0, op400 1.0 ms x1.0]; window acquire 0.1 ms (1%) + encode 0.5 ms (6%) + \
 +                 present 0.2 ms (2%), GPU 2.0 ms a draw; runtime: 10.0 command buffers, submit \
@@ -3336,7 +3469,13 @@ index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c
 +            ),
 +            "{line}"
 +        );
-+        assert!(line.contains("maps reads 5.0 = 60.0 ms (720%)"), "{line}");
++        assert!(
++            line.contains(
++                "maps reads 5.0 = 60.0 ms (720%) (kept answers 15.0), shadow copies 2.0 (3.00 \
++                 Mtexel in, 0.00 back, 0.0 skipped), translated 0"
++            ),
++            "{line}"
++        );
 +    }
 +
 +    #[test]
@@ -3413,10 +3552,10 @@ index c8e3a4ace816b7e54455b153b48393dd52bb13ef..b1773b3868a4dce84936db6e70877640
              continue;
          }
 diff --git a/crates/reims-vgpu/src/stats.rs b/crates/reims-vgpu/src/stats.rs
-index ca66b193a42596f67240f715eb18483411be9577..55a2edab38281505ecdef8b8ec9640a9b6d034f6 100644
+index ca66b193a42596f67240f715eb18483411be9577..13ff44948fed7b26a5890f09cae821196375f60d 100644
 --- a/crates/reims-vgpu/src/stats.rs
 +++ b/crates/reims-vgpu/src/stats.rs
-@@ -56,10 +56,57 @@ const NONE: u64 = u64::MAX;
+@@ -56,10 +56,61 @@ const NONE: u64 = u64::MAX;
  /// Whether the environment turns the statistics on, read once per process. A value that is not
  /// UTF-8 counts as unset.
  fn on() -> bool {
@@ -3445,6 +3584,8 @@ index ca66b193a42596f67240f715eb18483411be9577..55a2edab38281505ecdef8b8ec9640a9
 +    pub(crate) guest: u64,
 +    /// The longest time between two of them, in nanoseconds.
 +    pub(crate) guest_gap: Option<u64>,
++    /// The most of them in one second of the clock.
++    pub(crate) guest_best: u64,
 +    /// The window's draws.
 +    pub(crate) drawn: u64,
 +    /// The window's draws whose GPU time was reported, and those times' sum in nanoseconds.
@@ -3458,6 +3599,7 @@ index ca66b193a42596f67240f715eb18483411be9577..55a2edab38281505ecdef8b8ec9640a9
 +    let stats = live.first()?;
 +    let now = mono_now(&*stats.clock);
 +    let since = stats.since.swap(now, Relaxed);
++    let guest_best = stats.guest.take_best();
 +    let (guest, guest_gap) = stats.guest.take(now);
 +    let (drawn, _) = stats.drawn.take(now);
 +    let gpu = (stats.gpu.count.swap(0, Relaxed), stats.gpu.total.swap(0, Relaxed));
@@ -3466,6 +3608,7 @@ index ca66b193a42596f67240f715eb18483411be9577..55a2edab38281505ecdef8b8ec9640a9
 +        seconds: Duration::from_nanos(now.saturating_sub(since)).as_secs_f64(),
 +        guest,
 +        guest_gap,
++        guest_best,
 +        drawn,
 +        gpu,
 +    })
@@ -3474,7 +3617,48 @@ index ca66b193a42596f67240f715eb18483411be9577..55a2edab38281505ecdef8b8ec9640a9
  /// Whether a switch's value turns it on.
  fn switch(value: &str) -> bool {
      let value = value.trim();
-@@ -297,7 +344,7 @@ fn key<P: Platform>(display: &Weak<CoreDisplay<P>>) -> usize {
+@@ -74,6 +125,12 @@ struct Presents {
+     count: AtomicU64,
+     last: AtomicU64,
+     max_gap: AtomicU64,
++    /// The second of the clock the last frame fell in, the frames in it so far, and the most
++    /// frames any one second held since they were last taken: a period's mean rate hides a
++    /// burst, such as the frames after an unlock in a period that began before it.
++    second: AtomicU64,
++    in_second: AtomicU64,
++    best_second: AtomicU64,
+ }
+ 
+ impl Presents {
+@@ -82,11 +139,27 @@ impl Presents {
+             count: AtomicU64::new(0),
+             last: AtomicU64::new(NONE),
+             max_gap: AtomicU64::new(0),
++            second: AtomicU64::new(NONE),
++            in_second: AtomicU64::new(0),
++            best_second: AtomicU64::new(0),
+         }
+     }
+ 
++    /// The most frames one second of the clock held since this was last asked; starts anew.
++    fn take_best(&self) -> u64 {
++        let open = self.in_second.load(Relaxed);
++        self.best_second.swap(0, Relaxed).max(open)
++    }
++
+     /// A frame at `now`.
+     fn record(&self, now: u64) {
++        let second = now / 1_000_000_000;
++        if self.second.swap(second, Relaxed) == second {
++            self.in_second.fetch_add(1, Relaxed);
++        } else {
++            let ended = self.in_second.swap(1, Relaxed);
++            self.best_second.fetch_max(ended, Relaxed);
++        }
+         self.count.fetch_add(1, Relaxed);
+         let last = self.last.swap(now, Relaxed);
+         if last != NONE {
+@@ -297,7 +370,7 @@ fn key<P: Platform>(display: &Weak<CoreDisplay<P>>) -> usize {
  pub(crate) fn register<P: Platform>(stats: &Arc<DisplayStats>, display: &Weak<CoreDisplay<P>>) {
      let mut registry = registry().lock();
      registry.add(key(display), stats);
@@ -3483,6 +3667,34 @@ index ca66b193a42596f67240f715eb18483411be9577..55a2edab38281505ecdef8b8ec9640a9
          registry.reporting = start(Arc::clone(&stats.clock));
      }
  }
+diff --git a/crates/reims-vgpu/src/stats/tests.rs b/crates/reims-vgpu/src/stats/tests.rs
+index f2d1469780a7ccccc38f0c47140cc38ffa1fa941..bd3f6648adbdd13248efac8ef430478992a64c64 100644
+--- a/crates/reims-vgpu/src/stats/tests.rs
++++ b/crates/reims-vgpu/src/stats/tests.rs
+@@ -189,3 +189,23 @@ fn a_sink_finds_its_display_s_stats() {
+     drop(s);
+     assert!(of_display(&display).is_none());
+ }
++
++/// The best second: the most frames one second of the clock held since it was last asked, the
++/// second still open among them, so a burst in a long quiet period shows its own rate.
++#[test]
++fn the_best_second_is_a_burst_s_rate() {
++    let frames = Presents::new();
++    assert_eq!(frames.take_best(), 0);
++    const S: u64 = 1_000_000_000;
++    // One frame early, then 40 within the tenth second, then two in the next.
++    frames.record(S / 2);
++    for i in 0..40 {
++        frames.record(9 * S + i * (S / 40));
++    }
++    frames.record(10 * S);
++    frames.record(10 * S + 1);
++    assert_eq!(frames.take_best(), 40);
++    // The open second's two frames are the next period's best so far.
++    assert_eq!(frames.take_best(), 2);
++    assert_eq!(frames.take(11 * S).0, 43, "the count is its own");
++}
 diff --git a/crates/reims-vgpu/src/video/backend_choice.rs b/crates/reims-vgpu/src/video/backend_choice.rs
 index d7f1134db6b05371559e034a54f28be838686f31..3bb14613d096b6fc400c7decf5107fcff97f3f7f 100644
 --- a/crates/reims-vgpu/src/video/backend_choice.rs

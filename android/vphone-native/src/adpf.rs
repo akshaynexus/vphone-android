@@ -46,32 +46,44 @@ pub fn vcpu_nice(performance: Performance) -> i32 {
 static CLOCK_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static CLOCK_PERMILLE: AtomicU64 = AtomicU64::new(0);
 static CLOCK_AT_MAX: AtomicU64 = AtomicU64::new(0);
+/// The clocks the system allowed those CPUs at each sample (`scaling_max_freq`, which thermal
+/// and power limits lower), as thousandths of each CPU's highest.
+static CLOCK_ALLOWED_PERMILLE: AtomicU64 = AtomicU64::new(0);
 
-/// One sample of a vCPU thread's CPU: its clock now and its highest, in kHz.
-fn clock_sample(now_khz: u64, max_khz: u64) {
+/// One sample of a vCPU thread's CPU: its clock now, the highest the system allows it now, and
+/// its highest, in kHz.
+fn clock_sample(now_khz: u64, allowed_khz: u64, max_khz: u64) {
     if max_khz == 0 {
         return;
     }
     let permille = (now_khz.saturating_mul(1000) / max_khz).min(1000);
+    let allowed = (allowed_khz.saturating_mul(1000) / max_khz).min(1000);
     CLOCK_SAMPLES.fetch_add(1, Ordering::Relaxed);
     CLOCK_PERMILLE.fetch_add(permille, Ordering::Relaxed);
+    CLOCK_ALLOWED_PERMILLE.fetch_add(allowed, Ordering::Relaxed);
     CLOCK_AT_MAX.fetch_add(u64::from(permille >= 950), Ordering::Relaxed);
 }
 
-/// `vCPU clocks 54% of max, 12% of the time at max`, over the samples since the last call; `None`
-/// where there were none (hints off, or clocks an app cannot read).
+/// `vCPU clocks 54% of max (the system allows 100%), 12% of the time at max`, over the samples
+/// since the last call; `None` where there were none (hints off, or clocks an app cannot read).
 pub fn take_clock_summary() -> Option<String> {
     let samples = CLOCK_SAMPLES.swap(0, Ordering::Relaxed);
     let permille = CLOCK_PERMILLE.swap(0, Ordering::Relaxed);
+    let allowed = CLOCK_ALLOWED_PERMILLE.swap(0, Ordering::Relaxed);
     let at_max = CLOCK_AT_MAX.swap(0, Ordering::Relaxed);
-    clock_summary(samples, permille, at_max)
+    clock_summary(samples, permille, allowed, at_max)
 }
 
-fn clock_summary(samples: u64, permille: u64, at_max: u64) -> Option<String> {
+/// The mean clock, the mean of what the system allowed, and the share of samples at the highest.
+/// Clocks at what is allowed, and that below 100%, are a limit of the phone's (heat or power);
+/// clocks below what is allowed are the governor's choice for this load.
+fn clock_summary(samples: u64, permille: u64, allowed: u64, at_max: u64) -> Option<String> {
     (samples > 0).then(|| {
+        let percent = |sum: u64| (sum + samples * 5) / (samples * 10);
         format!(
-            "vCPU clocks {}% of max, {}% of the time at max",
-            (permille + samples * 5) / (samples * 10),
+            "vCPU clocks {}% of max (the system allows {}%), {}% of the time at max",
+            percent(permille),
+            percent(allowed),
             (at_max * 100 + samples / 2) / samples
         )
     })
@@ -86,6 +98,12 @@ type CloseSession = unsafe extern "C" fn(*mut c_void);
 type PreferEfficiency = unsafe extern "C" fn(*mut c_void, bool) -> c_int;
 /// `APerformanceHint_notifyWorkloadIncrease` (API 36): session, cpu, gpu, a name for traces.
 type WorkloadIncrease = unsafe extern "C" fn(*mut c_void, bool, bool, *const c_char) -> c_int;
+/// `AThermal_acquireManager` (API 30).
+type ThermalManager = unsafe extern "C" fn() -> *mut c_void;
+/// `AThermal_getCurrentThermalStatus` (API 30): `AThermalStatus`, 0 none to 6 shutdown.
+type ThermalStatus = unsafe extern "C" fn(*mut c_void) -> c_int;
+/// `AThermal_getThermalHeadroom` (API 31): 1.0 is where the system throttles severely.
+type ThermalHeadroom = unsafe extern "C" fn(*mut c_void, c_int) -> f32;
 
 struct Api {
     get_manager: GetManager,
@@ -95,6 +113,8 @@ struct Api {
     /// Newer calls, where this Android has them.
     prefer_efficiency: Option<PreferEfficiency>,
     workload_increase: Option<WorkloadIncrease>,
+    /// The thermal service's manager, its status and its headroom, where this Android has them.
+    thermal: Option<(ThermalManager, ThermalStatus, Option<ThermalHeadroom>)>,
 }
 
 fn dl_error() -> String {
@@ -141,6 +161,16 @@ impl Api {
                 workload_increase: symbol(c"APerformanceHint_notifyWorkloadIncrease")
                     .ok()
                     .map(|f| std::mem::transmute::<*mut c_void, WorkloadIncrease>(f)),
+                thermal: match (symbol(c"AThermal_acquireManager"), symbol(c"AThermal_getCurrentThermalStatus")) {
+                    (Ok(manager), Ok(status)) => Some((
+                        std::mem::transmute::<*mut c_void, ThermalManager>(manager),
+                        std::mem::transmute::<*mut c_void, ThermalStatus>(status),
+                        symbol(c"AThermal_getThermalHeadroom")
+                            .ok()
+                            .map(|f| std::mem::transmute::<*mut c_void, ThermalHeadroom>(f)),
+                    )),
+                    _ => None,
+                },
             })
         }
     }
@@ -158,6 +188,24 @@ fn vcpu_threads() -> Vec<i32> {
         })
         .filter_map(|t| t.file_name().to_str()?.parse().ok())
         .collect()
+}
+
+/// The threads of the GPU device and its Vulkan runtime (reims-vgpu's FIFO and queue threads,
+/// metal2vulkan's): the ones a guest frame waits on once its vCPU has asked for it.
+fn gpu_threads() -> Vec<i32> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter(|t| std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| is_gpu_thread(c.trim_end())))
+        .filter_map(|t| t.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
+/// A thread name of the GPU device's, as the kernel keeps it (its first 15 bytes).
+fn is_gpu_thread(comm: &str) -> bool {
+    ["reims-vgpu", "metal2vulkan", "m2v-"].iter().any(|prefix| comm.starts_with(prefix))
 }
 
 fn cpu_ns(tid: i32) -> Option<i64> {
@@ -273,6 +321,91 @@ fn placement_line(cpus: &[usize], speeds: &[(u64, u64)], reports: u64) -> String
     format!("performance hints: vCPU threads last ran on CPUs {}, {clock}; {reports} work reports accepted in all", cpu_list(&on))
 }
 
+/// One cluster of CPUs that share a clock: its CPUs as the kernel lists them (`0-5`), its clock
+/// now, the highest the system allows now and its highest, in kHz.
+type Cluster = (String, u64, u64, u64);
+
+/// The phone's clusters, from each CPU's `cpufreq/related_cpus`; empty where an app cannot read
+/// them.
+fn clusters() -> Vec<Cluster> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for cpu in 0..crate::config::online_cpus() as usize {
+        let Ok(related) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/related_cpus")) else {
+            continue;
+        };
+        if seen.contains(&related) {
+            continue;
+        }
+        let cpus: Vec<usize> = related.split_whitespace().filter_map(|c| c.parse().ok()).collect();
+        if let (Some(now), Some(max)) = (cpu_khz(cpu, "scaling_cur_freq"), cpu_khz(cpu, "cpuinfo_max_freq")) {
+            out.push((cpu_list(&cpus), now, cpu_khz(cpu, "scaling_max_freq").unwrap_or(max), max));
+        }
+        seen.push(related);
+    }
+    out
+}
+
+/// `clusters: CPUs 0-5 at 2.4 GHz, allowed 3.6 of 3.6; CPUs 6-7 at 2.5 GHz, allowed 3.9 of 4.6`:
+/// a clock below what is allowed is the governor's choice, an allowance below the highest is the
+/// phone's limit (heat or power).
+fn clusters_line(clusters: &[Cluster]) -> String {
+    if clusters.is_empty() {
+        return "clusters not readable here".to_owned();
+    }
+    let ghz = |khz: u64| format!("{:.1}", khz as f64 / 1e6);
+    let each: Vec<String> = clusters
+        .iter()
+        .map(|(cpus, now, allowed, max)| format!("CPUs {cpus} at {} GHz, allowed {} of {}", ghz(*now), ghz(*allowed), ghz(*max)))
+        .collect();
+    format!("clusters: {}", each.join("; "))
+}
+
+/// `scheduler groups cpuset:/top-app, cpu:/top-app`: the CPU and cpuset control groups Android
+/// put a thread in, from its `cgroup` file (`4:cpuset:/top-app`); the groups without a CPU
+/// controller are left out, and a thread with none (cgroup v2 alone) shows its one path. Android
+/// gives the app on screen `top-app`, whose threads the scheduler places and clocks first.
+fn scheduler_groups(cgroup: &str) -> String {
+    let mut groups: Vec<String> = Vec::new();
+    let mut unified = None;
+    for line in cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if controllers.is_empty() {
+            unified = Some(path);
+        } else if controllers.split(',').any(|c| c == "cpu" || c == "cpuset") {
+            groups.push(format!("{controllers}:{path}"));
+        }
+    }
+    match (groups.is_empty(), unified) {
+        (false, _) => format!("scheduler groups {}", groups.join(", ")),
+        (true, Some(path)) => format!("scheduler group {path}"),
+        (true, None) => "scheduler group not readable".to_owned(),
+    }
+}
+
+/// `thermal status light, headroom 0.82 of 1.00`: Android's thermal status (`AThermalStatus`) and
+/// its headroom, where 1.00 is the temperature at which it throttles severely; a headroom the
+/// phone does not give (NaN) is left out.
+fn thermal_line(status: c_int, headroom: Option<f32>) -> String {
+    let name = match status {
+        0 => "none",
+        1 => "light",
+        2 => "moderate",
+        3 => "severe",
+        4 => "critical",
+        5 => "emergency",
+        6 => "shutdown",
+        _ => "not given",
+    };
+    match headroom.filter(|h| h.is_finite()) {
+        Some(headroom) => format!("thermal status {name}, headroom {headroom:.2} of 1.00"),
+        None => format!("thermal status {name}"),
+    }
+}
+
 /// Gives each of `tids` the nice value `nice`: how many took it, and the first refusal.
 fn raise_priority(tids: &[i32], nice: i32) -> (usize, Option<String>) {
     let mut refusal = None;
@@ -357,6 +490,11 @@ fn run(
         if api.prefer_efficiency.is_some() { ", power efficiency not preferred" } else { "" },
         if api.workload_increase.is_some() { ", workload increases notified" } else { "" },
     ));
+    // SAFETY: the manager is process-wide; a null one is never asked.
+    let thermal = api.thermal.map(|(acquire, status, headroom)| (unsafe { acquire() }, status, headroom)).filter(|t| !t.0.is_null());
+    // The GPU device's threads, given the vCPUs' priority as they appear: a frame's vCPU waits
+    // on them, and at the default priority they queue behind the vCPU threads of other work.
+    let mut gpu_raised: Vec<i32> = Vec::new();
     let mut ticks = 0u64;
     let mut last: Vec<i64> = tids.iter().map(|t| cpu_ns(*t).unwrap_or(0)).collect();
     let mut outcome = Ok(());
@@ -369,14 +507,41 @@ fn run(
             placed_at = Instant::now();
             let cpus: Vec<usize> = tids.iter().filter_map(|t| last_cpu(*t)).collect();
             let speeds: Vec<(u64, u64)> = cpus.iter().filter_map(|c| Some((cpu_khz(*c, "scaling_cur_freq")?, cpu_khz(*c, "cpuinfo_max_freq")?))).collect();
-            say_more(&placement_line(&cpus, &speeds, reports));
+            let heat = thermal.map_or(String::new(), |(manager, status, headroom)| {
+                // SAFETY: a live manager; both calls only read it.
+                let (status, headroom) = unsafe { (status(manager), headroom.map(|h| h(manager, 0))) };
+                format!("; {}", thermal_line(status, headroom))
+            });
+            let groups = tids.first().and_then(|t| std::fs::read_to_string(format!("/proc/self/task/{t}/cgroup")).ok()).unwrap_or_default();
+            say_more(&format!(
+                "{}; {}{heat}; {}; {} GPU threads at nice {nice}",
+                placement_line(&cpus, &speeds, reports),
+                clusters_line(&clusters()),
+                scheduler_groups(&groups),
+                gpu_raised.len()
+            ));
         }
         ticks += 1;
         // The clocks the vCPU threads get, for the status line: every fifth of a second.
         if ticks % 4 == 0 {
             for cpu in tids.iter().filter_map(|t| last_cpu(*t)) {
                 if let (Some(now), Some(max)) = (cpu_khz(cpu, "scaling_cur_freq"), cpu_khz(cpu, "cpuinfo_max_freq")) {
-                    clock_sample(now, max);
+                    clock_sample(now, cpu_khz(cpu, "scaling_max_freq").unwrap_or(max), max);
+                }
+            }
+        }
+        // The GPU device makes its threads as the guest makes its queues: every two seconds.
+        if ticks % 40 == 1 {
+            let new: Vec<i32> = gpu_threads().into_iter().filter(|t| !gpu_raised.contains(t)).collect();
+            if !new.is_empty() {
+                let first = gpu_raised.is_empty();
+                let (raised, refusal) = raise_priority(&new, nice);
+                gpu_raised.extend(new.iter().copied());
+                if first {
+                    say_more(&match refusal {
+                        None => format!("performance: {raised} GPU threads run at nice {nice}, and the ones made later will"),
+                        Some(why) => format!("performance: {raised} of {} GPU threads took nice {nice}; the system refused the rest ({why})", new.len()),
+                    });
                 }
             }
         }
@@ -452,18 +617,54 @@ mod tests {
 
     #[test]
     fn the_clock_summary_is_a_mean_and_a_share() {
-        assert_eq!(clock_summary(0, 0, 0), None);
-        // Four samples: 1.8 of 3.6 GHz twice, and 4.6 of 4.6 twice.
+        assert_eq!(clock_summary(0, 0, 0, 0), None);
+        // Four samples: 1.8 of 3.6 GHz twice, allowed 2.7 (a limit of the phone's), and 4.6 of
+        // 4.6 twice.
         assert_eq!(
-            clock_summary(4, 500 + 500 + 1000 + 1000, 2).as_deref(),
-            Some("vCPU clocks 75% of max, 50% of the time at max")
+            clock_summary(4, 500 + 500 + 1000 + 1000, 750 + 750 + 1000 + 1000, 2).as_deref(),
+            Some("vCPU clocks 75% of max (the system allows 88%), 50% of the time at max")
         );
-        clock_sample(1_800_000, 3_600_000);
-        clock_sample(4_600_000, 4_600_000);
-        clock_sample(1, 0);
+        clock_sample(1_800_000, 2_700_000, 3_600_000);
+        clock_sample(4_600_000, 4_600_000, 4_600_000);
+        clock_sample(1, 1, 0);
         let line = take_clock_summary().unwrap();
-        assert!(line.starts_with("vCPU clocks 75% of max, 50%"), "{line}");
+        assert!(line.starts_with("vCPU clocks 75% of max (the system allows 88%), 50%"), "{line}");
         assert_eq!(take_clock_summary(), None);
+    }
+
+    #[test]
+    fn the_clusters_and_the_heat_are_said_as_the_phone_gives_them() {
+        let clusters = vec![("0-5".to_owned(), 2_400_000, 3_628_800, 3_628_800), ("6-7".to_owned(), 2_500_000, 3_900_000, 4_608_000)];
+        assert_eq!(
+            clusters_line(&clusters),
+            "clusters: CPUs 0-5 at 2.4 GHz, allowed 3.6 of 3.6; CPUs 6-7 at 2.5 GHz, allowed 3.9 of 4.6"
+        );
+        assert_eq!(clusters_line(&[]), "clusters not readable here");
+        assert_eq!(thermal_line(1, Some(0.816)), "thermal status light, headroom 0.82 of 1.00");
+        assert_eq!(thermal_line(0, Some(f32::NAN)), "thermal status none");
+        assert_eq!(thermal_line(3, None), "thermal status severe");
+        assert_eq!(thermal_line(42, None), "thermal status not given");
+        assert_eq!(
+            scheduler_groups("5:cpuset:/top-app\n4:cpu,cpuacct:/top-app\n2:memory:/\n0::/uid_10123/pid_456\n"),
+            "scheduler groups cpuset:/top-app, cpu,cpuacct:/top-app"
+        );
+        assert_eq!(scheduler_groups("0::/uid_10123/pid_456\n"), "scheduler group /uid_10123/pid_456");
+        assert_eq!(scheduler_groups(""), "scheduler group not readable");
+        // Reading this machine's clusters never fails, whatever it lets a process read.
+        let _ = clusters_line(&super::clusters());
+    }
+
+    #[test]
+    fn the_gpu_devices_threads_are_known_by_their_names() {
+        // The kernel keeps 15 bytes of a name.
+        for name in ["reims-vgpu.fifo", "reims-vgpu.time", "metal2vulkan-wa", "m2v-host-ram"] {
+            assert!(is_gpu_thread(name), "{name}");
+        }
+        for name in ["CPU 0/TCG", "qemu-main", "vm-status", "RenderThread", ""] {
+            assert!(!is_gpu_thread(name), "{name}");
+        }
+        // This process has none; reading its threads is not a failure.
+        assert!(gpu_threads().is_empty());
     }
 
     #[test]

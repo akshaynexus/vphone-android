@@ -163,14 +163,39 @@ lower the RAM or the code cache.
 
 ## Reading a boot log for speed
 
-Every 30 s `serial.log` has two lines:
+Every 30 s `serial.log` has these lines. Measure a few minutes after the unlock: iOS's own work after
+a boot keeps every vCPU busy for minutes, and a period that began before the first frame gives a low mean
+rate (`best second` is the burst's own).
 
-- `[vphone] status ...`: memory, the busiest threads, and `vCPU clocks N% of max, M% of the time at max`,
-  sampled five times a second from the CPUs the vCPU threads last ran on.
-- `[vphone] gpu ...`: the guest's presents a second against the refresh rate, and per guest frame, in
-  milliseconds and as a share of the refresh rate's frame budget (8.3 ms at 120 Hz): the GPU device's FIFO
-  threads waiting for the guest (`guest`), waiting for earlier work (`barriers`) and running the guest's
-  commands (`host`, with the three opcodes that took most), the window's acquire, encode and present, and the
-  Metal runtime's `vkQueueSubmit`, pipeline makings, host steps and readings of `/proc/self/maps`
+- `[vphone] status ...`: memory, the busiest threads, where each vCPU is, and
+  `vCPU clocks N% of max (the system allows A%), M% of the time at max`, sampled five times a second from the
+  CPUs the vCPU threads last ran on. Clocks at what is allowed, and that below 100%, are the phone's limit
+  (heat or power: `scaling_max_freq`); clocks below what is allowed are the governor's choice for this load.
+- `[vphone] performance hints: ...`: the CPUs the vCPU threads last ran on, each cluster's clock now with
+  what the system allows and its highest, Android's thermal status and headroom (1.00 is where it throttles
+  severely), the scheduler groups of a vCPU thread (`top-app` while the VM is on screen), and how many of the
+  GPU device's threads were given the vCPUs' priority.
+- `[vphone] cpu ...` (QEMU's `vphone_android_cpu_line`): how often the guest ran `WFE` and `YIELD`, which
+  are NOPs under multi-threaded TCG, so a guest that spins on them burns host cores: tens of thousands a
+  second is iOS at rest, millions is a spin; the share of the vCPU threads' time spent halted (the guest
+  idle), waiting for QEMU's global lock, in exclusive sections, and spinning for other vCPUs' part of a TLB
+  flush; and the translated-code cache's fill and how often it was flushed whole (each flush translates
+  everything the guest runs again: raise the code cache if it happens in use).
+- `[vphone] guest top ...`: which of iOS's processes used its CPUs since the last line (vphoned's
+  `processes.list`), from the unlock on: `5.61 guest CPUs busy: mediaanalysisd 1.92, ...`.
+- `[vphone] guest code ...`: when at least half the vCPUs are in one 16 KiB page of user code, 48
+  instruction words around the address most of them share, once a page. TCG keeps a vCPU's PC as of its
+  last indirect branch, so vCPUs in one loop show the same few addresses. `d503205f` is `WFE`, `d503203f`
+  `YIELD`: a loop of those and a branch back is a spin; vector instructions are work. The shared cache's
+  slide has been the same in every boot logged, so with the guest's dyld shared cache in `dsc/`
+  `tools/dsc-symbolize.py` names the image and function (docs/PERFORMANCE.md).
+- `[vphone] gpu ...`: the guest's presents a second against the refresh rate, the most in one second, and
+  per guest frame, in milliseconds and as a share of the refresh rate's frame budget (8.3 ms at 120 Hz):
+  the GPU device's FIFO threads waiting for the guest (`guest`), waiting for an earlier command of another
+  FIFO (`barriers`: the guest orders commands across its queues, and a FIFO thread waits until the other
+  queue's thread has run the command it names, so this follows `host`) and running the guest's commands
+  (`host`, with the three opcodes that took most), the window's acquire, encode and present, and the Metal
+  runtime's `vkQueueSubmit`, pipeline makings, host steps, readings of `/proc/self/maps` with the checks
+  answered from the kept reading instead, and the shadow copies with the texels they moved
   (`reims-vgpu`'s `perf.rs`). The FIFO figures are sums over every FIFO thread. A `host` far below the frame
   time means the frame waits on the emulated CPU, not on the GPU path.

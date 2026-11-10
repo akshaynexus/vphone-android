@@ -79,6 +79,15 @@ Tried, and left off by default:
   microseconds. A vCPU thread's sleep and wakeup cost about as much as that spin. It may help on a
   host with fewer cores than vCPUs.
 
+- **`-O3` for QEMU** (the builds are `-O2`). The bare-metal tests of the QEMU fork
+  (`tests/tcg/vphone-ibc`, `vphone-ras`, `vphone-cnt`; one vCPU), host builds with clang differing
+  only in `-Doptimization`, 15 alternating runs each pinned to two cores, CPU time of the fastest run:
+  3.428 s vs 3.427 s, 0.355 vs 0.351 s, 0.411 vs 0.395 s. Nothing past the runs' own spread (the host
+  was not idle; medians moved 5-8% either way). These tests are mostly generated code, which the
+  flag does not touch; an iOS guest spends more of its time in QEMU's C code, so a guest benchmark
+  could still show a little. LTO and `-mcpu` tuning were not measured and are not used: the Android
+  build stays at `-march=armv8.2-a+lse`, which every phone the app targets runs.
+
 - **`QEMU_TLB_UNSYNCED`** (relaxed broadcast TLB flushes). Six app-switch sweeps per mode gave the same
   latencies within noise. Settings scrolling: 31.4 vs 30.5 frames/s. The synced flush is not the
   bottleneck.

@@ -20,6 +20,45 @@ index 79601465e23330d30cc68aa9bad7fc0282b0345a..9455d94f6388df93a7852a3c76931f57
              }
  
              /*
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index 8e359508be203be3f3ceb60df99c5c7a21af1273..42cb941b78a16b8f6be5fac459fa180a27502839 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-stats.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/target-info.h"
+ #include "accel/tcg/cpu-ops.h"
+@@ -615,7 +616,7 @@ static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
+                              run_on_cpu_data data)
+ {
+     TLBFlushBarrier *b = tlb_barrier;
+-    int64_t deadline;
++    int64_t deadline, vphone_t0;
+ 
+     switch (tlb_flush_mode()) {
+     case 1:
+@@ -627,7 +628,8 @@ static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
+         if (!b) {
+             return;
+         }
+-        deadline = get_clock() + tlb_barrier_limit_ns();
++        vphone_t0 = get_clock();
++        deadline = vphone_t0 + tlb_barrier_limit_ns();
+         while (qatomic_read(&b->pending) > 0) {
+             if (cpu_exclusive_pending()) {
+                 tlb_barrier_note(&tbw_excl);
+@@ -643,6 +645,7 @@ static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
+             }
+             cpu_relax();
+         }
++        vphone_wait_add(VPHONE_WAIT_TLB, vphone_t0);
+         if (qatomic_read(&b->pending) <= 0) {
+             tlb_barrier_note(&tbw_done);
+         } else {
 diff --git a/accel/tcg/tb-jmp-cache.h b/accel/tcg/tb-jmp-cache.h
 index 8e72693a0d2a0bc2535847e7e873ba8b0eef6a1c..3898287d48447f91fe9b81701b465ee12f7b7987 100644
 --- a/accel/tcg/tb-jmp-cache.h
@@ -114,6 +153,22 @@ index cf915fd3a30f7207bbab09e4de59bb67eeee55cf..100c22531320105e5c3d017cae779432
                  tcg_flush_jmp_cache(cpu);
              }
          }
+diff --git a/accel/tcg/tcg-stats.c b/accel/tcg/tcg-stats.c
+index a863f4b8ef388261aaa3b972ccb47fc3d238a73e..c0fa54292b6b4ef1286952fc50d234b8782f19dc 100644
+--- a/accel/tcg/tcg-stats.c
++++ b/accel/tcg/tcg-stats.c
+@@ -217,3 +217,11 @@ void tcg_dump_stats(GString *buf)
+ {
+     tcg_get_stats(current_accel(), buf);
+ }
++
++/* For the Android app's log line (qemu/vphone-stats.h). */
++unsigned vphone_tb_flush_count(void);
++
++unsigned vphone_tb_flush_count(void)
++{
++    return qatomic_read(&tb_ctx.tb_flush_count);
++}
 diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
 index 3b72dcf06ada12685de4621e41d6ecdfc89ba03e..27a29d85e18a99e15a20ed64be6d012a7e759187 100644
 --- a/accel/tcg/translate-all.c
@@ -236,6 +291,54 @@ index 97ee78299bf7566a1c0c808dc7bbca7eaad82102..f967680fc16ffa1b007db3787a268f4a
  #endif
  
      filename = g_strdup_printf("%s/vl.XXXXXX", tmpdir);
+diff --git a/cpu-common.c b/cpu-common.c
+index 9064c6ab821a5f18b36299d1a91e9436a426d97e..5929bc31ccd93ab2dbc9adf7aa8337cafe935cad 100644
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -23,6 +23,12 @@
+ #include "hw/core/cpu.h"
+ #include "qemu/lockable.h"
+ #include "trace/trace-root.h"
++#include "qemu/vphone-stats.h"
++
++uint64_t vphone_wait_ns[VPHONE_WAIT__COUNT];
++uint64_t vphone_wait_n[VPHONE_WAIT__COUNT];
++int vphone_guest_cpus;
++int64_t vphone_stats_since;
+ 
+ QemuMutex qemu_cpu_list_lock;
+ static QemuCond exclusive_cond;
+@@ -218,6 +224,8 @@ void start_exclusive(void)
+         return;
+     }
+ 
++    int64_t vphone_t0 = get_clock();
++
+     qemu_mutex_lock(&qemu_cpu_list_lock);
+     exclusive_idle();
+ 
+@@ -239,6 +247,7 @@ void start_exclusive(void)
+     while (pending_cpus > 1) {
+         qemu_cond_wait(&exclusive_cond, &qemu_cpu_list_lock);
+     }
++    vphone_wait_add(VPHONE_WAIT_EXCL, vphone_t0);
+ 
+     /* Can release mutex, no one will enter another exclusive
+      * section until end_exclusive resets pending_cpus to 0.
+@@ -304,10 +313,13 @@ void cpu_exec_start(CPUState *cpu)
+              * run.  Since we have the lock, just set cpu->running to true
+              * while holding it; no need to check pending_cpus again.
+              */
++            int64_t vphone_t0 = get_clock();
++
+             qatomic_set(&cpu->running, false);
+             exclusive_idle();
+             /* Now pending_cpus is zero.  */
+             qatomic_set(&cpu->running, true);
++            vphone_wait_add(VPHONE_WAIT_EXCL, vphone_t0);
+         } else {
+             /* Counted in pending_cpus, go ahead and release the
+              * waiter at cpu_exec_end.
 diff --git a/host/include/aarch64/host/cpuinfo.h b/host/include/aarch64/host/cpuinfo.h
 index fe671534e40fa0198a42a08e69af4c6054f09be3..2e2e6c5b40726fe606b33e86c91bc3910c4757aa 100644
 --- a/host/include/aarch64/host/cpuinfo.h
@@ -1786,6 +1889,64 @@ index 0000000000000000000000000000000000000000..ca8c4060eb471ccc627d27b01ae04e16
 +};
 +
 +#endif
+diff --git a/include/qemu/vphone-stats.h b/include/qemu/vphone-stats.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3fbb74603cf1fb3bdc3c761cb0728eb2fc06fd6b
+--- /dev/null
++++ b/include/qemu/vphone-stats.h
+@@ -0,0 +1,52 @@
++/*
++ * Where the guest's vCPU threads spend the time they do not run guest code,
++ * and how often the guest spins: counters for one line of the Android app's
++ * log (vphone_android_cpu_line(), target/arm/helper.c). Always on: each is
++ * an add on a path that already sleeps or waits.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_VPHONE_STATS_H
++#define QEMU_VPHONE_STATS_H
++
++#include "qemu/timer.h"
++#include "hw/core/cpu.h"
++
++enum {
++    VPHONE_WAIT_HALT,     /* halted: WFI with no work, until an interrupt */
++    VPHONE_WAIT_LOCK,     /* waiting for QEMU's global lock (BQL) */
++    VPHONE_WAIT_EXCL,     /* stopped for, or starting, an exclusive section */
++    VPHONE_WAIT_TLB,      /* spinning for other vCPUs' part of a TLB flush */
++    VPHONE_WAIT__COUNT,
++};
++
++/* Summed over the guest's vCPU threads (cpu-common.c). */
++extern uint64_t vphone_wait_ns[VPHONE_WAIT__COUNT];
++extern uint64_t vphone_wait_n[VPHONE_WAIT__COUNT];
++/* The guest's vCPUs: CPUs of a lower index are counted; 0 until the machine is up. */
++extern int vphone_guest_cpus;
++/* get_clock() when the counting began. */
++extern int64_t vphone_stats_since;
++
++/* The machine is up, with `cpus` vCPUs of the guest's: count from now. */
++static inline void vphone_stats_start(int cpus)
++{
++    vphone_stats_since = get_clock();
++    qatomic_set(&vphone_guest_cpus, cpus);
++}
++
++/* How many times the whole code cache was flushed (accel/tcg/tcg-stats.c). */
++unsigned vphone_tb_flush_count(void);
++
++/* A wait of the calling thread that began at get_clock() == t0 has ended. */
++static inline void vphone_wait_add(int kind, int64_t t0)
++{
++    CPUState *cpu = current_cpu;
++
++    if (cpu && cpu->cpu_index < qatomic_read(&vphone_guest_cpus)) {
++        qatomic_add(&vphone_wait_ns[kind], (uint64_t)(get_clock() - t0));
++        qatomic_inc(&vphone_wait_n[kind]);
++    }
++}
++
++#endif
 diff --git a/include/system/memory.h b/include/system/memory.h
 index 26225f4f1e15b3f4fc5de63108a37e6294c88014..0310d994315a8557877700a02130cca3d928e09b 100644
 --- a/include/system/memory.h
@@ -1970,10 +2131,10 @@ index c483fda69e5baedb2da63b67a268e7512b73af48..1f003b1bc820a089482ddbd59ca91651
  ##
 diff --git a/system/android-exports.map b/system/android-exports.map
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8d4b47b871b815302a9b3a335ef5a031a23bfaa
+index 0000000000000000000000000000000000000000..946116647fa204e4b52abe80ac6d62598406aff0
 --- /dev/null
 +++ b/system/android-exports.map
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,15 @@
 +/*
 + * What libqemu-vphone.so shows to the app: QEMU's entry point and the entry
 + * points the app calls in reims-vgpu's static library.
@@ -1985,14 +2146,23 @@ index 0000000000000000000000000000000000000000..c8d4b47b871b815302a9b3a335ef5a03
 +    rvg_android_set_window;
 +    rvg_android_pointer;
 +    rvg_android_perf_line;
++    vphone_android_cpu_line;
 +  local:
 +    *;
 +};
 diff --git a/system/cpus.c b/system/cpus.c
-index 2171847691413350cce816dcb0f8b8082a518e7f..c5fb2407960c06be2478e02dfade52984f0b7444 100644
+index 2171847691413350cce816dcb0f8b8082a518e7f..b667867ce3f614dcea140379ee954b4e545cbd33 100644
 --- a/system/cpus.c
 +++ b/system/cpus.c
-@@ -359,7 +359,11 @@ void cpu_handle_guest_debug(CPUState *cpu)
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-stats.h"
+ #include "monitor/monitor.h"
+ #include "qemu/coroutine-tls.h"
+ #include "qapi/error.h"
+@@ -359,7 +360,11 @@ void cpu_handle_guest_debug(CPUState *cpu)
      }
  }
  
@@ -2005,7 +2175,7 @@ index 2171847691413350cce816dcb0f8b8082a518e7f..c5fb2407960c06be2478e02dfade5298
  static void sigbus_reraise(void)
  {
      sigset_t set;
-@@ -411,11 +415,11 @@ static void qemu_init_sigbus(void)
+@@ -411,11 +416,11 @@ static void qemu_init_sigbus(void)
  
      prctl(PR_MCE_KILL, PR_MCE_KILL_SET, PR_MCE_KILL_EARLY, 0, 0);
  }
@@ -2019,11 +2189,49 @@ index 2171847691413350cce816dcb0f8b8082a518e7f..c5fb2407960c06be2478e02dfade5298
  
  static QemuThread io_thread;
  
+@@ -462,8 +467,13 @@ void qemu_process_cpu_events_common(CPUState *cpu)
+ void qemu_process_cpu_events(CPUState *cpu)
+ {
+     qatomic_set(&cpu->exit_request, false);
+-    while (cpu_thread_is_idle(cpu)) {
+-        qemu_cond_wait(cpu->halt_cond, &bql);
++    if (cpu_thread_is_idle(cpu)) {
++        int64_t t0 = get_clock();
++
++        while (cpu_thread_is_idle(cpu)) {
++            qemu_cond_wait(cpu->halt_cond, &bql);
++        }
++        vphone_wait_add(VPHONE_WAIT_HALT, t0);
+     }
+ 
+     qemu_process_cpu_events_common(cpu);
+@@ -546,7 +556,20 @@ void bql_lock_impl(const char *file, int line)
+     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
+ 
+     assert(!bql_locked());
+-    bql_lock_fn(&bql, file, line);
++    /*
++     * A vCPU thread's wait for the lock is counted (qemu/vphone-stats.h): the
++     * lock taken at once costs it one try, a contended one two clock reads.
++     */
++    if (current_cpu && bql_lock_fn == qemu_mutex_lock_impl) {
++        if (qemu_mutex_trylock_impl(&bql, file, line) != 0) {
++            int64_t t0 = get_clock();
++
++            bql_lock_fn(&bql, file, line);
++            vphone_wait_add(VPHONE_WAIT_LOCK, t0);
++        }
++    } else {
++        bql_lock_fn(&bql, file, line);
++    }
+     set_bql_locked(true);
+ }
+ 
 diff --git a/system/main.c b/system/main.c
-index a1782a8507d2b4b8799cf177120e2a9a96e554de..5ab54d8fdc6bdce484d91906d25477c23ee84428 100644
+index a1782a8507d2b4b8799cf177120e2a9a96e554de..f1a85ad341f3a4a669dee7dc7de444d6f96ca7ed 100644
 --- a/system/main.c
 +++ b/system/main.c
-@@ -23,8 +23,10 @@
+@@ -23,10 +23,14 @@
   */
  
  #include "qemu/osdep.h"
@@ -2033,8 +2241,12 @@ index a1782a8507d2b4b8799cf177120e2a9a96e554de..5ab54d8fdc6bdce484d91906d25477c2
 +#include "qemu/rcu.h"
  #include "system/replay.h"
  #include "system/system.h"
++#include "hw/boards.h"
++#include "qemu/vphone-stats.h"
  
-@@ -66,6 +68,40 @@ static int os_darwin_cfrunloop_main(void)
+ #ifdef CONFIG_SDL
+ /*
+@@ -66,9 +70,46 @@ static int os_darwin_cfrunloop_main(void)
  int (*qemu_main)(void) = os_darwin_cfrunloop_main;
  #endif
  
@@ -2064,6 +2276,8 @@ index a1782a8507d2b4b8799cf177120e2a9a96e554de..5ab54d8fdc6bdce484d91906d25477c2
 +
 +    /* qemu_init leaves the BQL and the replay mutex held for this thread. */
 +    qemu_init(argc, argv);
++    /* From here the vCPU threads' waits are counted (qemu/vphone-stats.h). */
++    vphone_stats_start(current_machine->smp.cpus);
 +    status = qemu_main_loop();
 +    qemu_cleanup(status);
 +    bql_unlock();
@@ -2075,7 +2289,11 @@ index a1782a8507d2b4b8799cf177120e2a9a96e554de..5ab54d8fdc6bdce484d91906d25477c2
  int main(int argc, char **argv)
  {
      qemu_init(argc, argv);
-@@ -94,3 +130,4 @@ int main(int argc, char **argv)
++    vphone_stats_start(current_machine->smp.cpus);
+ 
+     /*
+      * qemu_init acquires the BQL and replay mutex lock. BQL is acquired when
+@@ -94,3 +135,4 @@ int main(int argc, char **argv)
          assert_not_reached();
      }
  }
@@ -2119,6 +2337,146 @@ index 86006123076d51be4de1099ebbdd474ed8b2edd9..82845176f6c8ec9d95232c20dd9eea81
  #endif
  
  static void memory_region_set_ram_ptr(MemoryRegion *mr, uint64_t size,
+diff --git a/target/arm/cpu.h b/target/arm/cpu.h
+index 99e0d61751e8b54cd941805c3c99d62c5c9406d1..228440eaa39d877733db70c0ec2a63b01e5b4eab 100644
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -822,6 +822,9 @@ typedef struct CPUArchState {
+ 
+     /* vphone diagnostic: executed instructions per class (VPHONE_INSN_STATS) */
+     uint64_t vphone_icount[24];
++/* The always-on classes among them: the guest's spin hints (translate-a64.c). */
++#define VPHONE_ICOUNT_WFE   16
++#define VPHONE_ICOUNT_YIELD 18
+ 
+     /*
+      * Newer SPRR layout (M1/A14 and later, the vresearch101 CPU): one
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index 0e118aabacf798402a3e0239fb8ecec1c570339a..eed670c02ed1196ec4397f401aed355b487b59b3 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -16,6 +16,8 @@
+ #include "exec/page-protection.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/timer.h"
++#include "qemu/vphone-stats.h"
++#include "tcg/tcg.h"
+ #include "qemu/bitops.h"
+ #include "qemu/qemu-print.h"
+ #include "exec/cputlb.h"
+@@ -2838,12 +2840,112 @@ static void vphone_mark_switch(unsigned asid)
+     }
+ }
+ 
++/*
++ * One line for the Android app's log, over the time since the last call: how
++ * often the guest's vCPUs ran WFE and YIELD (NOPs under MTTCG: a guest that
++ * spins on them burns host cores), and the share of the vCPU threads' time
++ * they spent not running guest code, by cause (qemu/vphone-stats.h); then
++ * the translated-code cache's fill and how often it was flushed whole, after
++ * which everything the guest runs is translated again. The first call covers
++ * the time since the machine came up. Writes at most cap bytes, no
++ * terminator; returns the bytes written, 0 before the machine is up. Called
++ * from one thread at a time. VPHONE_CPU_LINE=1 prints it on stderr at exit.
++ */
++size_t vphone_android_cpu_line(char *buf, size_t cap);
++
++size_t vphone_android_cpu_line(char *buf, size_t cap)
++{
++    static const char *const kinds[VPHONE_WAIT__COUNT] = {
++        "halted", "waiting for QEMU's lock", "in exclusive sections",
++        "waiting for TLB flushes",
++    };
++    static uint64_t last_ns[VPHONE_WAIT__COUNT], last_n[VPHONE_WAIT__COUNT];
++    static uint64_t last_wfe, last_yield;
++    static int64_t last_t;
++    static unsigned last_flushes;
++    unsigned flushes;
++    int cpus = qatomic_read(&vphone_guest_cpus);
++    g_autoptr(GString) line = NULL;
++    uint64_t wfe = 0, yield = 0;
++    int64_t now = get_clock();
++    double secs, all;
++    CPUState *cs;
++    size_t len;
++
++    if (cpus <= 0 || !buf || !cap) {
++        return 0;
++    }
++    /* The list's lock, not RCU: this thread is not one of QEMU's. */
++    cpu_list_lock();
++    CPU_FOREACH(cs) {
++        if (cs->cpu_index < cpus) {
++            wfe += qatomic_read(&cpu_env(cs)->vphone_icount[VPHONE_ICOUNT_WFE]);
++            yield += qatomic_read(&cpu_env(cs)->vphone_icount[VPHONE_ICOUNT_YIELD]);
++        }
++    }
++    cpu_list_unlock();
++    if (!last_t) {
++        last_t = vphone_stats_since;
++    }
++    secs = (now - last_t) / 1e9;
++    if (secs <= 0) {
++        secs = 1e-9;
++    }
++    all = secs * 1e9 * cpus;
++    line = g_string_new(NULL);
++    g_string_append_printf(line, "guest spin hints: WFE %.0f/s, YIELD %.0f/s; "
++                           "of the %d vCPU threads' time:",
++                           (wfe - last_wfe) / secs,
++                           (yield - last_yield) / secs, cpus);
++    for (int i = 0; i < VPHONE_WAIT__COUNT; i++) {
++        uint64_t ns = qatomic_read(&vphone_wait_ns[i]);
++        uint64_t n = qatomic_read(&vphone_wait_n[i]);
++
++        g_string_append_printf(line, "%s %s %.1f%% (%.0f/s)", i ? "," : "",
++                               kinds[i],
++                               (ns - last_ns[i]) * 100.0 / all,
++                               (n - last_n[i]) / secs);
++        last_ns[i] = ns;
++        last_n[i] = n;
++    }
++    flushes = vphone_tb_flush_count();
++    g_string_append_printf(line, "; code cache %zu of %zu MiB, flushed whole "
++                           "%u times (%u since the last line)",
++                           tcg_code_size() >> 20, tcg_code_capacity() >> 20,
++                           flushes, flushes - last_flushes);
++    last_flushes = flushes;
++    last_wfe = wfe;
++    last_yield = yield;
++    last_t = now;
++    len = MIN(line->len, cap);
++    memcpy(buf, line->str, len);
++    return len;
++}
++
++static void vphone_cpu_line_at_exit(void)
++{
++    char buf[1024];
++    size_t len = vphone_android_cpu_line(buf, sizeof(buf));
++
++    fprintf(stderr, "vphone-cpu %.*s\n", (int)len, buf);
++}
++
++static void __attribute__((constructor)) vphone_cpu_line_init(void)
++{
++    const char *e = getenv("VPHONE_CPU_LINE");
++
++    if (e && *e && *e != '0') {
++        atexit(vphone_cpu_line_at_exit);
++    }
++}
++
+ /* VPHONE_INSN_STATS counters, summed over the vCPUs (translate-a64.c) */
+ static void vphone_mark_icount(const char *what)
+ {
+     static const char *const names[] = {
+         "ldar", "ldapr", "stlr", "ldaxr", "stlxr", "ldxr", "stxr", "cas",
+         "atomic", "dmb", "dmbldst", "isb", "mrs", "msr", "daifset", "daifclr", "wfe", "clrex",
++        "yield",
+     };
+     g_autoptr(GString) line = g_string_new("vphone-icount ");
+     struct timespec ts;
 diff --git a/target/arm/tcg/crypto_helper.c b/target/arm/tcg/crypto_helper.c
 index 3428bd1bf0b4b852bad5a6a53982cd56d4d4ae64..7a50e75b806bf49469dcff8223b73ecc834dee59 100644
 --- a/target/arm/tcg/crypto_helper.c
@@ -2622,7 +2980,7 @@ index 982f302b5cb1e7e872c54b11d1cca629dbb4679e..e3e94dc1ae374063a49c34f8ddb76635
  #define ARM_HOST_MXCSR_BASE  0x1f80
  #define ARM_HOST_MXCSR_FLAGS 0x3f
 diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
-index 028e6c22c807a9f086edbea047f4a373923ad95f..f40301589c515768fb0ecad234ff5bf4345a0282 100644
+index 028e6c22c807a9f086edbea047f4a373923ad95f..997a55022f864ab53166c3f126365d07834e1b62 100644
 --- a/target/arm/tcg/translate-a64.c
 +++ b/target/arm/tcg/translate-a64.c
 @@ -22,6 +22,7 @@
@@ -2633,7 +2991,67 @@ index 028e6c22c807a9f086edbea047f4a373923ad95f..f40301589c515768fb0ecad234ff5bf4
  #include "qemu/log.h"
  #include "arm_ldst.h"
  #include "semihosting/semihost.h"
-@@ -6015,12 +6016,34 @@ typedef struct FPScalar {
+@@ -2532,8 +2533,10 @@ static void vphone_acq_after(DisasContext *s)
+ enum {
+     VPI_LDAR, VPI_LDAPR, VPI_STLR, VPI_LDAXR, VPI_STLXR, VPI_LDXR, VPI_STXR,
+     VPI_CAS, VPI_ATOMIC, VPI_DMB_FULL, VPI_DMB_LDST, VPI_ISB, VPI_MRS, VPI_MSR,
+-    VPI_DAIFSET, VPI_DAIFCLR, VPI_WFE, VPI_CLREX,
++    VPI_DAIFSET, VPI_DAIFCLR, VPI_WFE, VPI_CLREX, VPI_YIELD,
+ };
++QEMU_BUILD_BUG_ON(VPI_WFE != VPHONE_ICOUNT_WFE);
++QEMU_BUILD_BUG_ON(VPI_YIELD != VPHONE_ICOUNT_YIELD);
+ 
+ static bool vphone_sysreg_stats_on(void)
+ {
+@@ -2558,6 +2561,22 @@ static void vphone_icount(DisasContext *s, int cls)
+     }
+ }
+ 
++/*
++ * WFE and YIELD are counted always, three host instructions each: with
++ * MTTCG both are NOPs here, so a guest that spins on them burns a host core,
++ * and their rate is how the app's log tells such a spin from work
++ * (vphone_android_cpu_line(), helper.c).
++ */
++static void vphone_spin_count(DisasContext *s, int cls)
++{
++    TCGv_i64 t = tcg_temp_new_i64();
++    int ofs = offsetof(CPUARMState, vphone_icount[cls]);
++
++    tcg_gen_ld_i64(t, tcg_env, ofs);
++    tcg_gen_addi_i64(t, t, 1);
++    tcg_gen_st_i64(t, tcg_env, ofs);
++}
++
+ /* hint #0x7e: a NOP, or a measurement marker with VPHONE_MARK=1 (helper.c) */
+ static bool trans_VPHONE_MARK(DisasContext *s, arg_VPHONE_MARK *a)
+ {
+@@ -2569,6 +2588,7 @@ static bool trans_VPHONE_MARK(DisasContext *s, arg_VPHONE_MARK *a)
+ 
+ static bool trans_YIELD(DisasContext *s, arg_YIELD *a)
+ {
++    vphone_spin_count(s, VPI_YIELD);
+     /*
+      * When running in MTTCG we don't generate jumps to the yield and
+      * WFE helpers as it won't affect the scheduling of other vCPUs.
+@@ -2589,7 +2609,7 @@ static bool trans_WFI(DisasContext *s, arg_WFI *a)
+ 
+ static bool trans_WFE(DisasContext *s, arg_WFI *a)
+ {
+-    vphone_icount(s, VPI_WFE);
++    vphone_spin_count(s, VPI_WFE);
+     /*
+      * When running in MTTCG we don't generate jumps to the yield and
+      * WFE helpers as it won't affect the scheduling of other vCPUs.
+@@ -2632,6 +2652,7 @@ static bool trans_WFET(DisasContext *s, arg_WFET *a)
+         return false;
+     }
+ 
++    vphone_spin_count(s, VPI_WFE);
+     /*
+      * We rely here on our WFE implementation being a NOP, so we
+      * don't need to do anything different to handle the WFET timeout
+@@ -6015,12 +6036,34 @@ typedef struct FPScalar {
   * guard"). The helper path recomputes from the untouched inputs; the flags
   * the native attempt raised are a subset of what the helper raises.
   *
@@ -2668,7 +3086,7 @@ index 028e6c22c807a9f086edbea047f4a373923ad95f..f40301589c515768fb0ecad234ff5bf4
  static bool fp_native_ok(DisasContext *s)
  {
      return arm_native_fp_enabled && !s->fpcr_ah && !s->fpcr_nep &&
-@@ -12919,6 +12942,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
+@@ -12919,6 +12962,10 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
  {
      DisasContext *dc = container_of(dcbase, DisasContext, base);
      CPUARMState *env = cpu_env(cpu);
@@ -3816,6 +4234,283 @@ index f680043c6f7280972ce9c507c62594e9d154ac1c..a47be033ffc7bc928fe8be7e8ab53ba7
          if (!ok) {
              continue;
          }
+diff --git a/tests/tcg/vphone-spin/build.sh b/tests/tcg/vphone-spin/build.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..2079d40e76b47a6471cdca9b97b204d4070b3c59
+--- /dev/null
++++ b/tests/tcg/vphone-spin/build.sh
+@@ -0,0 +1,11 @@
++#!/bin/sh
++# Builds spintest.elf (bare-metal AArch64 for QEMU virt, 1 vCPU). clang + ld.lld.
++set -e
++cd "$(dirname "$0")"
++CFLAGS="--target=aarch64-none-elf -march=armv8.5-a -mstrict-align
++  -ffreestanding -fno-builtin -nostdlib -O2 -Wall $EXTRA_CFLAGS"
++clang $CFLAGS -c start.S -o start.o
++clang $CFLAGS -c main.c -o main.o
++ld.lld -T link.ld start.o main.o -o spintest.elf
++rm -f start.o main.o
++echo "built spintest.elf"
+diff --git a/tests/tcg/vphone-spin/link.ld b/tests/tcg/vphone-spin/link.ld
+new file mode 100644
+index 0000000000000000000000000000000000000000..21c7cb80eeb2d201a0cfbb0f812e0a84d0c6c964
+--- /dev/null
++++ b/tests/tcg/vphone-spin/link.ld
+@@ -0,0 +1,15 @@
++ENTRY(_start)
++SECTIONS
++{
++    . = 0x40080000;
++    .text : { KEEP(*(.text.boot)) *(.text .text.*) }
++    .rodata : { *(.rodata .rodata.*) }
++    .data : { *(.data .data.*) }
++    . = ALIGN(4096);
++    __bss_start = .;
++    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
++    . = ALIGN(16);
++    __bss_end = .;
++    . = . + 0x10000;
++    __stack_top = .;
++}
+diff --git a/tests/tcg/vphone-spin/main.c b/tests/tcg/vphone-spin/main.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..a51a99c7d74921219303d7371e3fe47f4c34ca2f
+--- /dev/null
++++ b/tests/tcg/vphone-spin/main.c
+@@ -0,0 +1,46 @@
++/*
++ * vphone-linux: bare-metal AArch64 test of the spin-hint counters
++ * (vphone_spin_count, target/arm/tcg/translate-a64.c, and
++ * vphone_android_cpu_line, target/arm/helper.c): the guest runs 200000 WFE
++ * and 100000 YIELD, which MTTCG executes as NOPs, and QEMU's line at exit
++ * (VPHONE_CPU_LINE=1) must count them at 2:1. run.sh checks the line.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++typedef unsigned long u64;
++typedef unsigned int u32;
++
++#define UART0 0x09000000UL
++static void putc_(char c)
++{
++    volatile u32 *uart = (volatile u32 *)UART0;
++    while (uart[0x18 / 4] & (1 << 5)) {
++    }
++    uart[0] = (u32)c;
++}
++static void puts_(const char *s)
++{
++    while (*s) {
++        if (*s == '\n') {
++            putc_('\r');
++        }
++        putc_(*s++);
++    }
++}
++void fatal_exception(u64 vec, u64 esr, u64 elr, u64 far)
++{
++    puts_("\nFATAL exception\n");
++}
++
++int main(void)
++{
++    puts_("vphone-spin WFE and YIELD count test\n");
++    for (volatile int i = 0; i < 200000; i++) {
++        __asm__ volatile("wfe");
++    }
++    for (volatile int i = 0; i < 100000; i++) {
++        __asm__ volatile("yield");
++    }
++    puts_("TOTAL ok\n");
++    return 0;
++}
+diff --git a/tests/tcg/vphone-spin/run.sh b/tests/tcg/vphone-spin/run.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..eef3343343c14ff1405982added4122ecc7f48c2
+--- /dev/null
++++ b/tests/tcg/vphone-spin/run.sh
+@@ -0,0 +1,25 @@
++#!/bin/sh
++# Runs spintest.elf (200000 WFE, 100000 YIELD) and checks QEMU's line at exit
++# (VPHONE_CPU_LINE=1): both hints counted, WFE at twice YIELD's rate, the vCPU's
++# waits and the code cache given.   QEMU=path (default ../../../build/qemu-system-aarch64)
++set -e
++here=$(cd "$(dirname "$0")" && pwd)
++QEMU=${QEMU:-$here/../../../build/qemu-system-aarch64}
++OUTDIR=${OUTDIR:-$(mktemp -d)}
++VPHONE_CPU_LINE=1 timeout "${TIMEOUT:-300}" "$QEMU" -M virt -accel tcg -cpu neoverse-v1 \
++    -m 256M -nographic -no-reboot -kernel "$here/spintest.elf" \
++    2> "$OUTDIR/err.txt" | tr -d '\r' > "$OUTDIR/out.txt"
++grep -q '^TOTAL ok' "$OUTDIR/out.txt" || { echo "FAILED: $OUTDIR"; exit 1; }
++line=$(grep '^vphone-cpu ' "$OUTDIR/err.txt") || { echo "NO LINE: $OUTDIR"; exit 1; }
++echo "$line"
++echo "$line" | awk '{
++    for (i = 1; i <= NF; i++) {
++        if ($i == "WFE") { wfe = $(i + 1) + 0 }
++        if ($i == "YIELD") { yield = $(i + 1) + 0 }
++    }
++    ratio = yield > 0 ? wfe / yield : 0
++    if (wfe <= 0 || ratio < 1.9 || ratio > 2.1) { print "BAD RATIO " ratio; exit 1 }
++}' || { echo "FAILED: $OUTDIR"; exit 1; }
++echo "$line" | grep -q "halted .*waiting for QEMU's lock .*in exclusive sections .*waiting for TLB flushes .*code cache [0-9]* of [0-9]* MiB" \
++    || { echo "LINE INCOMPLETE: $OUTDIR"; exit 1; }
++echo "MATCH"
+diff --git a/tests/tcg/vphone-spin/start.S b/tests/tcg/vphone-spin/start.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..6741bf7f216c83b3419ec3a42ad9c254a981e2e3
+--- /dev/null
++++ b/tests/tcg/vphone-spin/start.S
+@@ -0,0 +1,150 @@
++// vphone-linux: bare-metal AArch64 boot for the counter test (tests/tcg/vphone-cnt).
++// Synchronous exceptions from EL0 (current EL with SP_EL0 / lower EL) are recorded in
++// trap_esr/trap_count and return past the trapping instruction.
++    .section .text.boot, "ax"
++    .global _start
++_start:
++    mrs     x0, CurrentEL
++    lsr     x0, x0, #2
++    cmp     x0, #2
++    b.ne    el1
++    mov     x0, #(1 << 31)
++    msr     hcr_el2, x0
++    mov     x0, #0x3c5
++    msr     spsr_el2, x0
++    adr     x0, el1
++    msr     elr_el2, x0
++    eret
++el1:
++    ldr     x0, =__stack_top
++    mov     sp, x0
++    ldr     x0, =vectors
++    msr     vbar_el1, x0
++    mov     x0, #(3 << 20)
++    msr     cpacr_el1, x0
++    isb
++    ldr     x0, =__bss_start
++    ldr     x1, =__bss_end
++1:  cmp     x0, x1
++    b.hs    2f
++    str     xzr, [x0], #8
++    b       1b
++2:  bl      main
++    ldr     x0, =0x84000008
++    hvc     #0
++park:
++    wfe
++    b       park
++
++    .balign 2048
++vectors:
++    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
++    .balign 128
++    .if \n == 8                     // lower EL, AArch64, synchronous
++    b       el0_sync
++    .elseif \n == 9 || \n == 10 || \n == 11
++    eret
++    .else
++    stp     x0, x1, [sp, #-16]!
++    mov     x0, #\n
++    b       vec_common
++    .endif
++    .endr
++vec_common:
++    mrs     x1, esr_el1
++    mrs     x2, elr_el1
++    mrs     x3, far_el1
++    bl      fatal_exception
++    ldr     x0, =0x84000008
++    hvc     #0
++3:  wfe
++    b       3b
++
++el0_sync:
++    mrs     x9, esr_el1
++    lsr     x10, x9, #26
++    cmp     x10, #0x15              // SVC: return to EL1 (x0 = result)
++    b.eq    el0_svc
++    ldr     x10, =trap_esr
++    str     x9, [x10]
++    ldr     x10, =trap_count
++    ldr     x11, [x10]
++    add     x11, x11, #1
++    str     x11, [x10]
++    mrs     x9, elr_el1
++    add     x9, x9, #4
++    msr     elr_el1, x9
++    eret
++el0_svc:
++    ldr     x10, =el0_result
++    str     x0, [x10]
++    ldr     x10, =el1_resume
++    ldr     x10, [x10]
++    ldr     x11, =el1_sp
++    ldr     x11, [x11]
++    mov     sp, x11
++    br      x10
++
++// u64 run_el0(void (*fn)(void)): runs fn at EL0 (MMU off); fn ends with svc #0 and x0 = result
++    .text
++    .global run_el0
++run_el0:
++    stp     x29, x30, [sp, #-16]!
++    ldr     x9, =el1_sp
++    mov     x10, sp
++    str     x10, [x9]
++    ldr     x9, =el1_resume
++    adr     x10, 1f
++    str     x10, [x9]
++    msr     elr_el1, x0
++    mov     x9, #0                  // EL0t, interrupts unmasked doesn't matter (none enabled)
++    msr     spsr_el1, x9
++    ldr     x9, =el0_stack_top
++    msr     sp_el0, x9
++    eret
++1:  ldp     x29, x30, [sp], #16
++    ldr     x0, =el0_result
++    ldr     x0, [x0]
++    ret
++
++// EL0 bodies: read the counter once (returns it; 0 stays if the read trapped and was skipped)
++    .global el0_read_vct, el0_read_pct
++el0_read_vct:
++    mov     x0, #0
++    mrs     x0, cntvct_el0
++    svc     #0
++el0_read_pct:
++    mov     x0, #0
++    mrs     x0, cntpct_el0
++    svc     #0
++
++// u64 vct_loop(u64 n, u64 *bad): reads CNTVCT n times within straight-line code,
++// counts reads lower than the previous one in *bad, returns last - first
++    .global vct_loop
++vct_loop:
++    mrs     x2, cntvct_el0
++    mov     x4, x2
++    mov     x5, #0
++1:  mrs     x3, cntvct_el0
++    add     x6, x6, #1
++    mrs     x7, cntpct_el0
++    cmp     x3, x2
++    cinc    x5, x5, lo
++    mov     x2, x3
++    subs    x0, x0, #1
++    b.ne    1b
++    str     x5, [x1]
++    sub     x0, x2, x4
++    ret
++
++    .bss
++    .balign 16
++    .global trap_esr, trap_count
++trap_esr:   .quad 0
++trap_count: .quad 0
++el0_result: .quad 0
++el1_resume: .quad 0
++el1_sp:     .quad 0
++    .balign 16
++    .space 4096
++el0_stack_top:
 diff --git a/util/coroutine-aarch64.c b/util/coroutine-aarch64.c
 new file mode 100644
 index 0000000000000000000000000000000000000000..0f2fa665ef2ef572bf711d9586758f5fa5a01466

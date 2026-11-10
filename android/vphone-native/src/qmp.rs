@@ -51,6 +51,11 @@ pub struct Vcpu {
 /// (the SEP coprocessor's CPU comes after them). A new connection each time: QEMU's monitor
 /// socket takes one client, and the pause and stop paths must not wait behind a long-lived one.
 pub fn sample_vcpus(socket: &Path, vcpus: u32) -> io::Result<Vec<Vcpu>> {
+    Ok(parse_registers(&hmp(socket, "info registers -a", None)?, vcpus))
+}
+
+/// One command of QEMU's human monitor over QMP, for vCPU `cpu` where given: its output.
+fn hmp(socket: &Path, command: &str, cpu: Option<u32>) -> io::Result<String> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -61,9 +66,12 @@ pub fn sample_vcpus(socket: &Path, vcpus: u32) -> io::Result<Vec<Vcpu>> {
     writer.write_all(b"{\"execute\":\"qmp_capabilities\"}\n")?;
     line.clear();
     reader.read_line(&mut line)?;
-    writer.write_all(
-        b"{\"execute\":\"human-monitor-command\",\"arguments\":{\"command-line\":\"info registers -a\"}}\n",
-    )?;
+    let mut arguments = serde_json::json!({"command-line": command});
+    if let Some(cpu) = cpu {
+        arguments["cpu-index"] = cpu.into();
+    }
+    let request = serde_json::json!({"execute": "human-monitor-command", "arguments": arguments});
+    writer.write_all(format!("{request}\n").as_bytes())?;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -72,13 +80,38 @@ pub fn sample_vcpus(socket: &Path, vcpus: u32) -> io::Result<Vec<Vcpu>> {
         let reply: serde_json::Value = serde_json::from_str(&line)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         if let Some(text) = reply.get("return").and_then(|v| v.as_str()) {
-            return Ok(parse_registers(text, vcpus));
+            return Ok(text.to_owned());
         }
         if reply.get("error").is_some() {
             return Err(io::Error::other(line.trim().to_string()));
         }
         // An event: the answer is still to come.
     }
+}
+
+/// `count` 32-bit words of the guest's memory at the virtual address `at`, as vCPU `cpu` maps it
+/// now (the monitor's `x`): the instructions around a PC, for telling a spin loop from work.
+/// Fewer words where the guest maps fewer; none where it maps none.
+pub fn read_words(socket: &Path, cpu: u32, at: u64, count: u32) -> io::Result<Vec<u32>> {
+    Ok(parse_words(&hmp(socket, &format!("x /{count}xw {at:#x}"), Some(cpu))?))
+}
+
+/// The words of the monitor's `x /Nxw`: lines of `<address>: 0x<word> 0x<word> ...`; a line that
+/// is not one (`Cannot access memory`) ends them.
+pub fn parse_words(text: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((_, words)) = line.split_once(':') else {
+            break;
+        };
+        for word in words.split_whitespace() {
+            match word.strip_prefix("0x").and_then(|hex| u32::from_str_radix(hex, 16).ok()) {
+                Some(word) => out.push(word),
+                None => return out,
+            }
+        }
+    }
+    out
 }
 
 /// Reads `CPU#n`, ` PC=<hex> ...` and `PSTATE=<hex> <flags> EL<n>...` from `info registers`'s text.
@@ -169,6 +202,40 @@ mod tests {
         server.join().unwrap();
     }
     use std::path::PathBuf;
+
+    #[test]
+    fn reads_the_words_of_the_monitors_dump() {
+        let text = "00000002c0eaca00: 0xd503201f 0xf9400008 0xb4000048 0xd65f03c0\r\n00000002c0eaca10: 0xd503205f 0x17fffffe\r\n";
+        assert_eq!(parse_words(text), vec![0xd503201f, 0xf9400008, 0xb4000048, 0xd65f03c0, 0xd503205f, 0x17fffffe]);
+        assert_eq!(parse_words("Cannot access memory\r\n"), Vec::<u32>::new());
+        assert_eq!(parse_words("00000002c0eaca00: 0xd503201f 0xf9400008\r\n00000002c0eaca08: Cannot access memory\r\n"), vec![0xd503201f, 0xf9400008]);
+    }
+
+    #[test]
+    fn a_dump_is_asked_of_the_vcpu_whose_memory_it_is() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/test-fixtures/sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qmp-words");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            s.write_all(b"{\"QMP\":{}}\n").unwrap();
+            let mut l = String::new();
+            r.read_line(&mut l).unwrap();
+            s.write_all(b"{\"return\":{}}\n").unwrap();
+            l.clear();
+            r.read_line(&mut l).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&l).unwrap();
+            assert_eq!(request["execute"], "human-monitor-command");
+            assert_eq!(request["arguments"]["command-line"], "x /2xw 0x2c0eaca00");
+            assert_eq!(request["arguments"]["cpu-index"], 3);
+            s.write_all(b"{\"return\":\"00000002c0eaca00: 0xd503205f 0x17ffffff\\r\\n\"}\n").unwrap();
+        });
+        assert_eq!(read_words(&path, 3, 0x2c0eaca00, 2).unwrap(), vec![0xd503205f, 0x17ffffff]);
+        server.join().unwrap();
+    }
 
     #[test]
     fn negotiates_then_quits() {

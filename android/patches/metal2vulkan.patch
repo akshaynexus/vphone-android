@@ -394,7 +394,7 @@ index 59062a3d739ecfb28f760135991837af5abb5de6..0a0f9dad7617aea8b5f645358e96a01a
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
-index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03fe5f1b0f 100644
+index 1957d120a3cd349b49eb0476141638fb7d5e19c7..b4eae4f10781d11e70212cbe73ca6614e92bccd2 100644
 --- a/crates/metal2vulkan-runtime/src/host_memory.rs
 +++ b/crates/metal2vulkan-runtime/src/host_memory.rs
 @@ -667,7 +667,7 @@ pub(super) fn import_refused(error: vk::Result) -> Error {
@@ -473,33 +473,262 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  impl Access {
      /// The mapping's flag of the permission in `PROCMAP_QUERY`'s answer (`vma_flags`).
      fn queried(self) -> u64 {
-@@ -855,7 +855,7 @@ impl Access {
+@@ -855,18 +855,274 @@ impl Access {
  /// answers now: for the mappings over it ([`queried_permitted`]), or from the lines of
  /// `/proc/self/maps` where the kernel predates the query ([`permitted`]); `None` when that file
  /// cannot be opened. Each mapping asked is added to `asked`.
 -#[cfg(target_os = "linux")]
 +#[cfg(any(target_os = "linux", target_os = "android"))]
  fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) -> Option<bool> {
-     use std::io::BufRead;
+-    use std::io::BufRead;
      let maps = kept_maps()?;
-@@ -864,9 +864,40 @@ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) ->
+     if let Some(permitted) = queried_permitted(&maps, start, end, access, asked) {
+         return Some(permitted);
      }
-     // The lines are read from a file of their own: reading moves its position, which the kept
-     // one's queries share among threads.
+-    // The lines are read from a file of their own: reading moves its position, which the kept
+-    // one's queries share among threads.
++    // The kernel does not answer the query: the lines, as last read where nothing was said to
++    // have changed over the window since ([`lines_permitted`]).
++    lines_permitted(start, end, access, asked, &read_mappings)
++}
++
++/// One mapping of the process as a line of its maps gives it: `[from, to)`, readable, writable.
++#[cfg(any(target_os = "linux", target_os = "android"))]
++pub(super) type MappingLine = (u64, u64, bool, bool);
++
++/// The process's mappings as one reading of `/proc/self/maps`' lines gave them, in address
++/// order, and [`MapsKept::changes`] when the reading began.
++#[cfg(any(target_os = "linux", target_os = "android"))]
++struct MapsReading {
++    as_of: u64,
++    mappings: Vec<MappingLine>,
++}
++
++#[cfg(any(target_os = "linux", target_os = "android"))]
++impl MapsReading {
++    /// [`permitted`] over the reading: whether its mappings cover `[start, end)` without a gap,
++    /// each with `access`.
++    fn permitted(&self, start: u64, end: u64, access: Access, asked: &mut u64) -> bool {
++        let mut covered = start;
++        // The first mapping ending past the start.
++        let mut at = self.mappings.partition_point(|m| m.1 <= covered);
++        while covered < end {
++            let Some(&(from, to, readable, writable)) = self.mappings.get(at) else {
++                return false;
++            };
++            *asked += 1;
++            let allowed = match access {
++                Access::Read | Access::Pin => readable,
++                Access::Write => writable,
++            };
++            if from > covered || !allowed || !access.pinned(covered) {
++                return false;
++            }
++            covered = to;
++            at += 1;
++        }
++        true
++    }
++}
++
++/// The last reading of the maps' lines, and what the consumer said changed since
++/// ([`host_mappings_changed`]).
++#[cfg(any(target_os = "linux", target_os = "android"))]
++struct MapsKept {
++    /// How many changes were said so far.
++    changes: u64,
++    reading: Option<std::sync::Arc<MapsReading>>,
++    /// The ranges said changed, each with [`MapsKept::changes`] after it was said; those the
++    /// reading saw (said before it began) are dropped as it is kept.
++    changed: Vec<(u64, u64, u64)>,
++    /// [`MapsKept::changes`] at the last change whose range was not kept (more than
++    /// [`MAPS_CHANGES_KEPT`] since the reading): a reading begun before it answers nothing.
++    all_changed: u64,
++    /// Checks the reading did not answer since it was kept ([`MAPS_MISSES_A_READING`]).
++    misses: u32,
++}
++
++/// How many changed ranges are kept against one reading; more, and the reading is dropped.
++#[cfg(any(target_os = "linux", target_os = "android"))]
++const MAPS_CHANGES_KEPT: usize = 4096;
++
++#[cfg(any(target_os = "linux", target_os = "android"))]
++static MAPS_KEPT: Mutex<MapsKept> = Mutex::new(MapsKept {
++    changes: 0,
++    reading: None,
++    changed: Vec::new(),
++    all_changed: 0,
++    misses: 0,
++});
++
++/// How many checks the kept reading may fail to answer before the maps are read whole again and
++/// kept anew. A check it does not answer reads the lines up to its window, as every check did
++/// before a reading was kept; the whole file is about twice that on average, so a process whose
++/// checks the reading never answers pays about an eighth more than it did, and one whose
++/// checks it answers pays for one reading in many.
++#[cfg(any(target_os = "linux", target_os = "android"))]
++const MAPS_MISSES_A_READING: u32 = 8;
++
++/// Tell the runtime that the process's mappings over the `length` bytes at `start` changed: the
++/// consumer mapped, unmapped, remapped or reprotected pages there. Called **after** the change
++/// is made and before memory in the range is handed to the runtime again.
++///
++/// Where the kernel does not answer `PROCMAP_QUERY` (before Linux 6.11, or refused, as
++/// Android's SELinux policy refuses an app's), the runtime reads the process's mappings as the
++/// lines of `/proc/self/maps`, which cost 6.3 ms a reading in an Android process of 14,000
++/// mappings, nine times a frame at worst. It keeps the last reading, and answers from it that a
++/// window is mapped with a permission only where the reading shows every page of it so **and**
++/// no change was said over the window since the reading began. Any other answer (a gap, a
++/// permission missing, a change said) is read from the file at the check, up to the window, as
++/// every answer was before; after [`MAPS_MISSES_A_READING`] of those the whole file is read and
++/// kept anew. So:
++///
++/// - a mapping made since the reading without a word (an allocator's, a driver's) is found by the
++///   new reading its missing answer causes;
++/// - a kept answer can be stale only for pages that were unmapped or lost a permission since the
++///   reading without a word. Memory handed to the runtime is the consumer's to map
++///   ([`HostMemory::new`]): the consumer says every such change of its own, and hands the runtime
++///   no memory another owner changes under it.
++///
++/// A consumer that never calls this keeps the same answers for memory whose mapping it does not
++/// change once made, which [`HostMemory::new`] already asks for the life of a buffer. On a
++/// kernel that answers the query nothing is kept and this does nothing but count. No Metal call
++/// has it: a runtime extension.
++pub fn host_mappings_changed(start: u64, length: u64) {
++    #[cfg(any(target_os = "linux", target_os = "android"))]
++    {
++        let mut kept = lock(&MAPS_KEPT);
++        kept.changes += 1;
++        let now = kept.changes;
++        let end = start.saturating_add(length);
++        // A view is mapped a piece after another: a range that touches the last one said joins it.
++        if let Some(last) = kept.changed.last_mut().filter(|last| start <= last.2 && last.1 <= end) {
++            *last = (now, last.1.min(start), last.2.max(end));
++            return;
++        }
++        // Kept with no reading too: one may be under way, begun before this change.
++        if kept.changed.len() >= MAPS_CHANGES_KEPT {
++            kept.changed.clear();
++            kept.all_changed = now;
++            kept.reading = None;
++            return;
++        }
++        kept.changed.push((now, start, end));
++    }
++    #[cfg(not(any(target_os = "linux", target_os = "android")))]
++    let _ = (start, length);
++}
++
++/// The process's mappings from the lines of `/proc/self/maps`, in address order: all of them,
++/// or with `up_to` those that begin below it (the lines past a window answer nothing about it).
++/// `None` when the file cannot be opened. Counted ([`host_maps_line_reads`]).
++#[cfg(any(target_os = "linux", target_os = "android"))]
++pub(super) fn read_mappings(up_to: Option<u64>) -> Option<Vec<MappingLine>> {
++    use std::io::BufRead;
 +    let began = std::time::Instant::now();
++    // A file of its own: reading moves its position, which the kept one's queries share among
++    // threads.
      let maps = std::fs::File::open("/proc/self/maps").ok()?;
 -    let lines = std::io::BufReader::new(maps).lines().map_while(Result::ok);
 -    Some(permitted(lines, start, end, access, asked))
-+    let lines = std::io::BufReader::with_capacity(1 << 18, maps)
-+        .lines()
-+        .map_while(Result::ok);
-+    let answer = permitted(lines, start, end, access, asked);
++    let mut mappings = Vec::new();
++    for line in std::io::BufReader::with_capacity(1 << 18, maps).lines().map_while(Result::ok) {
++        let Some(found) = mapping_line(&line) else {
++            continue;
++        };
++        if up_to.is_some_and(|end| found.0 >= end) {
++            break;
++        }
++        mappings.push(found);
++    }
 +    MAPS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +    MAPS_READ_NANOS.fetch_add(
 +        u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
 +        std::sync::atomic::Ordering::Relaxed,
 +    );
++    Some(mappings)
++}
++
++/// One line of `/proc/<pid>/maps` as a [`MappingLine`]; `None` for a line that does not parse.
++#[cfg(any(target_os = "linux", target_os = "android"))]
++fn mapping_line(line: &str) -> Option<MappingLine> {
++    let (from, to, readable) = mapping(line, Access::Read)?;
++    let (_, _, writable) = mapping(line, Access::Write)?;
++    Some((from, to, readable, writable))
++}
++
++/// Whether the process maps `[start, end)` without a gap, each page with `access`, from the
++/// lines of its maps: the kept reading's answer where it is yes and no change was said over the
++/// window since that reading began, else the file's as `read` reads it now: up to the window
++/// (`read(Some(end))`), or whole and kept (`read(None)`) where nothing is kept or the kept reading
++/// failed [`MAPS_MISSES_A_READING`] checks ([`host_mappings_changed`] has the rule and its
++/// ground). `None` where `read` gives none.
++#[cfg(any(target_os = "linux", target_os = "android"))]
++pub(super) fn lines_permitted(
++    start: u64,
++    end: u64,
++    access: Access,
++    asked: &mut u64,
++    read: &dyn Fn(Option<u64>) -> Option<Vec<MappingLine>>,
++) -> Option<bool> {
++    let usable = {
++        let kept = lock(&MAPS_KEPT);
++        (kept.reading.as_ref())
++            .filter(|reading| {
++                reading.as_of >= kept.all_changed
++                    && !(kept.changed.iter())
++                        .any(|&(said, from, to)| said > reading.as_of && from < end && start < to)
++            })
++            .cloned()
++    };
++    if let Some(reading) = usable {
++        let mut judged = 0;
++        if reading.permitted(start, end, access, &mut judged) {
++            *asked += judged;
++            MAPS_KEPT_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            return Some(true);
++        }
++        // Not mapped so when it was read: a mapping made since says nothing, so the file is asked.
++    }
++    let (as_of, whole) = {
++        let mut kept = lock(&MAPS_KEPT);
++        kept.misses = kept.misses.saturating_add(1);
++        let whole = kept.reading.is_none() || kept.misses >= MAPS_MISSES_A_READING;
++        (kept.changes, whole)
++    };
++    // Read with no lock held; a change said meanwhile is after `as_of`, and counts against it.
++    let reading = std::sync::Arc::new(MapsReading {
++        as_of,
++        mappings: read((!whole).then_some(end))?,
++    });
++    let answer = reading.permitted(start, end, access, asked);
++    if whole {
++        let mut kept = lock(&MAPS_KEPT);
++        if kept.reading.as_ref().is_none_or(|older| older.as_of <= as_of)
++            && as_of >= kept.all_changed
++        {
++            kept.changed.retain(|&(said, _, _)| said > as_of);
++            kept.reading = Some(reading);
++            kept.misses = 0;
++        }
++    }
 +    Some(answer)
++}
++
++/// Answers given from the kept reading of the maps' lines, with no reading ([`lines_permitted`]).
++#[cfg(any(target_os = "linux", target_os = "android"))]
++static MAPS_KEPT_ANSWERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// How many permission checks were answered from the kept reading of `/proc/self/maps`' lines,
++/// without a reading, since the process started ([`host_mappings_changed`]). A diagnostic: no
++/// Metal call answers it. 0 off Linux.
++pub fn host_maps_kept_answers() -> u64 {
++    #[cfg(any(target_os = "linux", target_os = "android"))]
++    {
++        MAPS_KEPT_ANSWERS.load(std::sync::atomic::Ordering::Relaxed)
++    }
++    #[cfg(not(any(target_os = "linux", target_os = "android")))]
++    0
 +}
 +
 +/// Readings of `/proc/self/maps`' lines made where the kernel does not answer `PROCMAP_QUERY`
@@ -525,7 +754,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  }
  
  /// This process's `/proc/self/maps`, opened once for [`queried_permitted`] and kept with the id of
-@@ -875,7 +906,7 @@ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) ->
+@@ -875,7 +1131,7 @@ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) ->
  /// answers as one opened for the call, without the opening, which cost each import about as much
  /// as its queries (an import over 57 mappings, the consumer's guest pages). A process forked
  /// since holds the file of its parent's mappings, so one of another id opens its own.
@@ -534,7 +763,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
      static KEPT: Mutex<Option<(u32, std::sync::Arc<std::fs::File>)>> = Mutex::new(None);
      let process = std::process::id();
-@@ -890,7 +921,7 @@ pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
+@@ -890,7 +1146,7 @@ pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
  
  /// `struct procmap_query` of Linux's `include/uapi/linux/fs.h` (Linux 6.11): the argument of
  /// [`PROCMAP_QUERY`].
@@ -543,7 +772,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  #[repr(C)]
  #[derive(Default)]
  struct ProcmapQuery {
-@@ -911,21 +942,21 @@ struct ProcmapQuery {
+@@ -911,21 +1167,21 @@ struct ProcmapQuery {
      build_id_addr: u64,
  }
  
@@ -569,7 +798,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
  
  /// Whether the process maps `[start, end)` without a gap, each mapping with `access`, as the
-@@ -934,7 +965,7 @@ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
+@@ -934,7 +1190,7 @@ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
  /// and each added to `asked`. `None` where the kernel does not answer the query (before Linux
  /// 6.11, `ENOTTY`) or fails it otherwise; a missing mapping (`ENOENT`) is an answer, not
  /// permitted.
@@ -578,7 +807,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  pub(super) fn queried_permitted(
      maps: &std::fs::File,
      start: u64,
-@@ -978,7 +1009,7 @@ pub(super) fn queried_permitted(
+@@ -978,7 +1234,7 @@ pub(super) fn queried_permitted(
  
  /// Refuse the window's pages unless the process can write them: no check off Linux (MoltenVK
  /// hands the range to Metal, which reads read-only pages).
@@ -587,7 +816,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> Result<(), Error> {
      Ok(())
  }
-@@ -987,7 +1018,7 @@ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> R
+@@ -987,7 +1243,7 @@ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> R
  /// `[start, end)` without a gap, each with `access`, adding to `asked` each mapping it judged (one
  /// ending past the address it reached). Reading stops at the first line past `end`; a line that
  /// does not parse is skipped.
@@ -596,7 +825,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03
  pub(super) fn permitted(
      maps: impl IntoIterator<Item = String>,
      start: u64,
-@@ -1016,7 +1047,7 @@ pub(super) fn permitted(
+@@ -1016,7 +1272,7 @@ pub(super) fn permitted(
  }
  
  /// One line of `/proc/<pid>/maps`: the mapping's start, its end, and whether it has `access`.
@@ -650,7 +879,7 @@ index 4c166a5c14a810779f5298a8763d1f90e52379c5..4766a1ebc35f1fcb2248cf0312ee5844
          Some((libc::MAP_SHARED | libc::MAP_ANON, None))
      }
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index 606eab5326bf79f6961a3f0227ad9ee05bf77a7f..44f9f1f8e0431ca785e1e59308c3d864752b075b 100644
+index 606eab5326bf79f6961a3f0227ad9ee05bf77a7f..b6148c6c974669d3668d8d692e4fc905328b6aaf 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
 @@ -269,6 +269,8 @@ pub use copy_plan::{BlitOption, CopyProblem};
@@ -666,7 +895,7 @@ index 606eab5326bf79f6961a3f0227ad9ee05bf77a7f..44f9f1f8e0431ca785e1e59308c3d864
  pub use heap::{Heap, HeapDescriptor, HeapProblem, HeapType, SizeAndAlign};
  pub use host_backing::HostBacking;
  pub use host_bytes::HostBytes;
-+pub use host_memory::host_maps_line_reads;
++pub use host_memory::{host_mappings_changed, host_maps_kept_answers, host_maps_line_reads};
  pub use host_memory::{Deallocator, HostMemory, ImportGate, ImportRequest, KeepAlive, RunResolver};
  pub use host_ram::{HostRam, HostRamUse};
  pub use indirect_command_buffer::{
@@ -946,6 +1175,133 @@ index eaa8a2e24b63040dece721c8c8dc7758e32e5f0d..86ba031065707628d9e2c81930370ccc
      ("device/functions.rs", "the device's functions themselves"),
      (
          "device/mod.rs",
+diff --git a/crates/metal2vulkan-runtime/src/tests/host_memory.rs b/crates/metal2vulkan-runtime/src/tests/host_memory.rs
+index a04bd27e63fefd36997d7ac36e3e064b66bdcce7..39b65ba93e4e6095e7447f7c69e2a59f394b0286 100644
+--- a/crates/metal2vulkan-runtime/src/tests/host_memory.rs
++++ b/crates/metal2vulkan-runtime/src/tests/host_memory.rs
+@@ -715,3 +715,122 @@ fn a_source_s_chunks_cover_the_request_at_its_granule() {
+     lengths.push(16_201 * page - 15 * (4 << 20));
+     assert!(!chunks_cover(&lengths, &window, page));
+ }
++
++/// The answers a kernel without `PROCMAP_QUERY` gives through the lines of the maps
++/// (`lines_permitted`), as an Android app's process gets them: a window mapped with the
++/// permission is answered from the kept reading, with no reading, until a change is said over it
++/// (`host_mappings_changed`); a window the kept reading does not show so is read from the file,
++/// so a mapping made without a word is found, and a no is never kept; the eighth such check
++/// reads the file whole and keeps it anew; a change said while a reading is under way counts
++/// against that reading; a view mapped piece after piece is one change; and more changes than
++/// are kept drop the reading.
++#[cfg(target_os = "linux")]
++#[test]
++fn a_kept_reading_of_the_maps_answers_until_a_change_is_said() {
++    use crate::host_mappings_changed;
++    use crate::host_memory::{lines_permitted, read_mappings, MappingLine};
++    use std::cell::Cell;
++    let page = host_page().unwrap();
++    let len = 3 * page as usize;
++    let map = || {
++        // SAFETY: a fresh private mapping, unmapped below.
++        let at = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                len,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_PRIVATE | libc::MAP_ANON,
++                -1,
++                0,
++            )
++        };
++        assert_ne!(at, libc::MAP_FAILED);
++        at
++    };
++    // Readings of the file: up to a window, and whole.
++    let (partial, whole) = (Cell::new(0u32), Cell::new(0u32));
++    let read = |up_to: Option<u64>| {
++        let count = if up_to.is_some() { &partial } else { &whole };
++        count.set(count.get() + 1);
++        read_mappings(up_to)
++    };
++    // The answer, and the readings it took: up to the window, whole.
++    let ask = |start: u64, end: u64, access: Access| {
++        let before = (partial.get(), whole.get());
++        let answer = lines_permitted(start, end, access, &mut 0, &read);
++        (answer, partial.get() - before.0, whole.get() - before.1)
++    };
++    // Nothing kept yet: start from a dropped reading whatever ran before.
++    for i in 0..5000u64 {
++        host_mappings_changed(i << 20, 0x1000);
++    }
++    let at = map();
++    let (start, end) = (at as u64, at as u64 + len as u64);
++    assert_eq!(ask(start, end, Access::Write), (Some(true), 0, 1), "nothing kept: read whole");
++    assert_eq!(ask(start, end, Access::Write), (Some(true), 0, 0), "kept");
++    assert_eq!(ask(start + page, end, Access::Read), (Some(true), 0, 0), "kept, another access");
++    // A page made read-only, and said: the window is asked of the file; what the change left
++    // is kept. (Misses 1 and 2.)
++    // SAFETY: a page of the mapping above.
++    let protected =
++        unsafe { libc::mprotect(at.byte_add(page as usize), page as usize, libc::PROT_READ) };
++    assert_eq!(protected, 0);
++    host_mappings_changed(start + page, page);
++    assert_eq!(ask(start, end, Access::Write), (Some(false), 1, 0));
++    assert_eq!(ask(start, start + page, Access::Write), (Some(true), 0, 0), "the first page, kept");
++    assert_eq!(ask(start, end, Access::Read), (Some(true), 1, 0), "over the change: asked");
++    // A mapping made without a word is found by the reading its missing answer causes, each
++    // time until a whole reading holds it. (Misses 3 and 4.)
++    let other = map();
++    let (other_start, other_end) = (other as u64, other as u64 + len as u64);
++    assert_eq!(ask(other_start, other_end, Access::Write), (Some(true), 1, 0));
++    assert_eq!(ask(other_start, other_end, Access::Write), (Some(true), 1, 0));
++    // Unmapped, and said: not mapped. (Miss 5.)
++    // SAFETY: the mapping above, which nothing uses.
++    assert_eq!(unsafe { libc::munmap(other, len) }, 0);
++    host_mappings_changed(other_start, len as u64);
++    assert_eq!(ask(other_start, other_end, Access::Read), (Some(false), 1, 0));
++    assert_eq!(ask(start, start + page, Access::Write), (Some(true), 0, 0), "elsewhere, kept");
++    // Misses 6 and 7 are asked up to the window; the eighth reads the file whole and keeps it,
++    // and the change it saw no longer counts against it.
++    assert_eq!(ask(start, end, Access::Read), (Some(true), 1, 0));
++    assert_eq!(ask(start, end, Access::Read), (Some(true), 1, 0));
++    assert_eq!(ask(start, end, Access::Read), (Some(true), 0, 1));
++    assert_eq!(ask(start, end, Access::Read), (Some(true), 0, 0), "kept anew");
++    // A no is never kept: each asks the file.
++    assert_eq!(ask(start, end, Access::Write), (Some(false), 1, 0));
++    assert_eq!(ask(start, end, Access::Write), (Some(false), 1, 0));
++    // A view mapped a piece after another is one change, however many pieces: the reading
++    // stays, and answers for what the pieces do not touch.
++    for i in 0..5000u64 {
++        host_mappings_changed(end + (1 << 30) + i * page, page);
++    }
++    assert_eq!(ask(start, start + page, Access::Write), (Some(true), 0, 0), "one change");
++    // More changes apart than are kept: the reading is dropped whole.
++    for i in 0..5000u64 {
++        host_mappings_changed(i << 20, 0x1000);
++    }
++    // A change said while a reading is under way is after that reading began: the reading is
++    // kept, but not for the changed range.
++    let during = |up_to: Option<u64>| -> Option<Vec<MappingLine>> {
++        assert_eq!(up_to, None, "nothing kept: read whole");
++        let mappings = read_mappings(None);
++        host_mappings_changed(start, page);
++        mappings
++    };
++    assert_eq!(
++        lines_permitted(start, start + page, Access::Write, &mut 0, &during),
++        Some(true)
++    );
++    assert_eq!(ask(start, start + page, Access::Write), (Some(true), 1, 0), "said meanwhile");
++    assert_eq!(ask(start + 2 * page, end, Access::Write), (Some(true), 0, 0), "the rest, kept");
++    // No reading to give: no answer.
++    assert_eq!(
++        lines_permitted(start, start + page, Access::Write, &mut 0, &|_| None),
++        None
++    );
++    // SAFETY: the mapping above, which nothing uses.
++    assert_eq!(unsafe { libc::munmap(at, len) }, 0);
++    host_mappings_changed(start, len as u64);
++    assert_eq!(ask(start, end, Access::Read), (Some(false), 1, 0), "unmapped and said");
++}
 diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
 index b0c28d6e34f4f604eac30aeb5fdc6b7bb0847ad1..c7e230f67791234cdbda9f5735cfe34a6d4efc4e 100644
 --- a/crates/metal2vulkan-runtime/src/work_counts.rs

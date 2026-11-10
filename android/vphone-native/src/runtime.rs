@@ -111,6 +111,9 @@ pub(crate) struct Qemu {
     pointer: unsafe extern "C" fn(u16, u16, u32),
     /// `rvg_android_perf_line`: where the guest's frame time went since the last call.
     perf_line: unsafe extern "C" fn(u32, *mut u8, usize) -> usize,
+    /// `vphone_android_cpu_line`: the guest's spin hints and the vCPU threads' waits since the
+    /// last call; absent in a QEMU built before it.
+    cpu_line: Option<unsafe extern "C" fn(*mut u8, usize) -> usize>,
 }
 static QEMU: OnceLock<Qemu> = OnceLock::new();
 
@@ -278,6 +281,7 @@ pub(crate) fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
             set_window: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_set_window")?),
             pointer: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_pointer")?),
             perf_line: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_perf_line")?),
+            cpu_line: dlsym(h, c"vphone_android_cpu_line").ok().map(|f| std::mem::transmute::<*mut c_void, _>(f)),
         }
     };
     Ok(QEMU.get_or_init(|| q))
@@ -579,6 +583,48 @@ fn gpu_line(qemu: &Qemu, cap_hz: u32) -> String {
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
+/// QEMU's line of the guest's spin hints and the vCPU threads' waits since the last call; empty
+/// where the library gives none.
+fn cpu_line(qemu: &Qemu) -> String {
+    let Some(line) = qemu.cpu_line else {
+        return String::new();
+    };
+    let mut buffer = vec![0u8; 1024];
+    // SAFETY: the buffer holds the capacity given; the call writes at most that.
+    let written = unsafe { line(buffer.as_mut_ptr(), buffer.len()) };
+    buffer.truncate(written.min(buffer.len()));
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// How many 16 KiB pages of guest code are dumped in one run: each is a line of the log.
+const CODE_PAGES_SAID: usize = 12;
+/// The words dumped before a PC and from it on.
+const CODE_WORDS: (u64, u32) = (16, 48);
+
+/// The PC most of the guest's vCPUs share in user space, where at least half of them (and three)
+/// are in one 16 KiB page of it: the vCPU to ask, and the PC. TCG keeps a vCPU's PC as of its
+/// last indirect branch or helper call, so vCPUs in one loop show the same few addresses: the
+/// sign of a spin, or of one piece of work spread over every core.
+fn shared_user_pc(vcpus: &[qmp::Vcpu]) -> Option<(u32, u64)> {
+    let user: Vec<&qmp::Vcpu> = vcpus.iter().filter(|v| v.el == 0).collect();
+    let need = 3.max(vcpus.len().div_ceil(2));
+    let mut best: Option<(usize, u32, u64)> = None;
+    for v in &user {
+        let together = user.iter().filter(|o| o.pc >> 14 == v.pc >> 14).count();
+        let same = user.iter().filter(|o| o.pc == v.pc).count();
+        if together >= need && best.is_none_or(|(most, _, _)| same > most) {
+            best = Some((same, v.index, v.pc));
+        }
+    }
+    best.map(|(_, cpu, pc)| (cpu, pc))
+}
+
+/// `guest code 3:00 at 0x2c0eaca3c (cpu0, 4 of 6 vCPUs in this page), from 0x2c0eac9fc: d503201f ...`
+fn code_line(at: u64, pc: u64, cpu: u32, words: &[u32]) -> String {
+    let words: Vec<String> = words.iter().map(|w| format!("{w:08x}")).collect();
+    format!("at {pc:#x} (asked of cpu{cpu}), words from {at:#x}: {}", words.join(" "))
+}
+
 /// The stack sampler's cost is two signals and one reading of the process's mappings a sample,
 /// on this thread: the first four status lines carry one, then every fourth (two minutes).
 fn status_lines(vcpus: u32, refresh_hz: u32) {
@@ -587,15 +633,21 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
     let mut tick = 0u32;
     let mut last: Vec<qmp::Vcpu> = Vec::new();
     let mut still = 0u32;
+    // The guest's processes' CPU time at the last line, once its agent answers.
+    let mut last_top: Option<(Instant, vphone_create_steps::firstboot::CpuTimes)> = None;
+    let mut code_said: Vec<u64> = Vec::new();
+    let agent = Client::new(&paths.vsock_socket());
     while sleep_until_done(STATUS_EVERY) {
         let s = state();
         let elapsed = crate::create::state::now_ms().saturating_sub(s.started_ms) / 1000;
         let sample = qmp::sample_vcpus(&paths.qmp_socket(), vcpus);
         let answered = sample.is_ok();
+        let mut shared = None;
         let guest = match sample {
             Ok(now) => {
                 still = if !now.is_empty() && now == last { still + 1 } else { 0 };
                 let text = guest_summary(&now, still, STATUS_EVERY);
+                shared = shared_user_pc(&now);
                 last = now;
                 text
             }
@@ -612,7 +664,42 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
         ));
         // Where a guest frame's time goes, against the refresh rate's budget.
         if let Some(line) = QEMU.get().map(|q| gpu_line(q, refresh_hz)).filter(|l| !l.is_empty()) {
-            log_line(&format!("gpu {}:{:02} {line}", elapsed / 60, elapsed % 60));
+            log_line(&format!("gpu {elapsed_min}:{elapsed_sec:02} {line}", elapsed_min = elapsed / 60, elapsed_sec = elapsed % 60));
+        }
+        let at = format!("{}:{:02}", elapsed / 60, elapsed % 60);
+        // The guest's spin hints, and what the vCPU threads waited on instead of running it.
+        if let Some(line) = QEMU.get().map(cpu_line).filter(|l| !l.is_empty()) {
+            log_line(&format!("cpu {at} {line}"));
+        }
+        // Which of the guest's processes used its CPUs since the last line, once its agent is up.
+        if matches!(s.phase, Phase::Unlocking | Phase::Running) {
+            let now = Instant::now();
+            let times = agent
+                .rpc("processes.list", serde_json::json!({}), Duration::from_secs(20))
+                .ok()
+                .as_ref()
+                .and_then(vphone_create_steps::firstboot::cpu_times);
+            match times {
+                Some(times) => {
+                    if let Some((then, before)) = &last_top {
+                        let top = vphone_create_steps::firstboot::top_line(before, &times, now.duration_since(*then).as_secs_f64());
+                        log_line(&format!("guest top {at} {top}"));
+                    }
+                    last_top = Some((now, times));
+                }
+                None => log_line(&format!("guest top {at} the guest's agent gave no process list")),
+            }
+        }
+        // Most vCPUs in one page of user code: its instructions, once a page, to tell a spin
+        // loop (WFE, YIELD, a compare and a branch back) from work.
+        if let Some((cpu, pc)) = shared.filter(|(_, pc)| code_said.len() < CODE_PAGES_SAID && !code_said.contains(&(pc >> 14))) {
+            let from = pc.saturating_sub(CODE_WORDS.0 * 4);
+            if let Ok(words) = qmp::read_words(&paths.qmp_socket(), cpu, from, CODE_WORDS.1) {
+                if !words.is_empty() {
+                    code_said.push(pc >> 14);
+                    log_line(&format!("guest code {at} {}", code_line(from, pc, cpu, &words)));
+                }
+            }
         }
         // A boot that is not moving says where it is stuck: the first minutes, then every few.
         // QEMU's main loop not answering is a boot not moving whatever the CPU use, so its
@@ -887,6 +974,19 @@ mod tests {
         let v = |index, el, pc| qmp::Vcpu { index, pc, el };
         let text = guest_summary(&[v(0, 1, 0xfffffe0007a1b2c0), v(1, 0, 0x1a2b)], 0, STATUS_EVERY);
         assert_eq!(text, "guest cpu0 EL1 0xfffffe0007a1b2c0, cpu1 EL0 0x1a2b (1 of 2 in user space)");
+        // The 0.5.9 log's 3:00: six vCPUs in one page of user code, four at one PC.
+        let cpu = |index, el, pc| qmp::Vcpu { index, pc, el };
+        let spin = [cpu(0, 0, 0x2c0eaca3c), cpu(1, 0, 0x2c0eac8cc), cpu(2, 0, 0x2c0eaca3c), cpu(3, 0, 0x2c0eaca3c), cpu(4, 0, 0x2c0eaca3c), cpu(5, 0, 0x2c0eac8d4)];
+        assert_eq!(shared_user_pc(&spin), Some((0, 0x2c0eaca3c)));
+        // Its 2:00: four in user space, each elsewhere; and kernel PCs never count.
+        let apart = [cpu(0, 0, 0x1a000083c), cpu(1, 0, 0x184e9bb78), cpu(2, 0, 0x184438a9c), cpu(3, 0, 0x181cab53c), cpu(4, 1, 0xfffffe003023a224), cpu(5, 1, 0xfffffe003023f340)];
+        assert_eq!(shared_user_pc(&apart), None);
+        let kernel: Vec<qmp::Vcpu> = (0..6).map(|i| cpu(i, 1, 0xfffffe0030a39340)).collect();
+        assert_eq!(shared_user_pc(&kernel), None);
+        assert_eq!(
+            code_line(0x2c0eac9fc, 0x2c0eaca3c, 0, &[0xd503205f, 0x17ffffff]),
+            "at 0x2c0eaca3c (asked of cpu0), words from 0x2c0eac9fc: d503205f 17ffffff"
+        );
         assert!(guest_summary(&[v(0, 1, 4)], 2, STATUS_EVERY).ends_with("no vCPU has moved in 60 s"));
         assert_eq!(guest_summary(&[], 0, STATUS_EVERY), "guest: no vCPU registers");
     }

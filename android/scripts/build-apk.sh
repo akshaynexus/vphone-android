@@ -37,7 +37,8 @@ if [ ${#missing[@]} -gt 0 ]; then
   printf '  %s\n' "${missing[@]}" >&2
   exit 1
 fi
-for symbol in qemu_android_main rvg_android_set_vulkan_gipa rvg_android_set_window rvg_android_pointer; do
+for symbol in qemu_android_main rvg_android_set_vulkan_gipa rvg_android_set_window rvg_android_pointer \
+    rvg_android_perf_line vphone_android_cpu_line; do
   if ! "$READELF" -W --dyn-syms "$QEMU_LIB" | grep -qw "$symbol"; then
     echo "build-apk.sh: $QEMU_LIB does not export $symbol" >&2
     exit 1
