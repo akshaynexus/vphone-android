@@ -71,6 +71,7 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     push(&gfx.iter().map(String::as_str).collect::<Vec<_>>());
     // The virtual network card's boot ROM is not in the app, and iOS does not use it.
     push(&["-global", "virtio-net-pci.romfile="]);
+    push(&net_args(cfg.network));
     push(&["-display", "none"]);
     let vsock = opt(&paths.vsock_socket().to_string_lossy());
     push(&[
@@ -116,11 +117,30 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     if cfg.gpu_diagnostics && cfg.display {
         env.push(("REIMS_VGPU_FRAME_DUMP", dir(frame_dump_dir(paths))));
     }
+    if cfg.network {
+        env.push((crate::net::RESOLV_CONF_ENV, dir(paths.resolv_conf())));
+    }
     env.extend([
         ("TMPDIR", dir(paths.cache.join("tmp"))),
         ("HOME", dir(paths.files.join("home"))),
     ]);
     Launch { args, env }
+}
+
+/// The machine's one network card (vresearch101 makes a `virtio-net-pci` of each `-nic` and
+/// `-net nic`, and of nothing else), and what is on its other end.
+///
+/// With the network: QEMU's user-mode NAT (`crate::net`), IPv4 only, as the phone's own IPv6
+/// would need a route the NAT cannot give.
+/// Without: the card alone, which is what QEMU's defaults made before it was built with the NAT
+/// (`nic` with no peer). Said outright now, as the defaults of a QEMU with the NAT add it; the
+/// card stays so that every device after it keeps its PCI slot.
+pub fn net_args(network: bool) -> [&'static str; 2] {
+    if network {
+        ["-nic", "user,model=virtio-net-pci,ipv6=off"]
+    } else {
+        ["-net", "nic"]
+    }
 }
 
 /// run-vphone.sh's GFX=1 part of `-M`, for a screen of `res` (`1290x2796`) at `refresh_hz`: the one
@@ -239,6 +259,33 @@ mod tests {
         assert!(l.env.contains(&("QEMU_TLB_UNSYNCED", "2".to_string())));
         assert!(l.env.contains(&("VPHONE_FAST_CNT", "1".to_string())));
         assert!(l.env.contains(&("REIMS_VGPU_WINDOW", "1".to_string())));
+    }
+
+    #[test]
+    fn the_network_is_qemus_nat_with_the_apps_dns_file_or_the_card_alone() {
+        let dir = fixture("network");
+        let bundle = Bundle::open(&dir).unwrap();
+        let on = build(&bundle, &cfg(), &paths());
+        let line = on.args.join(" ");
+        assert!(line.contains("-global virtio-net-pci.romfile= -nic user,model=virtio-net-pci,ipv6=off"), "{line}");
+        assert!(on.env.contains(&("VPHONE_RESOLV_CONF", "/data/files/resolv.conf".to_string())));
+        // One card: nothing else names a network device or backend.
+        let count = |l: &Launch, flag: &str| l.args.iter().filter(|a| *a == flag).count();
+        assert_eq!((count(&on, "-nic"), count(&on, "-net"), count(&on, "-netdev")), (1, 0, 0));
+        assert!(!on.args.iter().any(|a| a.starts_with("virtio-net-pci,")));
+        // The vsock link to the guest's agent is its own device, with or without the network.
+        assert!(line.contains("-device virtio-vsock-uds-pci,guest-cid=3"));
+
+        let off = build(&bundle, &VmConfig { network: false, ..cfg() }, &paths());
+        let line = off.args.join(" ");
+        assert!(line.contains("-global virtio-net-pci.romfile= -net nic -display none"), "{line}");
+        assert_eq!((count(&off, "-nic"), count(&off, "-net")), (0, 1));
+        assert!(!line.contains("user"), "{line}");
+        assert!(!off.env.iter().any(|(k, _)| *k == "VPHONE_RESOLV_CONF"));
+        assert!(line.contains("-device virtio-vsock-uds-pci,guest-cid=3"));
+        // Nothing else differs.
+        assert_eq!(on.args.len(), off.args.len());
+        assert_eq!(on.env.len(), off.env.len() + 1);
     }
 
     #[test]

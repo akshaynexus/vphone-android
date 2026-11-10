@@ -199,6 +199,21 @@ pub extern "system" fn Java_com_vphone_android_Native_logLine(
     quiet(|| runtime::log_line(&line));
 }
 
+/// The active network's DNS servers, as Android gives them, for the VM's NAT (`crate::net`).
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_setDnsServers(
+    mut env: JNIEnv,
+    _this: JObject,
+    servers: JString,
+) {
+    let servers = text(&mut env, &servers);
+    quiet(|| {
+        if let Some(line) = crate::net::set_dns_servers(Paths::get(), &servers) {
+            runtime::log_line(&line);
+        }
+    });
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_vphone_android_Native_logTail(
     mut env: JNIEnv,

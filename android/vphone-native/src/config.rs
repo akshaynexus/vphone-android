@@ -95,6 +95,10 @@ pub struct VmConfig {
     /// Which of iOS's background services run (`crate::services`), applied by the guest's agent
     /// when it has changed, from iOS's next start.
     pub services: crate::services::Level,
+    /// Give the VM the internet through QEMU's user-mode network (`crate::net`): a NAT made of
+    /// the app's own sockets, IPv4 only. Off, iOS still has its network card, with nothing on
+    /// the other end, as every VM had before 0.6.4.
+    pub network: bool,
 }
 
 impl Default for VmConfig {
@@ -129,6 +133,7 @@ impl VmConfig {
             swapchain_layout: SwapchainLayout::Auto,
             software_display: false,
             services: crate::services::Level::Unchanged,
+            network: true,
         }
     }
 
@@ -266,6 +271,17 @@ mod tests {
         let set: VmConfig = serde_json::from_str(r#"{"services":"fewest"}"#).unwrap();
         assert_eq!(set.services, Level::Fewest);
         assert!(serde_json::to_string(&VmConfig { services: Level::Trimmed, ..old }).unwrap().contains(r#""services":"trimmed""#));
+    }
+
+    /// Settings saved before the network had a setting get the network.
+    #[test]
+    fn the_network_is_on_unless_a_file_says_otherwise() {
+        assert!(VmConfig::for_phone(11 * 1024, 8).network);
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"version":2}"#).unwrap();
+        assert!(old.network);
+        let off: VmConfig = serde_json::from_str(r#"{"network":false}"#).unwrap();
+        assert!(!off.network);
+        assert!(serde_json::to_string(&off).unwrap().contains(r#""network":false"#));
     }
 
     /// The GPU switches name the driver's flags.

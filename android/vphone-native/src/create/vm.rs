@@ -135,6 +135,8 @@ pub fn dfu_spec(
     }
     // The virtual network card's boot ROM is not in the app, and iOS does not use it.
     push(&["-global", "virtio-net-pci.romfile="]);
+    // The card alone, as before QEMU had its NAT: a restore talks over the virtual USB.
+    push(&launcher::net_args(false));
     if display {
         let gfx = launcher::gfx_args(&res, &mem);
         push(&gfx.iter().map(String::as_str).collect::<Vec<_>>());
@@ -204,7 +206,9 @@ pub fn first_boot_spec(
     run: &Path,
     display: bool,
 ) -> RunSpec {
-    let launch = launcher::build(b, cfg, paths);
+    // Without the network, as every first boot so far: iOS's setup is done by the guest's agent
+    // over vsock, and what iOS does with the internet during it is not known to be harmless.
+    let launch = launcher::build(b, &VmConfig { network: false, ..*cfg }, paths);
     let env: Vec<(String, String)> = launch
         .env
         .into_iter()
@@ -895,6 +899,9 @@ mod tests {
         assert!(line.contains(&format!("-drive file={v}/SEPStorage,if=none,id=sep-storage,format=raw,file.locking=off")));
         assert!(!line.contains("apple-gfx"));
         assert!(spec.env.iter().any(|(k, _)| k == "VPHONE_TARGET_PAGE_BITS"));
+        // The network card alone, as before QEMU had its NAT.
+        assert!(line.contains("-global virtio-net-pci.romfile= -net nic -display none"), "{line}");
+        assert!(!line.contains("-nic") && !spec.env.iter().any(|(k, _)| k == "VPHONE_RESOLV_CONF"));
     }
 
     #[test]
@@ -953,6 +960,10 @@ mod tests {
         let spec = first_boot_spec(&b, &cfg(), &paths(), &dir.join(".runs-boot"), false);
         assert!(spec.gfx);
         assert!(spec.args.join(" ").contains("apple-gfx-mmio"));
+        // Without the internet, whatever the settings say: the card alone.
+        assert!(cfg().network);
+        assert!(spec.args.join(" ").contains("-net nic") && !spec.args.iter().any(|a| a == "-nic"));
+        assert!(!spec.env.iter().any(|(k, _)| k == "VPHONE_RESOLV_CONF"));
         assert_eq!(
             spec.env.iter().find(|(k, _)| k == "REIMS_VGPU_WINDOW").map(|(_, v)| v.as_str()),
             Some("0")

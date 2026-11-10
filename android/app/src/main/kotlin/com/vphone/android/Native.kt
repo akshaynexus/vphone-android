@@ -21,6 +21,8 @@ object Native {
     external fun recordDeath(reason: String)
     /** A line of the running VM's log, from the app's side. */
     external fun logLine(line: String)
+    /** The active network's DNS servers, separated by spaces, for the VM's network: see [VmNetwork]. */
+    external fun setDnsServers(servers: String)
     external fun logTail(path: String, bytes: Long): String
     external fun setSurface(surface: Surface?)
     external fun layoutImage(width: Int, height: Int): IntArray

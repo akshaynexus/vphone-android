@@ -7,6 +7,7 @@ pub mod create;
 pub mod import;
 pub mod launcher;
 pub mod meminfo;
+pub mod net;
 pub mod paths;
 pub mod platform;
 pub mod preflight;

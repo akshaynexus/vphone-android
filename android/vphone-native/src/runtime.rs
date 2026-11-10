@@ -462,6 +462,11 @@ fn start(name: &str) -> Result<(), String> {
     if !cfg.display {
         notice("This VM's screen is off in its settings: iOS runs, and nothing is drawn".into());
     }
+    log_line(&if cfg.network {
+        crate::net::boot_line(paths)
+    } else {
+        "network: off in this VM's settings; iOS has its network card with nothing on the other end".to_string()
+    });
 
     let Launch { args, env } = launcher::build(&bundle, &cfg, paths);
     log_line(&format!("starting QEMU: {}", args.join(" ")));
@@ -545,12 +550,16 @@ fn start(name: &str) -> Result<(), String> {
         crate::adpf::start(cfg.vcpus, cfg.performance, || QEMU_DONE.load(Ordering::SeqCst), log_line);
     }
     let services = cfg.services;
+    let network = cfg.network;
     let vm_dir = dir.clone();
     std::thread::Builder::new()
         .name("vphoned-watch".into())
         .spawn(move || {
             let client = Client::new(&Paths::get().vsock_socket());
             if watch(client.clone()) {
+                if network {
+                    network_line(&client);
+                }
                 // After the unlock, which the user waits for; the guest's agent is up.
                 crate::services::apply(&client, &vm_dir, services, &|line| {
                     log_line(line);
@@ -828,6 +837,35 @@ fn watch(client: Client) -> bool {
         "iOS is up but the screen did not unlock; swipe up",
     );
     true
+}
+
+/// How long iOS is given to get its address after the unlock, in steps of ten seconds.
+const NETWORK_TRIES: u32 = 6;
+
+/// After the unlock: the one `network: ...` line that says whether iOS has its address from
+/// QEMU's NAT, resolves a name and connects (`crate::net::report`), asked of the guest's agent.
+fn network_line(client: &Client) {
+    use crate::net::{self, Link};
+    let rpc = |method: &str, params: serde_json::Value, timeout: Duration| client.rpc(method, params, timeout);
+    let read = || net::link(&rpc("device.network", serde_json::json!({}), Duration::from_secs(30)));
+    let mut link = read();
+    // An address the Mac host of an imported VM pinned is not one QEMU's NAT routes.
+    if matches!(&link, Link::Other(a) if !a.starts_with("169.254.")) {
+        if let Some(line) = net::release_managed_address(&rpc) {
+            log_line(&line);
+            link = Link::NoAddress;
+        }
+    }
+    for _ in 0..NETWORK_TRIES {
+        if !link.may_settle() || !sleep_while_up(Duration::from_secs(10)) {
+            break;
+        }
+        link = read();
+    }
+    if QEMU_DONE.load(Ordering::SeqCst) {
+        return;
+    }
+    log_line(&net::report(&link, &rpc));
 }
 
 // ------------------------------------------------------------------- stop

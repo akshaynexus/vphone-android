@@ -1,0 +1,26 @@
+vphone: the resolv.conf path comes from VPHONE_RESOLV_CONF
+
+Android has no /etc/resolv.conf. Applied to libslirp 4.9.7 by android/scripts/build-deps.sh.
+
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -388,7 +388,18 @@
+ #if defined(__HAIKU__)
+ #define RESOLV_CONF_PATH "/boot/system/settings/network/resolv.conf"
+ #else
+-#define RESOLV_CONF_PATH "/etc/resolv.conf"
++/*
++ * vphone: Android has no /etc/resolv.conf, and an app cannot make one. The
++ * app writes the active network's DNS servers to a file of its own and names
++ * it in VPHONE_RESOLV_CONF. The file is looked at again when it changes, as
++ * /etc/resolv.conf is (get_dns_addr_cached), so the path is read each time.
++ */
++static const char *vphone_resolv_conf_path(void)
++{
++    const char *path = getenv("VPHONE_RESOLV_CONF");
++    return path && *path ? path : "/etc/resolv.conf";
++}
++#define RESOLV_CONF_PATH vphone_resolv_conf_path()
+ #endif
+ 
+ static int get_dns_addr_cached(void *pdns_addr, void *cached_addr,

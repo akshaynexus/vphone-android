@@ -31,9 +31,12 @@ class VmService : Service() {
             ACTION_BOOT -> {
                 vmActive = true
                 goForeground("Starting")
+                // Before QEMU starts: its NAT reads the DNS servers from the file this writes.
+                VmNetwork.start(this)
                 val error = Native.boot(intent.getStringExtra(EXTRA_VM) ?: "")
                 if (error.isNotEmpty()) {
                     vmActive = false
+                    VmNetwork.stop(this)
                     lastBootError = error
                 }
                 startMonitor()
@@ -109,7 +112,10 @@ class VmService : Service() {
             while (true) {
                 val state = App.state()
                 val phase = state.getString("phase")
-                if (vmActive && phase in ENDED) vmActive = false
+                if (vmActive && phase in ENDED) {
+                    vmActive = false
+                    VmNetwork.stop(this)
+                }
                 if (!vmActive && !importing && !transferring) break
                 val text = when {
                     importing -> importText()

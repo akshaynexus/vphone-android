@@ -211,4 +211,22 @@ if ! stamp tasn1; then
   done_stamp tasn1
 fi
 
+# libslirp: QEMU's user-mode network (NAT), the VM's way to the internet. The version Termux
+# ships; the tarball is the tag's archive from the project's own GitLab. Android has no
+# /etc/resolv.conf, so android/patches/libslirp makes it read the file the app names in
+# VPHONE_RESOLV_CONF. The stamp carries the patches' hash: a changed patch rebuilds it.
+SLIRP_PATCHES=$ROOT/android/patches/libslirp
+slirp_stamp=libslirp-$(cat "$SLIRP_PATCHES"/*.patch | sha256sum | cut -c1-16)
+if ! stamp "$slirp_stamp"; then
+  fetch https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.9.7/libslirp-v4.9.7.tar.gz \
+        d2567fa06a6357c7755d61c67293b2c0bf069b3f2173bde6b76cf768529a1938
+  d=$(unpack libslirp-v4.9.7.tar.gz libslirp)
+  for p in "$SLIRP_PATCHES"/*.patch; do
+    patch -d "$d" -p1 --no-backup-if-mismatch < "$p"
+  done
+  meson_static "$d"
+  rm -f "$WORK"/libslirp-*.stamp
+  done_stamp "$slirp_stamp"
+fi
+
 echo "== all dependencies in $PREFIX"

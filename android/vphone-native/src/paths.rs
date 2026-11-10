@@ -56,6 +56,10 @@ impl Paths {
     pub fn qmp_socket(&self) -> PathBuf {
         self.files.join("qmp.sock")
     }
+    /// The DNS servers QEMU's NAT asks (`crate::net`).
+    pub fn resolv_conf(&self) -> PathBuf {
+        self.files.join("resolv.conf")
+    }
     pub fn last_run(&self) -> PathBuf {
         self.files.join("last-run.json")
     }

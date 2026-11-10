@@ -98,7 +98,7 @@ see the build report.
 
 *Boot* checks the bundle, the app's libraries and free memory, then starts the VM. Boot takes several
 minutes on a phone: the screen shows the phase until iOS is up, and the app unlocks the screen once `vphoned`
-answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, iOS's background services, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
+answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, iOS's background services, the network, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
 RAM and a 1024 MiB code cache on a 12 GB phone; 6 GiB and 2048 MiB from 16 GB; 8 GiB and 2048 MiB from 24 GB.
 
 | Control | What it does |
@@ -112,6 +112,39 @@ RAM and a 1024 MiB code cache on a 12 GB phone; 6 GiB and 2048 MiB from 16 GB; 8
 The VM keeps running with the app in the background, in a foreground service (type `specialUse`) holding a
 partial wake lock. A notification brings it back or stops it. QEMU can run once per process, so the app restarts
 itself after a VM ends.
+
+## Network
+
+iOS reaches the internet through QEMU's user-mode network (libslirp 4.9.7, built by
+`scripts/build-deps.sh` and enabled in `scripts/build-qemu.sh`): a NAT made of the app's own sockets, so
+it follows whatever connection the phone uses, Wi-Fi, mobile data or a VPN. The machine's one network card
+(`virtio-net-pci`) is attached to it with `-nic user,model=virtio-net-pci,ipv6=off`. iOS gets `10.0.2.15`
+by DHCP, the gateway `10.0.2.2` and the resolver `10.0.2.3`. *Settings > Network* turns it off for a VM;
+iOS then has the card with nothing on the other end (`-net nic`), as every VM had before 0.6.4. The boots
+of a creation (restore, SSH ramdisk, first boot) are always without it.
+
+- **DNS.** libslirp forwards the guest's lookups to the first IPv4 server of a resolv.conf. Android has
+  none, so `patches/libslirp` makes it read the file named in `VPHONE_RESOLV_CONF`, and the app keeps
+  `files/resolv.conf`: the IPv4 DNS servers of the phone's active network (`VmNetwork.kt`, from
+  `LinkProperties`), then `1.1.1.1` and `8.8.8.8`, which answer when the network lists only IPv6 resolvers.
+  The file is written before the boot and again whenever the active network changes. libslirp looks at
+  it again when it has changed, at most once a second, so a switch of network reaches a running VM without
+  a restart. Only the first server is asked: if the network's own IPv4 server does not answer, the public
+  ones are not tried.
+- **Limits.** IPv4 only. TCP and UDP; `ping` (ICMP) is not tested on a phone. Nothing
+  outside reaches iOS: there are no forwarded ports. Android's Private DNS does not apply to the guest's
+  lookups, which go as plain DNS to the servers above.
+- **The log.** A boot's log has `network: on ... DNS servers ...` at the start, a `network: DNS servers
+  for the VM: ...` line at each change, and, after the unlock, one line of what iOS itself sees, asked of
+  vphoned (`device.network`, then `network.resolve` of `apple.com` with a connection to port 443):
+
+      [vphone] network: en0 10.0.2.15 (QEMU's NAT); DNS apple.com -> 17.253.144.10 in 180 ms; TCP 17.253.144.10:443 connected in 95 ms
+
+  `NO en0` there means iOS's driver did not bind the card; `NO ADDRESS` that it did and DHCP did not
+  answer; `DNS FAILED` and `TCP ... FAILED` name the step that failed. libslirp's own errors go to
+  QEMU's stderr, which is in the same log. A VM that came from a Mac with its address pinned by
+  vphone-cli is set back to DHCP (`network.ipv4.set`), and the log says so.
+- The guest's agent (vsock) and usbmuxd (virtual USB) do not use this network.
 
 ## Logs and failures
 
