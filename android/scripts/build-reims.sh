@@ -27,6 +27,9 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="$RUSTFLAGS_ANDROID"
 cd "$ROOT/reims-vgpu"
 
 BUILD_LOG=$ROOT/android/build/reims-build.log
+# reims-vgpu pins its own toolchain (rust-toolchain.toml, a dated nightly since vphone-next4),
+# which does not come with the Android target: add it to that toolchain, once.
+rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
 cargo rustc --target "$TARGET" --profile "$PROFILE" -p reims-vgpu-c --lib \
     --no-default-features --features reims-vgpu-c/vulkan \
     -- --print native-static-libs 2>&1 | tee "$BUILD_LOG"
