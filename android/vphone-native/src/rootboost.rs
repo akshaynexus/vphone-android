@@ -1,8 +1,8 @@
 //! "Root boost": on a rooted phone (KernelSU first, Magisk and APatch too), `root-boost.sh` runs as
-//! root beside the VM and lifts what an app cannot: the vendor's clock caps, the GPU's and memory
-//! buses' clocks, core parking, the priority and placement of QEMU's threads, the low-memory
-//! killer. What it does and why is in the script. It ends, giving everything back, when the stop
-//! file appears or the app's process is gone.
+//! root beside the VM and lifts what an app cannot: the vendor's clock caps, core parking, the
+//! cpuset, priority and placement of QEMU's threads, the low-memory killer. What it does and why
+//! is in the script. It ends, giving everything back, when the stop file appears or the app's
+//! process is gone.
 //!
 //! KernelSU has no prompt: the app must be allowed root in the KernelSU manager (Superuser), and a
 //! `su` the manager refuses fails at once. Its `su` is reached at `/system/bin/su` by the apps it

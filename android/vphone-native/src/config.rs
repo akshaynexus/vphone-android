@@ -114,9 +114,9 @@ pub struct VmConfig {
     /// "Verbose kernel log": off, NVRAM's `boot-args` keep IOLog and kprintf off the serial line
     /// (`crate::bootargs`); on, the kernel prints everything iBoot's arguments ask for.
     pub verbose_kernel_log: bool,
-    /// "Root boost" (`crate::rootboost`): on a rooted phone, a root script lifts the clock caps,
-    /// pins the CPU, GPU and memory clocks high, keeps cores awake and gives QEMU's threads the
-    /// big cores and the highest priorities while the VM runs. Off by default: it needs root and
+    /// "Root boost" (`crate::rootboost`): on a rooted phone, a root script lifts the vendor's
+    /// clock caps, keeps cores awake and gives QEMU's threads every core and the highest
+    /// priorities while the VM runs. Off by default: it needs root and
     /// makes the phone warm.
     pub root_boost: bool,
 }

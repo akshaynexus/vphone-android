@@ -171,9 +171,9 @@ fun SettingsScreen(
                             it,
                             "Root boost",
                             "Needs root: allow vPhone in KernelSU's Superuser list (or Magisk, APatch). While the VM runs, " +
-                                "the CPU, GPU and memory clocks are held at their highest past the vendor's caps, every core " +
-                                "stays awake, and QEMU's threads get the big cores and the highest priorities. The phone gets " +
-                                "warm: the clocks are given back at 44 °C battery, and everything when the VM ends.",
+                                "the vendor's CPU clock caps are lifted, every core stays awake, and QEMU's threads get all " +
+                                "cores and the highest priorities. The clocks are given back at 44 °C battery, and everything " +
+                                "when the VM ends.",
                             s.rootBoost,
                         ) { v -> s = s.copy(rootBoost = v) }
                     },
