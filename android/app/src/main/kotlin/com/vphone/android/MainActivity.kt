@@ -450,6 +450,15 @@ class MainActivity : Activity() {
             text = "Show the screen (off: iOS runs with nothing drawn)"
             isChecked = config.optBoolean("display", true)
         }
+        val compression = CheckBox(this).apply {
+            text = "GPU image compression (UBWC). Off is the fix for a scrambled screen on the Adreno 840"
+            isChecked = config.optBoolean("gpuCompression", false)
+        }
+        val diagnostics = CheckBox(this).apply {
+            text = "GPU diagnostics: image layouts in the log, and pictures of the guest's screen " +
+                "in the log screen's Share"
+            isChecked = config.optBoolean("gpuDiagnostics", true)
+        }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 0)
@@ -459,9 +468,11 @@ class MainActivity : Activity() {
         labelled(form, "Code cache (MiB)", tb)
         form.addView(hints)
         form.addView(display)
+        form.addView(compression)
+        form.addView(diagnostics)
         AlertDialog.Builder(this)
             .setTitle(name)
-            .setView(form)
+            .setView(ScrollView(this).apply { addView(form) })
             .setPositiveButton("Save") { _, _ ->
                 val saved = JSONObject()
                     .put("vcpus", vcpus.text.toString().toIntOrNull() ?: 0)
@@ -469,6 +480,8 @@ class MainActivity : Activity() {
                     .put("tbMib", tb.text.toString().toIntOrNull() ?: 0)
                     .put("performanceHints", hints.isChecked)
                     .put("display", display.isChecked)
+                    .put("gpuCompression", compression.isChecked)
+                    .put("gpuDiagnostics", diagnostics.isChecked)
                 val error = Native.saveVmConfig(name, saved.toString())
                 if (error.isNotEmpty()) Toast.makeText(this, error, Toast.LENGTH_LONG).show()
                 showVms()

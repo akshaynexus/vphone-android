@@ -254,6 +254,28 @@ index 20981a86d587a667a518e89aa82b1a29fcddf95e..54e5ead565759892578ca625de373446
      assert_eq!(exports, header_functions(&header));
  }
  
+diff --git a/crates/reims-vgpu-core/src/display.rs b/crates/reims-vgpu-core/src/display.rs
+index 57c4dcb20920379147b1d9fb118bba8602d6c32b..7c71f2fee303c4c2eb3103bb1654e3ea519b61be 100644
+--- a/crates/reims-vgpu-core/src/display.rs
++++ b/crates/reims-vgpu-core/src/display.rs
+@@ -903,6 +903,17 @@ impl<P: Platform> DisplayCore<P> {
+         guest_display.and_then(|n| n.cursor_position_unless_paused())
+     }
+ 
++    /// One more reference to the display's current frame, the texture its encode draws: `None`
++    /// before the guest's first frame. For the display's own window, which names the frame it
++    /// drew in a diagnostic ([`DisplayCore::encode_current_frame_with`] reads the same field).
++    pub fn current_frame(&self) -> Option<P::Texture> {
++        self.display_mutex
++            .lock()
++            .current_frame
++            .as_ref()
++            .map(|frame| frame.clone_ref())
++    }
++
+     /// The pipeline the display's own window draws over a frame of the display in a target of
+     /// `format` with ([`DisplayPipelineCache::overlay_for`]), in the display's pass
+     /// ([`DisplayCore::encode_current_frame_with`]): asked before the encode, which makes none.
 diff --git a/crates/reims-vgpu-core/src/testkit/death/sys.rs b/crates/reims-vgpu-core/src/testkit/death/sys.rs
 index acd0b3a5633468e980692089ea8ee46fef1c15fa..a2d675919f0087003a3388bb46686228a5bf217b 100644
 --- a/crates/reims-vgpu-core/src/testkit/death/sys.rs
@@ -2691,10 +2713,28 @@ index d7f1134db6b05371559e034a54f28be838686f31..3bb14613d096b6fc400c7decf5107fcf
      let picked = Picked {
          label: "none",
 diff --git a/crates/reims-vgpu/src/window.rs b/crates/reims-vgpu/src/window.rs
-index 6aad5cbbbf70aa42d963f766f185a5b26d4c8c4e..8ea4e0c68cefe4ae00ff9038be4a1b46bbebcd1a 100644
+index 6aad5cbbbf70aa42d963f766f185a5b26d4c8c4e..67fc84109506c34a6af3e3eecd1b2828cb705aad 100644
 --- a/crates/reims-vgpu/src/window.rs
 +++ b/crates/reims-vgpu/src/window.rs
-@@ -387,7 +387,7 @@ impl<P: Platform> SinkDisplay<P> {
+@@ -359,6 +359,17 @@ impl<P: Platform> SinkDisplay<P> {
+         Some((at.x, at.y))
+     }
+ 
++    /// One more reference to the display's current frame ([`DisplayCore::current_frame`]), for
++    /// a sink's diagnostic of the frame it drew: `None` before the guest's first frame, and once
++    /// the core has gone.
++    #[cfg_attr(
++        not(feature = "vulkan"),
++        expect(dead_code, reason = "only the Vulkan platform's sink dumps its frames")
++    )]
++    pub(crate) fn current_frame(&self) -> Option<P::Texture> {
++        self.core.upgrade()?.current_frame()
++    }
++
+     /// The display's statistics, where they are on: a sink that measures its frames' GPU time
+     /// reports it there.
+     #[cfg_attr(
+@@ -387,7 +398,7 @@ impl<P: Platform> SinkDisplay<P> {
      /// holds it on until the frame completes. So when the host has released the display in the
      /// meantime, this draw's release, inside this entry, may be the display's end.
      #[cfg_attr(
@@ -2704,18 +2744,415 @@ index 6aad5cbbbf70aa42d963f766f185a5b26d4c8c4e..8ea4e0c68cefe4ae00ff9038be4a1b46
              dead_code,
              reason = "Linux's sink draws each frame with its decoration"
 diff --git a/crates/reims-vgpu/src/window/vulkan.rs b/crates/reims-vgpu/src/window/vulkan.rs
-index c16496afb52c39cc2f782f76a656a955a951286a..c5b8a561c60c009a8c96737e6fd729e3a4c24cf4 100644
+index c16496afb52c39cc2f782f76a656a955a951286a..0d3d960e351d970d3de6ac9a29fe3c6ca71b4a53 100644
 --- a/crates/reims-vgpu/src/window/vulkan.rs
 +++ b/crates/reims-vgpu/src/window/vulkan.rs
-@@ -2,7 +2,7 @@
+@@ -2,7 +2,8 @@
  //! the window's swapchain, on either OS (`swapchain.rs`), and each OS's window asks the sink for
  //! it its own way (`linux.rs`, `macos.rs`).
  
 -#[cfg(target_os = "linux")]
++mod dump;
 +#[cfg(any(target_os = "linux", target_os = "android"))]
  mod linux;
  #[cfg(target_os = "macos")]
  mod macos;
+diff --git a/crates/reims-vgpu/src/window/vulkan/dump.rs b/crates/reims-vgpu/src/window/vulkan/dump.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c61eaffe6ff9da103f7fe61fdd38812e43b35ed7
+--- /dev/null
++++ b/crates/reims-vgpu/src/window/vulkan/dump.rs
+@@ -0,0 +1,343 @@
++//! Frame dumps, a diagnostic for a window whose picture is wrong: with `REIMS_VGPU_FRAME_DUMP`
++//! naming a directory, the window's presenter writes there, every [`PERIOD`] at most, the bytes
++//! of the surface behind the frame it just drew, as the CPU reads them in the guest's pages, and
++//! says so on stderr.
++//!
++//! The bytes are read with plain loads from the host's view of the surface
++//! (`reims_vgpu_vulkan::os::lend_surface_bytes_for_reading`): no Vulkan command, image or copy is
++//! between them and the file. So a dump that shows the picture the guest drew, beside a window
++//! that does not, puts the fault after the surface (the copy into the frame's image, the draw
++//! into the swapchain, the swapchain's image as the compositor reads it); a dump that shows the
++//! window's wrong picture puts it before (what the GPU wrote back into the surface).
++//!
++//! **The file.** `frame-N.rgba` (N cycles through [`KEPT`] files): [`MAGIC`], then the width and
++//! the height as little-endian `u32`s, then one `R G B A` byte quadruple per pixel, rows from the
++//! top with no padding. A surface of 8 bytes per element is read as four half floats per pixel
++//! in `R G B A` order, each clamped to [0, 1] and scaled to a byte with no transfer function;
++//! one of 4 bytes per element as `B G R A` bytes. Alpha is written as 255: the dump is of the
++//! picture, and a viewer that blends it would hide it. Any other surface is not dumped, and the
++//! line on stderr says what it is.
++
++use std::io::Write as _;
++use std::path::{Path, PathBuf};
++use std::sync::OnceLock;
++use std::time::{Duration, Instant};
++
++use reims_vgpu_core::platform::os::surface::Surface as _;
++use reims_vgpu_core::platform::resource::Texture as _;
++use reims_vgpu_vulkan::VulkanPlatform;
++use reims_vgpu_vulkan::os::lend_surface_bytes_for_reading;
++
++use crate::window::SinkDisplay;
++
++/// The switch: the directory the dumps go to.
++const DUMP_VAR: &str = "REIMS_VGPU_FRAME_DUMP";
++
++/// The least time between two dumps.
++const PERIOD: Duration = Duration::from_secs(15);
++
++/// How many files are kept: the dump after the last overwrites the first.
++const KEPT: u32 = 4;
++
++/// What a dump file starts with.
++pub(crate) const MAGIC: &[u8; 8] = b"RVGDUMP1";
++
++/// The directory the environment names, read once per process; `None` without the switch.
++fn directory() -> Option<&'static Path> {
++    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
++    DIR.get_or_init(|| {
++        std::env::var_os(DUMP_VAR)
++            .filter(|dir| !dir.is_empty())
++            .map(PathBuf::from)
++    })
++    .as_deref()
++}
++
++/// A presenter's dumps: when the last one was written, and how many were.
++#[derive(Default)]
++pub(crate) struct FrameDumps {
++    last: Option<Instant>,
++    written: u32,
++}
++
++impl FrameDumps {
++    /// After a frame was presented: dumps the surface behind `display`'s current frame where the
++    /// switch is on and [`PERIOD`] has passed since the last dump. Never fails the frame: what
++    /// keeps a dump from being written is said on stderr, once per period.
++    pub(crate) fn presented(&mut self, display: &SinkDisplay<VulkanPlatform>) {
++        let Some(dir) = directory() else {
++            return;
++        };
++        let now = Instant::now();
++        if self.last.is_some_and(|last| now.duration_since(last) < PERIOD) {
++            return;
++        }
++        let Some(frame) = display.current_frame() else {
++            // Before the guest's first frame: asked again at the next one.
++            return;
++        };
++        self.last = Some(now);
++        let said = format!(
++            "a frame of Metal pixel format {}, {}x{}, usage {:#x}",
++            frame.pixel_format(),
++            frame.width(),
++            frame.height(),
++            frame.usage()
++        );
++        let Some(surface) = frame.iosurface() else {
++            eprintln!(
++                "reims-vgpu: frame dump: {said}, over no surface: nothing the CPU reads holds \
++                 it, and it is not dumped"
++            );
++            return;
++        };
++        let shape = Shape {
++            width: surface.width(),
++            height: surface.height(),
++            bytes_per_element: surface.bytes_per_element(),
++            bytes_per_row: surface.bytes_per_row(),
++        };
++        let fourcc = fourcc(surface.pixel_format());
++        let mut pixels = None;
++        let lent = lend_surface_bytes_for_reading(&surface, &mut |bytes| {
++            pixels = rgba(bytes, shape);
++        });
++        let path = dir.join(format!("frame-{}.rgba", self.written % KEPT));
++        let written = match (lent, pixels) {
++            (Err(why), _) => Err(why.to_owned()),
++            (Ok(()), None) => Err(format!(
++                "a surface of {} bytes per element and rows of {} bytes is not one the dump reads",
++                shape.bytes_per_element, shape.bytes_per_row
++            )),
++            (Ok(()), Some(pixels)) => write(&path, shape, &pixels).map_err(|e| e.to_string()),
++        };
++        match written {
++            Ok(()) => {
++                self.written = self.written.wrapping_add(1);
++                eprintln!(
++                    "reims-vgpu: frame dump {}: {said}, over a surface '{fourcc}' of {}x{}, {} \
++                     bytes per element, rows of {} bytes: its bytes in the guest's pages, as the \
++                     CPU reads them, are in {}",
++                    self.written,
++                    shape.width,
++                    shape.height,
++                    shape.bytes_per_element,
++                    shape.bytes_per_row,
++                    path.display()
++                );
++            }
++            Err(why) => eprintln!(
++                "reims-vgpu: frame dump: {said}, over a surface '{fourcc}' of {}x{}: not dumped \
++                 ({why})",
++                shape.width, shape.height
++            ),
++        }
++    }
++}
++
++/// A surface's layout, as the dump reads it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Shape {
++    pub(crate) width: u64,
++    pub(crate) height: u64,
++    pub(crate) bytes_per_element: u64,
++    pub(crate) bytes_per_row: u64,
++}
++
++/// An OSType as its four characters, a `.` for each that does not print.
++fn fourcc(format: u32) -> String {
++    format
++        .to_be_bytes()
++        .iter()
++        .map(|&b| {
++            if b.is_ascii_graphic() {
++                char::from(b)
++            } else {
++                '.'
++            }
++        })
++        .collect()
++}
++
++/// A half float's value.
++fn half(bits: u16) -> f32 {
++    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
++    let exponent = i32::from((bits >> 10) & 0x1f);
++    let fraction = f32::from(bits & 0x3ff);
++    let magnitude = match exponent {
++        0 => fraction * 2f32.powi(-24),
++        31 if fraction == 0.0 => f32::INFINITY,
++        31 => f32::NAN,
++        _ => (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
++    };
++    sign * magnitude
++}
++
++/// A color channel's byte: the value clamped to [0, 1] and scaled, a NaN as 0.
++fn byte(value: f32) -> u8 {
++    if value.is_nan() {
++        return 0;
++    }
++    let scaled = (value.clamp(0.0, 1.0) * 255.0).round();
++    // In [0, 255] after the clamp.
++    #[expect(
++        clippy::cast_possible_truncation,
++        clippy::cast_sign_loss,
++        clippy::as_conversions,
++        reason = "the value lies in [0, 255]"
++    )]
++    let byte = scaled as u8;
++    byte
++}
++
++/// The surface's pixels as `R G B A` bytes, rows from the top with no padding (the module doc);
++/// `None` for a layout the dump does not read, or bytes too few for it.
++pub(crate) fn rgba(bytes: &[u8], shape: Shape) -> Option<Vec<u8>> {
++    let width = usize::try_from(shape.width).ok()?;
++    let height = usize::try_from(shape.height).ok()?;
++    let element = usize::try_from(shape.bytes_per_element).ok()?;
++    let pitch = usize::try_from(shape.bytes_per_row).ok()?;
++    if !(element == 4 || element == 8) || width == 0 || height == 0 {
++        return None;
++    }
++    let row_bytes = width.checked_mul(element)?;
++    if pitch < row_bytes {
++        return None;
++    }
++    let needed = pitch.checked_mul(height - 1)?.checked_add(row_bytes)?;
++    if bytes.len() < needed {
++        return None;
++    }
++    let mut out = Vec::with_capacity(width.checked_mul(height)?.checked_mul(4)?);
++    for row in bytes.chunks(pitch).take(height) {
++        for pixel in row.get(..row_bytes)?.chunks_exact(element) {
++            match *pixel {
++                [b, g, r, _] => out.extend_from_slice(&[r, g, b, 255]),
++                [r0, r1, g0, g1, b0, b1, _, _] => out.extend_from_slice(&[
++                    byte(half(u16::from_le_bytes([r0, r1]))),
++                    byte(half(u16::from_le_bytes([g0, g1]))),
++                    byte(half(u16::from_le_bytes([b0, b1]))),
++                    255,
++                ]),
++                _ => return None,
++            }
++        }
++    }
++    Some(out)
++}
++
++/// Writes the dump file (the module doc) beside its final name, then moves it there, so a reader
++/// never sees half a file.
++fn write(path: &Path, shape: Shape, pixels: &[u8]) -> std::io::Result<()> {
++    let (Ok(width), Ok(height)) = (u32::try_from(shape.width), u32::try_from(shape.height)) else {
++        return Err(std::io::Error::other("a surface too large for the header"));
++    };
++    if let Some(dir) = path.parent() {
++        std::fs::create_dir_all(dir)?;
++    }
++    let partial = path.with_extension("partial");
++    let mut file = std::fs::File::create(&partial)?;
++    file.write_all(MAGIC)?;
++    file.write_all(&width.to_le_bytes())?;
++    file.write_all(&height.to_le_bytes())?;
++    file.write_all(pixels)?;
++    drop(file);
++    std::fs::rename(&partial, path)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Half floats read as their values
++    #[test]
++    fn halves_read_as_their_values() {
++        assert_eq!(half(0x0000), 0.0);
++        assert_eq!(half(0x3c00), 1.0);
++        assert_eq!(half(0x3800), 0.5);
++        assert_eq!(half(0xbc00), -1.0);
++        assert_eq!(half(0x4000), 2.0);
++        assert_eq!(half(0x0001), 2f32.powi(-24));
++        assert!(half(0x7c00).is_infinite() && half(0x7e00).is_nan());
++        assert_eq!(
++            [byte(0.0), byte(0.5), byte(1.0), byte(7.0), byte(-1.0), byte(f32::NAN)],
++            [0, 128, 255, 255, 0, 0]
++        );
++    }
++
++    /// A surface of half floats is read row by row at its pitch, the bytes between rows left out
++    #[test]
++    fn a_half_float_surface_is_read_at_its_pitch() {
++        let shape = Shape {
++            width: 2,
++            height: 2,
++            bytes_per_element: 8,
++            bytes_per_row: 24,
++        };
++        let one = 0x3c00u16.to_le_bytes();
++        let half_ = 0x3800u16.to_le_bytes();
++        let pixel = |r: [u8; 2], g: [u8; 2], b: [u8; 2]| [r, g, b, one].concat();
++        let mut bytes = Vec::new();
++        bytes.extend(pixel(one, [0, 0], [0, 0]));
++        bytes.extend(pixel([0, 0], one, [0, 0]));
++        bytes.extend([0xee; 8]);
++        bytes.extend(pixel([0, 0], [0, 0], one));
++        bytes.extend(pixel(half_, half_, half_));
++        assert_eq!(
++            rgba(&bytes, shape).unwrap(),
++            [
++                [255, 0, 0, 255],
++                [0, 255, 0, 255],
++                [0, 0, 255, 255],
++                [128, 128, 128, 255]
++            ]
++            .concat()
++        );
++        assert!(rgba(&bytes[..bytes.len() - 1], shape).is_none(), "too few bytes");
++    }
++
++    /// A surface of four bytes per pixel is read as BGRA, and other layouts are not read
++    #[test]
++    fn a_bgra_surface_is_read_and_others_are_not() {
++        let shape = Shape {
++            width: 1,
++            height: 2,
++            bytes_per_element: 4,
++            bytes_per_row: 4,
++        };
++        assert_eq!(
++            rgba(&[1, 2, 3, 4, 5, 6, 7, 8], shape).unwrap(),
++            [3, 2, 1, 255, 7, 6, 5, 255]
++        );
++        let odd = Shape {
++            bytes_per_element: 2,
++            ..shape
++        };
++        assert!(rgba(&[0; 8], odd).is_none());
++        let narrow = Shape {
++            bytes_per_row: 3,
++            ..shape
++        };
++        assert!(rgba(&[0; 8], narrow).is_none());
++        assert_eq!(fourcc(u32::from_be_bytes(*b"RGhA")), "RGhA");
++        assert_eq!(fourcc(1), "....");
++    }
++
++    /// The file is the header and the pixels
++    #[test]
++    fn the_file_is_the_header_and_the_pixels() {
++        let dir = std::env::temp_dir().join(format!("rvg-dump-{}", std::process::id()));
++        let path = dir.join("frame-0.rgba");
++        let shape = Shape {
++            width: 1,
++            height: 1,
++            bytes_per_element: 4,
++            bytes_per_row: 4,
++        };
++        write(&path, shape, &[9, 8, 7, 255]).unwrap();
++        let file = std::fs::read(&path).unwrap();
++        assert_eq!(&file[..8], MAGIC);
++        assert_eq!(&file[8..], [1, 0, 0, 0, 1, 0, 0, 0, 9, 8, 7, 255]);
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}
+diff --git a/crates/reims-vgpu/src/window/vulkan/swapchain.rs b/crates/reims-vgpu/src/window/vulkan/swapchain.rs
+index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..e62113e89169a3d95e499dae44f5632b6a3a6171 100644
+--- a/crates/reims-vgpu/src/window/vulkan/swapchain.rs
++++ b/crates/reims-vgpu/src/window/vulkan/swapchain.rs
+@@ -29,6 +29,9 @@
+ //! display's device, until the window's render thread ends at the window's end: its swapchain and
+ //! surface go there, before the window under them.
+ //!
++//! **Frame dumps.** With `REIMS_VGPU_FRAME_DUMP` naming a directory, a presenter writes there the
++//! bytes of the surface behind a frame it presented, as the CPU reads them (`dump`).
++//!
+ //! **Statistics.** With `REIMS_VGPU_STATS` on, each frame committed counts as a window frame, as
+ //! every sink's does, and its command buffer's GPU time is the window's ([`crate::stats`]).
+ 
+@@ -42,6 +45,7 @@ use reims_vgpu_window::{
+     BarLayout, Decoration, Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget,
+ };
+ 
++use super::dump::FrameDumps;
+ use crate::entry;
+ use crate::stats::DisplayStats;
+ use crate::window::{SinkDisplay, WindowFrame};
+@@ -136,6 +140,7 @@ impl SwapchainSink {
+                 Some(Box::new(SwapchainPresenter {
+                     display: Arc::clone(&self.display),
+                     swapchain,
++                    dumps: FrameDumps::default(),
+                 }))
+             }
+             Err(refused) => {
+@@ -155,6 +160,8 @@ struct SwapchainPresenter {
+     display: Arc<SinkDisplay<VulkanPlatform>>,
+     /// The swapchain.
+     swapchain: Swapchain,
++    /// The dumps of the frames' surfaces, where `REIMS_VGPU_FRAME_DUMP` asks for them (`dump`).
++    dumps: FrameDumps,
+ }
+ 
+ impl Presenter for SwapchainPresenter {
+@@ -209,6 +216,7 @@ impl Presenter for SwapchainPresenter {
+                 return Drawn::Nothing;
+             };
+             self.swapchain.present(frame, command_buffer);
++            self.dumps.presented(&self.display);
+             Drawn::Presented
+         })
+     }
 diff --git a/docs/qemu.md b/docs/qemu.md
 index c504f3a4e816fa2f5ea3ee473eba889240a2b289..0d3fd545e36a3bfbc1695326d0e3648d8371aff5 100644
 --- a/docs/qemu.md

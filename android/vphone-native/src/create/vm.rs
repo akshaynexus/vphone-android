@@ -873,6 +873,8 @@ mod tests {
             tb_mib: 1024,
             performance_hints: false,
             display: true,
+            gpu_compression: false,
+            gpu_diagnostics: true,
         }
     }
 

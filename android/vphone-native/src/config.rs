@@ -21,6 +21,14 @@ pub struct VmConfig {
     /// Draw the guest's screen in the app's window. Off, the GPU device still runs and draws
     /// nowhere (`REIMS_VGPU_WINDOW=0`), as a setup boot with its display off does.
     pub display: bool,
+    /// Let the GPU driver keep images compressed (UBWC). Off, Turnip runs with `TU_DEBUG=noubwc`.
+    /// Off by default: with it on, the Adreno 840 showed a compressed image's bytes as its
+    /// picture (0.5.6's scrambled screen).
+    pub gpu_compression: bool,
+    /// Diagnostics for a wrong picture: the driver prints each image's layout
+    /// (`TU_DEBUG=layout`), and the surface behind the frame on screen is saved every few
+    /// seconds (`REIMS_VGPU_FRAME_DUMP`), for the log screen's Share.
+    pub gpu_diagnostics: bool,
 }
 
 impl Default for VmConfig {
@@ -47,7 +55,21 @@ impl VmConfig {
             tb_mib,
             performance_hints: true,
             display: true,
+            gpu_compression: false,
+            gpu_diagnostics: true,
         }
+    }
+
+    /// Turnip's `TU_DEBUG` for these settings; `None` where they ask for nothing.
+    pub fn tu_debug(&self) -> Option<String> {
+        let flags: Vec<&str> = [
+            (!self.gpu_compression).then_some("noubwc"),
+            self.gpu_diagnostics.then_some("layout"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!flags.is_empty()).then(|| flags.join(","))
     }
 
     pub fn load(vm: &Path) -> VmConfig {
@@ -110,6 +132,8 @@ mod tests {
             tb_mib: 1024,
             performance_hints: true,
             display: true,
+            gpu_compression: false,
+            gpu_diagnostics: true,
         };
         assert!(c.validate(8, 11000).is_err());
         assert_eq!(VmConfig { vcpus: 6, ..c }.ram_arg(), "4G");
@@ -125,5 +149,21 @@ mod tests {
         let off: VmConfig = serde_json::from_str(r#"{"display":false}"#).unwrap();
         assert!(!off.display);
         assert!(serde_json::to_string(&off).unwrap().contains(r#""display":false"#));
+    }
+
+    /// Settings saved before the GPU switches run without compression and with the diagnostics.
+    #[test]
+    fn gpu_switches_default_and_name_the_drivers_flags() {
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"display":true}"#).unwrap();
+        assert!(!old.gpu_compression && old.gpu_diagnostics);
+        assert_eq!(old.tu_debug().as_deref(), Some("noubwc,layout"));
+        let set: VmConfig =
+            serde_json::from_str(r#"{"gpuCompression":true,"gpuDiagnostics":false}"#).unwrap();
+        assert_eq!(set.tu_debug(), None);
+        let quiet = VmConfig { gpu_diagnostics: false, ..old };
+        assert_eq!(quiet.tu_debug().as_deref(), Some("noubwc"));
+        let compressed = VmConfig { gpu_compression: true, ..old };
+        assert_eq!(compressed.tu_debug().as_deref(), Some("layout"));
+        assert!(serde_json::to_string(&old).unwrap().contains(r#""gpuCompression":false"#));
     }
 }

@@ -443,7 +443,16 @@ fn start(name: &str) -> Result<(), String> {
 
     let Launch { args, env } = launcher::build(&bundle, &cfg, paths);
     log_line(&format!("starting QEMU: {}", args.join(" ")));
+    // Dumps of an earlier boot would pass for this one's.
+    if let Ok(old) = fs::read_dir(launcher::frame_dump_dir(paths)) {
+        for file in old.flatten() {
+            let _ = fs::remove_file(file.path());
+        }
+    }
     for (key, value) in env {
+        if key == "TU_DEBUG" || key == "REIMS_VGPU_FRAME_DUMP" {
+            log_line(&format!("GPU setting: {key}={value}"));
+        }
         std::env::set_var(key, value);
     }
 

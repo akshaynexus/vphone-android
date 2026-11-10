@@ -98,7 +98,7 @@ see the build report.
 
 *Boot* checks the bundle, the app's libraries and free memory, then starts the VM. Boot takes several
 minutes on a phone: the screen shows the phase until iOS is up, and the app unlocks the screen once `vphoned`
-answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache and performance hints. Defaults: 6 vCPUs, 4 GiB
+answers. *Settings* sets each VM's vCPUs, RAM, TCG code cache, performance hints, whether its screen is drawn, and two GPU switches (see *A wrong picture*). Defaults: 6 vCPUs, 4 GiB
 RAM and a 1024 MiB code cache on a 12 GB phone; 6 GiB and 2048 MiB from 16 GB; 8 GiB and 2048 MiB from 24 GB.
 
 | Control | What it does |
@@ -123,6 +123,27 @@ dies with a VM in it, the next launch shows why, from Android's `ApplicationExit
 
 No helper processes run, so Android's limit on phantom processes does not apply: `process-isolation` runs each
 GPU task on threads inside QEMU.
+
+### A wrong picture
+
+*Settings* has two GPU switches for each VM:
+
+| Setting | Default | What it sets |
+|---|---|---|
+| GPU image compression (UBWC) | off | Off runs Turnip with `TU_DEBUG=noubwc`. |
+| GPU diagnostics | on | `TU_DEBUG=layout`: the driver prints each image's format, size, pitch, tile mode and UBWC sizes to `serial.log`. `REIMS_VGPU_FRAME_DUMP=<files>/runs/frames`: every 15 s at most, the GPU device saves the bytes of the guest surface behind the frame on screen, read by the CPU from the guest's pages with no GPU command between (`reims-vgpu`'s `window/vulkan/dump.rs`). The log screen's *Share* sends the last four as `guest-surface-N.png` with the log. |
+
+Compression is off because 0.5.6 on an Adreno 840 drew a scrambled screen whose structure is that of a
+UBWC-compressed 864x1864 image of 8 bytes per pixel shown as plain rows: 27 columns of 32 pixels (256-byte
+compressed blocks in 6912-byte rows), repeating every 16 rows (27 macrotiles of 4 KiB). The guest's
+framebuffer surface is such an image (`RGBA16Float`); the swapchain's is 4 bytes per pixel. Which read of
+it goes wrong (the copy back into the guest's pages, the copy into the image, or the draw that samples
+it) is not known, and neither is whether `noubwc` cures it: nothing here was run on the GPU.
+
+A screenshot beside a `guest-surface-N.png` tells the two halves apart. The PNG scrambled like the screen:
+the GPU wrote the scramble into the guest's pages (the render or the copy back). The PNG right and the
+screen wrong: the fault is after the surface (the copy into the image, the draw, or the swapchain image
+as the compositor reads it; the swapchain image's `layout` line says how Turnip laid it out).
 
 Android 17 adds a per-app memory limit based on the phone's RAM. A VM it ends is reported as such;
 lower the RAM or the code cache.

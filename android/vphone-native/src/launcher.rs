@@ -99,6 +99,12 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
             (key, value)
         }
     }));
+    if let Some(flags) = cfg.tu_debug() {
+        env.push(("TU_DEBUG", flags));
+    }
+    if cfg.gpu_diagnostics && cfg.display {
+        env.push(("REIMS_VGPU_FRAME_DUMP", dir(frame_dump_dir(paths))));
+    }
     env.extend([
         ("TMPDIR", dir(paths.cache.join("tmp"))),
         ("HOME", dir(paths.files.join("home"))),
@@ -135,10 +141,16 @@ pub fn gfx_env(paths: &Paths) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Where the GPU device saves the surface behind the frame on screen, with the diagnostics on.
+pub fn frame_dump_dir(paths: &Paths) -> std::path::PathBuf {
+    paths.files.join("runs/frames")
+}
+
 /// The directories the environment above names, and the vsock socket's.
 pub fn runtime_dirs(paths: &Paths) -> Vec<std::path::PathBuf> {
     vec![
         paths.files.join("runs/census"),
+        frame_dump_dir(paths),
         paths.files.join("home"),
         paths.files.join("vsock"),
         paths.cache.join("tmp"),
@@ -167,6 +179,8 @@ mod tests {
             tb_mib: 1024,
             performance_hints: false,
             display: true,
+            gpu_compression: false,
+            gpu_diagnostics: true,
         }
     }
 
@@ -208,7 +222,30 @@ mod tests {
         assert!(!off.env.contains(&("REIMS_VGPU_WINDOW", "1".to_string())));
         // Nothing else differs: the GPU device and its memory are the same.
         assert_eq!(on.args, off.args);
-        assert_eq!(on.env.len(), off.env.len());
+        // But the frame dumps, which only a window's presenter writes.
+        assert_eq!(on.env.len(), off.env.len() + 1);
+        assert!(!off.env.iter().any(|(k, _)| *k == "REIMS_VGPU_FRAME_DUMP"));
+    }
+
+    #[test]
+    fn the_gpu_switches_reach_the_driver_and_the_gpu_device() {
+        let dir = fixture("gpu-switches");
+        let bundle = Bundle::open(&dir).unwrap();
+        let value = |l: &Launch, key: &str| {
+            l.env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+        };
+        let default = build(&bundle, &cfg(), &paths());
+        assert_eq!(value(&default, "TU_DEBUG").as_deref(), Some("noubwc,layout"));
+        assert_eq!(
+            value(&default, "REIMS_VGPU_FRAME_DUMP").as_deref(),
+            Some("/data/files/runs/frames")
+        );
+        assert!(runtime_dirs(&paths()).contains(&PathBuf::from("/data/files/runs/frames")));
+        let plain = VmConfig { gpu_compression: true, gpu_diagnostics: false, ..cfg() };
+        let plain = build(&bundle, &plain, &paths());
+        assert_eq!(value(&plain, "TU_DEBUG"), None);
+        assert_eq!(value(&plain, "REIMS_VGPU_FRAME_DUMP"), None);
+        assert_eq!(default.args, plain.args);
     }
 
     #[test]

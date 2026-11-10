@@ -95,6 +95,8 @@ mod tests {
             tb_mib: 1024,
             performance_hints: true,
             display: true,
+            gpu_compression: false,
+            gpu_diagnostics: true,
         };
         let mut r = Report::default();
         check_memory(

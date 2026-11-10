@@ -23,7 +23,8 @@ import java.util.concurrent.Executors
 /**
  * The running VM's log, live: QEMU's output and the status line every 30 s. Copy takes what is
  * shown; Share sends a file with more of the log and this app's logcat, which has the GPU
- * driver's messages.
+ * driver's messages, and with the VM's GPU diagnostics on, pictures of the surface behind the
+ * frame on screen ([FrameDumps]).
  */
 class VmLogActivity : Activity() {
     private val main = Handler(Looper.getMainLooper())
@@ -147,17 +148,26 @@ class VmLogActivity : Activity() {
         val file = File(dir, "$vm-boot.log")
         Toast.makeText(this, "Preparing the log", Toast.LENGTH_SHORT).show()
         worker.execute {
-            val result = runCatching { writeShared(file) }
+            val result = runCatching {
+                writeShared(file)
+                FrameDumps.toPngs(File(filesDir, FrameDumps.DIR), dir)
+            }
             main.post {
                 result.exceptionOrNull()?.let {
                     Toast.makeText(this, "Cannot prepare the log: ${it.message}", Toast.LENGTH_LONG).show()
                     return@post
                 }
                 val uri = FileProvider.getUriForFile(this, "$packageName.logs", file)
-                val send = Intent(Intent.ACTION_SEND)
-                    .setType("text/plain")
-                    .putExtra(Intent.EXTRA_STREAM, uri)
-                    .putExtra(Intent.EXTRA_SUBJECT, "$vm boot log")
+                val frames = result.getOrDefault(emptyList())
+                    .map { FileProvider.getUriForFile(this, "$packageName.logs", it) }
+                val send = if (frames.isEmpty()) {
+                    Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM, uri)
+                } else {
+                    // The log and the pictures of the guest's surface, as the GPU diagnostics saved them.
+                    Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*")
+                        .putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(listOf(uri) + frames))
+                }
+                send.putExtra(Intent.EXTRA_SUBJECT, "$vm boot log")
                     .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 startActivity(Intent.createChooser(send, "Share the log"))
             }
