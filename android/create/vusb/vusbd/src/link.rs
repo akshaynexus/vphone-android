@@ -11,7 +11,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use vusb_common::active::ActiveInstant;
 
 /// Framing overhead of a host-to-device message.
 const FRAME_HEADER: usize = 6;
@@ -38,8 +39,12 @@ const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A NAK is retried after this long, doubling up to `NAK_DELAY_MAX` until the transfer gets data.
 const NAK_DELAY_MIN: Duration = Duration::from_millis(1);
 const NAK_DELAY_MAX: Duration = Duration::from_millis(16);
-/// How long the guest may go without acknowledging a packet: far past any slow phone.
+/// How long the guest may go without acknowledging a packet: far past any slow phone. Like every
+/// limit here it is counted on the active clock, so a paused creation uses none of it.
 const OUT_ACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long one blocked write to the chardev waits before the time it has made no progress for
+/// is looked at again.
+const WRITE_SLICE: Duration = Duration::from_secs(2);
 /// Packets in flight. The controller queues at most 64 host messages (`VUSB_HOST_FIFO`) and pauses
 /// the chardev beyond that.
 pub const OUT_WINDOW: usize = 32;
@@ -148,7 +153,7 @@ impl Link {
     pub fn serve(&self, stream: UnixStream) -> io::Result<()> {
         // QEMU pauses its end when the controller's queue is full; a guest that has stopped reading
         // must fail a send the way it fails an acknowledgement.
-        stream.set_write_timeout(Some(self.out_ack_timeout))?;
+        stream.set_write_timeout(Some(WRITE_SLICE.min(self.out_ack_timeout)))?;
         let mut reader = stream.try_clone()?;
         *self.write.lock().unwrap() = Some(stream);
         self.lock().connected = true;
@@ -285,16 +290,33 @@ impl Link {
         let Some(stream) = w.as_mut() else {
             return Err(LinkError::NoDevice);
         };
-        stream.write_all(frames).map_err(|_| {
-            let _ = stream.shutdown(Shutdown::Both);
-            LinkError::NoDevice
-        })
+        // The socket's own time limit runs on the system clock, through a pause too. It is short,
+        // and what decides is how long, in time this process was running, nothing went out.
+        let mut rest = frames;
+        let mut stuck_since = ActiveInstant::now();
+        while !rest.is_empty() {
+            match stream.write(rest) {
+                Ok(n) if n > 0 => {
+                    rest = &rest[n..];
+                    stuck_since = ActiveInstant::now();
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+                        && stuck_since.elapsed() < self.out_ack_timeout => {}
+                _ => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Err(LinkError::NoDevice);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn wait_for<T>(
         &self,
         epoch: u64,
-        deadline: Option<Instant>,
+        deadline: Option<ActiveInstant>,
         cancel: Option<&AtomicBool>,
         mut pick: impl FnMut(&mut State) -> Option<T>,
     ) -> Result<T> {
@@ -314,11 +336,13 @@ impl Link {
             s = match deadline {
                 None => self.cond.wait(s).unwrap(),
                 Some(d) => {
-                    let now = Instant::now();
-                    if now >= d {
+                    // A wait the process was stopped in comes back expired; the active clock says
+                    // how much of the limit is really left.
+                    let left = d.remaining();
+                    if left.is_zero() {
                         return Err(LinkError::Timeout);
                     }
-                    self.cond.wait_timeout(s, d - now).unwrap().0
+                    self.cond.wait_timeout(s, left).unwrap().0
                 }
             };
         }
@@ -328,7 +352,7 @@ impl Link {
         &self,
         queue: Queue,
         epoch: u64,
-        deadline: Option<Instant>,
+        deadline: Option<ActiveInstant>,
         cancel: Option<&AtomicBool>,
         retry: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<u8>> {
@@ -355,7 +379,7 @@ impl Link {
 
     /// USB bus reset; completes when the current boot stage's driver answers.
     pub fn reset(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = ActiveInstant::now() + timeout;
         let epoch = {
             let mut s = self.lock();
             s.reset_responses.clear();
@@ -390,7 +414,7 @@ impl Link {
         let epoch = self.epoch();
         let retry = || self.send(0, MSG_DATA, &payload);
         retry()?;
-        let deadline = Some(Instant::now() + self.ctrl_timeout);
+        let deadline = Some(ActiveInstant::now() + self.ctrl_timeout);
         self.next(Queue::Ctrl, epoch, deadline, cancel, &retry)
     }
 
@@ -513,7 +537,7 @@ impl Link {
         cancel: Option<&AtomicBool>,
     ) -> Result<Vec<Response>> {
         let mut seen = 0;
-        let mut deadline = Instant::now() + self.out_ack_timeout;
+        let mut deadline = ActiveInstant::now() + self.out_ack_timeout;
         loop {
             let got = self.wait_for(epoch, Some(deadline), cancel, |s| {
                 let queue = s.out_acks.entry(address).or_default();
@@ -531,7 +555,7 @@ impl Link {
                         return Err(LinkError::Timeout);
                     }
                     seen = arrived;
-                    deadline = Instant::now() + self.out_ack_timeout;
+                    deadline = ActiveInstant::now() + self.out_ack_timeout;
                 }
                 other => return other,
             }
@@ -545,7 +569,7 @@ impl Link {
         if self.send(address, MSG_ABORT, &[]).is_err() {
             return;
         }
-        let deadline = Some(Instant::now() + ABORT_TIMEOUT);
+        let deadline = Some(ActiveInstant::now() + ABORT_TIMEOUT);
         let _ = self.wait_for(epoch, deadline, None, |s| {
             let key = if address & 0x7f == 0 { 0 } else { address };
             s.aborts.entry(key).or_default().pop_front()
@@ -564,6 +588,7 @@ fn push_frame(out: &mut Vec<u8>, ep: u8, typ: u8, payload: &[u8]) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Instant;
 
     const EP: u8 = 0x01;
 

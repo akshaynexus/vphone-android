@@ -19,7 +19,8 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use vusb_common::active::ActiveInstant;
 use vusb_common::{status, transfer_type, DeviceBlob, OpCode, C2S, PROTOCOL_VERSION, S2C};
 
 pub const LIBUSB_SUCCESS: c_int = 0;
@@ -167,7 +168,8 @@ struct SyncSlot {
 
 struct Pending {
     target: Target,
-    deadline: Option<Instant>,
+    /// On the active clock: a transfer's time limit does not run while the process is stopped.
+    deadline: Option<ActiveInstant>,
     timed_out: bool,
 }
 
@@ -403,24 +405,22 @@ fn serve(shared: &Arc<Shared>, stream: UnixStream) {
 
 fn next_deadline_ms(s: &Shared) -> c_int {
     let st = lock(s);
-    let mut earliest: Option<Instant> = None;
+    let mut earliest: Option<ActiveInstant> = None;
     for p in st.pending.values() {
         if !p.timed_out {
             if let Some(d) = p.deadline {
-                earliest = Some(earliest.map_or(d, |e: Instant| e.min(d)));
+                earliest = Some(earliest.map_or(d, |e: ActiveInstant| e.min(d)));
             }
         }
     }
     match earliest {
         None => -1,
-        Some(d) => {
-            let now = Instant::now();
-            if d <= now {
-                0
-            } else {
-                (d - now).as_millis().min(i32::MAX as u128) as c_int + 1
-            }
-        }
+        // A poll that ends early (the process was stopped through it) comes back here and waits
+        // for what is left.
+        Some(d) => match d.remaining() {
+            left if left.is_zero() => 0,
+            left => left.as_millis().min(i32::MAX as u128 - 1) as c_int + 1,
+        },
     }
 }
 
@@ -428,9 +428,8 @@ fn fire_deadlines(s: &Shared) {
     let mut expired = Vec::new();
     {
         let mut st = lock(s);
-        let now = Instant::now();
         for (id, p) in st.pending.iter_mut() {
-            if !p.timed_out && p.deadline.is_some_and(|d| d <= now) {
+            if !p.timed_out && p.deadline.is_some_and(|d| d.passed()) {
                 p.timed_out = true;
                 expired.push(*id);
             }
@@ -1255,11 +1254,11 @@ struct Request {
     setup: [u8; 8],
 }
 
-fn deadline_from(timeout_ms: c_uint) -> Option<Instant> {
+fn deadline_from(timeout_ms: c_uint) -> Option<ActiveInstant> {
     if timeout_ms == 0 {
         None
     } else {
-        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+        Some(ActiveInstant::now() + Duration::from_millis(timeout_ms as u64))
     }
 }
 

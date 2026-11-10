@@ -36,13 +36,16 @@ unpack() { # name -> prints source dir
 }
 stamped() { [ -f "$WORK/$1.stamp" ]; }
 stamp() { touch "$WORK/$1.stamp"; echo "== $1 done"; }
-autotools() { # name [configure args]
-  local n=$1; shift; stamped "$n" && return 0
+autotools() { # name [configure args]; PATCH=file applies it first, and a changed patch rebuilds
+  local n=$1 key=$1; shift
+  [ -z "${PATCH:-}" ] || key=$n-$(sha256sum "$PATCH" | cut -c1-12)
+  stamped "$key" && return 0
   local d; d=$(unpack "$n")
+  [ -z "${PATCH:-}" ] || patch -d "$d" -p1 -s < "$PATCH"
   ( cd "$d" && ./configure --host=$HOST --build=x86_64-pc-linux-gnu --prefix="$PREFIX" --enable-static --disable-shared "$@" >configure.out 2>&1 || { tail -n 40 configure.out; tail -n 40 config.log; exit 1; }
     make -j"$JOBS" >make.out 2>&1 || { tail -n 40 make.out; exit 1; }
     make install >/dev/null )
-  stamp "$n"
+  stamp "$key"
 }
 
 if ! stamped xz; then autotools xz --disable-xz --disable-xzdec --disable-lzmadec --disable-lzmainfo --disable-scripts --disable-doc --disable-nls; fi
@@ -73,7 +76,9 @@ fi
 
 export LIBS=""
 if ! stamped libplist; then autotools libplist --without-cython --without-tools; fi
-autotools libimobiledevice-glue
+# Its timed waits (condition variables, sockets) count on a clock that leaves out time the process
+# was stopped: a paused creation stops the restore tool for as long as the person likes.
+PATCH=$here/patches/libimobiledevice-glue-active-clock.patch autotools libimobiledevice-glue
 autotools libusbmuxd --without-tools --without-preflight 
 autotools libtatsu
 autotools libimobiledevice --without-cython --with-openssl

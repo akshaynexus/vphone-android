@@ -1,0 +1,191 @@
+diff -ruN a/include/libimobiledevice-glue/thread.h b/include/libimobiledevice-glue/thread.h
+--- a/include/libimobiledevice-glue/thread.h
++++ b/include/libimobiledevice-glue/thread.h
+@@ -23,6 +23,7 @@
+ #define __THREAD_H
+ 
+ #include <stddef.h>
++#include <stdint.h>
+ #include <libimobiledevice-glue/glue.h>
+ 
+ #ifdef _WIN32
+@@ -103,6 +104,11 @@
+ LIMD_GLUE_API int cond_wait(cond_t* cond, mutex_t* mutex);
+ LIMD_GLUE_API int cond_wait_timeout(cond_t* cond, mutex_t* mutex, unsigned int timeout_ms);
+ 
++/* vphone: milliseconds this process has been running, leaving out time it was stopped
++ * (SIGSTOP, as a paused VM creation stops its helpers). cond_wait_timeout and the socket
++ * waits count their limits on this clock. */
++LIMD_GLUE_API uint64_t vphone_active_ms(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/src/socket.c b/src/socket.c
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -66,6 +66,7 @@
+ #endif
+ #include "common.h"
+ #include "libimobiledevice-glue/socket.h"
++#include "libimobiledevice-glue/thread.h"
+ #ifdef HAVE_POLL
+ #include <sys/poll.h>
+ #endif
+@@ -248,11 +249,22 @@
+ 			SOCKET_ERR(2, "%s: fd_mode %d unsupported\n", __func__, mode);
+ 			return poll_status_error;
+ 	}
++	/* vphone: a time limit is counted on the active clock (thread.h). A poll the process was
++	 * stopped in ends early by that clock, and waits again for what is left. */
++	const int limit = timeout;
++	const uint64_t start = limit > 0 ? vphone_active_ms() : 0;
+ 	while (1) {
+ 		struct pollfd pfd = {
+ 			.fd = fd,
+ 			.events = events,
+ 		};
++		if (limit > 0) {
++			uint64_t spent = vphone_active_ms() - start;
++			if (spent >= (uint64_t)limit) {
++				return poll_status_timeout;
++			}
++			timeout = limit - (int)spent;
++		}
+ 		switch (poll(&pfd, 1, timeout)) {
+ 			case 1:
+ 				if((pfd.revents & (POLLNVAL | POLLERR)) != 0)
+@@ -262,6 +274,9 @@
+ 				}
+ 				return poll_status_success;
+ 			case 0:
++				if (limit > 0) {
++					continue;
++				}
+ 				return poll_status_timeout;
+ 			case -1:
+ 				if(errno == EINTR)
+diff -ruN a/src/thread.c b/src/thread.c
+--- a/src/thread.c
++++ b/src/thread.c
+@@ -27,6 +27,12 @@
+ #endif
+ #include "common.h"
+ #include "libimobiledevice-glue/thread.h"
++#ifndef _WIN32
++#include <errno.h>
++#include <stdint.h>
++#include <time.h>
++#include <sys/time.h>
++#endif
+ 
+ int thread_new(THREAD_T *thread, thread_func_t thread_func, void* data)
+ {
+@@ -192,6 +198,68 @@
+ #endif
+ }
+ 
++#ifndef _WIN32
++/* vphone: the active clock. A thread ticks every 100 ms; the time between two ticks counts,
++ * but never more than a second of it. A process that was stopped comes back to one tick that
++ * is minutes long, of which a second is counted. A reader between ticks applies the same
++ * limit to the time since the last tick, so the first thread to wake after a stop already
++ * reads the right time. */
++#define VPHONE_ACTIVE_TICK_NS 100000000ULL
++#define VPHONE_ACTIVE_GAP_LIMIT_NS 1000000000ULL
++
++static pthread_once_t vphone_active_once = PTHREAD_ONCE_INIT;
++static pthread_mutex_t vphone_active_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint64_t vphone_active_counted_ns;
++static uint64_t vphone_active_last_ns;
++
++static uint64_t vphone_monotonic_ns(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++
++static uint64_t vphone_active_pending(uint64_t now)
++{
++	uint64_t gap = now > vphone_active_last_ns ? now - vphone_active_last_ns : 0;
++	return gap < VPHONE_ACTIVE_GAP_LIMIT_NS ? gap : VPHONE_ACTIVE_GAP_LIMIT_NS;
++}
++
++static void* vphone_active_ticker(void* arg)
++{
++	(void)arg;
++	for (;;) {
++		struct timespec tick = { 0, VPHONE_ACTIVE_TICK_NS };
++		nanosleep(&tick, NULL);
++		pthread_mutex_lock(&vphone_active_lock);
++		uint64_t now = vphone_monotonic_ns();
++		vphone_active_counted_ns += vphone_active_pending(now);
++		vphone_active_last_ns = now;
++		pthread_mutex_unlock(&vphone_active_lock);
++	}
++	return NULL;
++}
++
++static void vphone_active_start(void)
++{
++	pthread_t thread;
++	vphone_active_last_ns = vphone_monotonic_ns();
++	/* Without the ticker the clock is still monotonic, only slow: waits get longer, not shorter. */
++	if (pthread_create(&thread, NULL, vphone_active_ticker, NULL) == 0) {
++		pthread_detach(thread);
++	}
++}
++
++uint64_t vphone_active_ms(void)
++{
++	pthread_once(&vphone_active_once, vphone_active_start);
++	pthread_mutex_lock(&vphone_active_lock);
++	uint64_t ns = vphone_active_counted_ns + vphone_active_pending(vphone_monotonic_ns());
++	pthread_mutex_unlock(&vphone_active_lock);
++	return ns / 1000000ULL;
++}
++#endif
++
+ int cond_wait_timeout(cond_t* cond, mutex_t* mutex, unsigned int timeout_ms)
+ {
+ #ifdef _WIN32
+@@ -205,15 +273,28 @@
+ 			return -1;
+ 	}
+ #else
+-	struct timespec ts;
+-	struct timeval now;
+-	gettimeofday(&now, NULL);
+-
+-	ts.tv_sec = now.tv_sec + timeout_ms / 1000;
+-	ts.tv_nsec = now.tv_usec * 1000 + 1000 * 1000 * (timeout_ms % 1000);
+-	ts.tv_sec += ts.tv_nsec / (1000 * 1000 * 1000);
+-	ts.tv_nsec %= (1000 * 1000 * 1000);
+-
+-	return pthread_cond_timedwait(cond, mutex, &ts);
++	/* vphone: the limit is counted on the active clock. A wait the process was stopped in
++	 * comes back expired by the system's clock; what is left of the limit is waited again. */
++	uint64_t start = vphone_active_ms();
++	for (;;) {
++		uint64_t spent = vphone_active_ms() - start;
++		if (spent >= timeout_ms) {
++			return ETIMEDOUT;
++		}
++		unsigned int left = timeout_ms - (unsigned int)spent;
++		struct timespec ts;
++		struct timeval now;
++		gettimeofday(&now, NULL);
++
++		ts.tv_sec = now.tv_sec + left / 1000;
++		ts.tv_nsec = now.tv_usec * 1000 + 1000 * 1000 * (left % 1000);
++		ts.tv_sec += ts.tv_nsec / (1000 * 1000 * 1000);
++		ts.tv_nsec %= (1000 * 1000 * 1000);
++
++		int res = pthread_cond_timedwait(cond, mutex, &ts);
++		if (res != ETIMEDOUT) {
++			return res;
++		}
++	}
+ #endif
+ }

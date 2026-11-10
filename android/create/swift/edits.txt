@@ -33,3 +33,13 @@ Package.swift	\.linkedLibrary\("usbmuxd-2\.0"\), \.linkedLibrary\("tatsu"\), \.l
 # The APK has no bundle layout above the executable: the app extracts the resources and names the folder.
 Sources/VPhoneCoreKit/Firmware/VPhoneResources.swift	(public static func resolve\(executablePath: String\? = nil\) -> VPhoneResources \{\n)	\1        if let path = ProcessInfo.processInfo.environment["VPHONE_RESOURCES"], !path.isEmpty {\n            return VPhoneResources(base: URL(fileURLWithPath: path))\n        }\n
 Sources/VPhoneCoreKit/Firmware/VPhoneFirmwareIndex.swift	guard let root = try JSONSerialization\.jsonObject\(with: data\) as\? \[String: Any\],\n\s*let entries = root\["ios"\] as\? \[\[String: Any\]\]\n\s*else \{ throw Error\.unexpectedShape\(catalogueURL\) \}\n\s*return entries	guard let entries = try? VPhoneAndroidCatalogue.entries(from: data) else { throw Error.unexpectedShape(catalogueURL) }\n        return entries
+# A paused creation stops this tool (SIGSTOP) for as long as the person likes. Its own time limits count on glue's
+# active clock (deps-create/patches/libimobiledevice-glue-active-clock.patch), which leaves stopped time out.
+Sources/MobileRestoreCore/Transfer/asr.c	^#include "common\.h"$	#include "common.h"\n#include <libimobiledevice-glue/thread.h>
+Sources/MobileRestoreCore/Transfer/asr.c	uint64_t now = clock_gettime_nsec_np\(CLOCK_MONOTONIC\);	uint64_t now = (vphone_active_ms() + 1) * 1000000ULL; /* never 0, which means "not idle" */
+Sources/VPhoneRestore/Recovery/VPhoneRecoveryProbe.swift	^import MobileRecoveryCore$	import MobileRecoveryCore\n\n/// glue's active clock: milliseconds this process has run, not counting time it was stopped.\n@_silgen_name("vphone_active_ms") private func vphone_active_ms() -> UInt64
+Sources/VPhoneRestore/Recovery/VPhoneRecoveryProbe.swift	let deadline = DispatchTime\.now\(\) \+ \.seconds\(max\(timeout, 0\)\)\n(\s*)while DispatchTime\.now\(\) < deadline \{	let limit = UInt64(max(timeout, 0)) * 1000\n\1let began = vphone_active_ms()\n\1while vphone_active_ms() - began < limit {
+# The image write hashes every 128 KiB it sends. glue's sha1() is portable C (246 MB/s on the build PC); OpenSSL's, already
+# linked, uses the CPU's SHA instructions (1999 MB/s there) and gives the same digest.
+Sources/MobileRestoreCore/Transfer/asr.c	^#include <libimobiledevice-glue/sha\.h>$	#include <libimobiledevice-glue/sha.h>\n#include <openssl/evp.h>
+Sources/MobileRestoreCore/Transfer/asr.c	sha1\(\(unsigned char\*\)data, size, \(unsigned char\*\)\(data\+size\)\);	if (EVP_Digest(data, size, (unsigned char*)(data+size), NULL, EVP_sha1(), NULL) != 1) {\n\t\t\t\tlogger(LL_ERROR, "Unable to hash a filesystem payload chunk\134n");\n\t\t\t\tbreak;\n\t\t\t}

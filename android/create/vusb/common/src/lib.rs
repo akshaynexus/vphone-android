@@ -5,6 +5,8 @@
 
 use std::io::{self, Read, Write};
 
+pub mod active;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 

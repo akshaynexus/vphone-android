@@ -75,13 +75,16 @@ cp "$A/vusbd" "$OUT/libvusbd.so"
 cp "$A/vphone_portfwd" "$OUT/libvphone_portfwd.so"
 
 # --- libplist and libimobiledevice-glue for Android, static --------------------------------------------
-build_autotools() { # name tarball configure-args
+PATCHES=$ROOT/android/deps-create/patches
+build_autotools() { # name tarball configure-args; PATCH=file applies it first, and a changed patch rebuilds
   local name=$1 tarball=$2; shift 2
   local stamp=$BUILD/$name.stamp
+  [ -z "${PATCH:-}" ] || stamp=$BUILD/$name-$(sha256sum "$PATCH" | cut -c1-12).stamp
   [ -f "$stamp" ] && return 0
   local d=$BUILD/android-src/$name
   rm -rf "$d"; mkdir -p "$d"
   tar -xjf "$SRC/$tarball" -C "$d" --strip-components=1
+  [ -z "${PATCH:-}" ] || patch -d "$d" -p1 -s < "$PATCH"
   (cd "$d" && CC=$CC AR=$AR RANLIB=$RANLIB STRIP=$STRIP \
      CFLAGS="-O2 -fPIC -g0" \
      PKG_CONFIG_LIBDIR=$PREFIX/lib/pkgconfig PKG_CONFIG_PATH= \
@@ -91,7 +94,24 @@ build_autotools() { # name tarball configure-args
   touch "$stamp"
 }
 build_autotools libplist libplist-2.7.0.tar.bz2 --without-cython --without-tools
-build_autotools glue libimobiledevice-glue-1.3.2.tar.bz2
+# glue's timed waits count on a clock that leaves out time the process was stopped (a paused
+# creation stops usbmuxd with the VM); usbmuxd's own ticks use the same clock, below.
+GLUE_PATCH=$PATCHES/libimobiledevice-glue-active-clock.patch
+PATCH=$GLUE_PATCH build_autotools glue libimobiledevice-glue-1.3.2.tar.bz2
+
+# The same glue for this host, beside the host usbmuxd: the verification restore's tools, which
+# find it through LD_LIBRARY_PATH, then keep time as the phone's do.
+HOST_GLUE=$BUILD/host-glue
+host_glue_stamp=$BUILD/host-glue-$(sha256sum "$GLUE_PATCH" | cut -c1-12).stamp
+if [ ! -f "$host_glue_stamp" ]; then
+  rm -rf "$HOST_GLUE"; mkdir -p "$HOST_GLUE/src"
+  tar -xjf "$SRC/libimobiledevice-glue-1.3.2.tar.bz2" -C "$HOST_GLUE/src" --strip-components=1
+  patch -d "$HOST_GLUE/src" -p1 -s < "$GLUE_PATCH"
+  (cd "$HOST_GLUE/src" && ./configure --prefix="$HOST_GLUE" --libdir="$HOST_GLUE/lib" --disable-static >configure.out 2>&1 \
+     && make -j"$JOBS" >make.out 2>&1 && make install >/dev/null) || { tail -n 30 "$HOST_GLUE/src/make.out" >&2; exit 1; }
+  touch "$host_glue_stamp"
+fi
+cp "$HOST_GLUE/lib/libimobiledevice-glue-1.0.so.0" "$HOST/libimobiledevice-glue-1.0.so.0"
 
 # --- usbmuxd, 32 KiB MTU, against this libusb (the steps in tools/build-usbmuxd-32k.sh) ------------------
 USBMUXD=$BUILD/usbmuxd-src
@@ -101,15 +121,17 @@ if [ ! -f "$USBMUXD/src/usb.c" ]; then
 fi
 sed -i 's/#define USB_MTU (3 \* 16384)/#define USB_MTU (2 * 16384)/' "$USBMUXD/src/usb.h"
 grep -q '#define USB_MTU (2 \* 16384)' "$USBMUXD/src/usb.h"
+grep -q vphone_active_ms "$USBMUXD/src/utils.c" || patch -d "$USBMUXD" -p1 -s < "$PATCHES/usbmuxd-active-clock.patch"
+grep -q vphone_active_ms "$USBMUXD/src/utils.c"
 USBMUXD_SRCS=(src/client.c src/device.c src/preflight.c src/log.c src/usb.c src/utils.c src/conf.c src/main.c)
 DEFINES=(-DPACKAGE_NAME='"usbmuxd"' -DPACKAGE_VERSION='"1.1.1-32k"' -DPACKAGE_STRING='"usbmuxd 1.1.1-32k"'
   -DPACKAGE_URL='"https://libimobiledevice.org"' -DPACKAGE_BUGREPORT='"https://github.com/libimobiledevice/usbmuxd/issues"'
   -DHAVE_CLOCK_GETTIME=1 -DHAVE_LOCALTIME_R=1 -DHAVE_PPOLL=1 -DHAVE_SYS_TYPES_H=1 -DHAVE_LIBUSB_HOTPLUG_API=1)
 
 # Host, against this library, for the verification restore.
-(cd "$USBMUXD" && gcc -O2 -Wall -Isrc -I"$OUT/include/libusb-1.0" $(pkg-config --cflags libplist-2.0 libimobiledevice-glue-1.0) \
+(cd "$USBMUXD" && gcc -O2 -Wall -Isrc -I"$OUT/include/libusb-1.0" -I"$HOST_GLUE/include" $(pkg-config --cflags libplist-2.0) \
   "${DEFINES[@]}" "${USBMUXD_SRCS[@]}" -o "$HOST/usbmuxd" \
-  -L"$HOST" -l:libusb-1.0.so.0 $(pkg-config --libs libplist-2.0 libimobiledevice-glue-1.0) -lpthread -lm)
+  -L"$HOST" -l:libusb-1.0.so.0 -l:libimobiledevice-glue-1.0.so.0 $(pkg-config --libs libplist-2.0) -lpthread -lm)
 
 # Android: libplist and glue linked statically, libusb-1.0.so dynamically.
 (cd "$USBMUXD" && "$CC" -O2 -fPIE -Isrc -I"$OUT/include/libusb-1.0" -I"$PREFIX/include" \

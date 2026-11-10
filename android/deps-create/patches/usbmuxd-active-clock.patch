@@ -1,0 +1,30 @@
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -38,6 +38,7 @@
+ #include "utils.h"
+ 
+ #include "log.h"
++#include <libimobiledevice-glue/thread.h>
+ #define util_error(...) usbmuxd_log(LL_ERROR, __VA_ARGS__)
+ 
+ void fdlist_create(struct fdlist *list)
+@@ -108,13 +109,12 @@
+ 
+ void get_tick_count(struct timeval * tv)
+ {
+-	struct timespec ts;
+-	if(0 == clock_gettime(CLOCK_MONOTONIC, &ts)) {
+-		tv->tv_sec = ts.tv_sec;
+-		tv->tv_usec = ts.tv_nsec / 1000;
+-	} else {
+-		gettimeofday(tv, NULL);
+-	}
++	/* vphone: the daemon's ticks leave out time it was stopped (a paused VM creation stops it
++	 * with the VM), so a wait that spans a pause has not run out when it resumes: the one
++	 * second a closing connection has to hand its last bytes to a client that was stopped too. */
++	uint64_t ms = vphone_active_ms();
++	tv->tv_sec = ms / 1000;
++	tv->tv_usec = (ms % 1000) * 1000;
+ }
+ 
+ /**
