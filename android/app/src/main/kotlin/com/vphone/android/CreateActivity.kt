@@ -113,6 +113,7 @@ class CreateActivity : AppCompatActivity() {
             d.getString("id") to (0 until p.length()).map { p.getJSONObject(it) }
         }
         findViewById<TextView>(R.id.about).text = ABOUT
+        findViewById<TextView>(R.id.trim_note).text = TRIM_NOTE
 
         val deviceView = findViewById<AutoCompleteTextView>(R.id.device)
         val deviceLabels = all.map { "${it.getString("name")} (${it.getString("id")})" }
@@ -200,6 +201,7 @@ class CreateActivity : AppCompatActivity() {
             .put("scale", scale)
             .put("allowCellular", findViewById<MaterialSwitch>(R.id.cellular).isChecked)
             .put("deleteFirmwareAfter", findViewById<MaterialSwitch>(R.id.delete_fw).isChecked)
+            .put("keepAllServices", !findViewById<MaterialSwitch>(R.id.trim_services).isChecked)
     }
 
     @SuppressLint("SetTextI18n")
@@ -532,6 +534,15 @@ class CreateActivity : AppCompatActivity() {
             findViewById(R.id.machine),
             objects(live.optJSONArray("vm")) + objects(live.optJSONArray("phone")) + temperatureFacts(),
         )
+        // The first boot's phases: what each took, how long the running one has run, and what it
+        // last took on this phone, or that there is no estimate yet.
+        val phases = live.optJSONArray("phases")
+        findViewById<TextView>(R.id.phases).apply {
+            val lines = (0 until (phases?.length() ?: 0)).map { phases!!.getString(it) }
+            visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE
+            val joined = lines.joinToString("\n")
+            if (text.toString() != joined) text = joined
+        }
         val times = live.optJSONObject("stepTimes") ?: return
         for ((key, row) in rows) {
             row.findViewById<TextView>(R.id.step_time).text = times.optString(key)
@@ -591,6 +602,16 @@ class CreateActivity : AppCompatActivity() {
                 "firmware, and runs iOS's own installer in emulation, several boots of it. Expect it to take many " +
                 "hours, probably overnight. It carries on with the screen off and survives the phone restarting. " +
                 "Keep the phone plugged in and in a cool place."
+
+        private const val TRIM_NOTE =
+            "On: during the first boot about 137 of iOS's background services are disabled, which a VM " +
+                "has no use for: Siri and the intelligence services, Find My, Wallet's NFC, Watch and Home, " +
+                "health coaching, Maps' background work, iCloud, iMessage and Mail sync, ads and " +
+                "recommendations, analytics, photo and media analysis, accessory updates, software update, " +
+                "and the App Store's services. The VM then runs fewer processes, uses less memory and writes " +
+                "less. They stay off from the VM's next start; those already running in the first boot keep " +
+                "running until then. Leave it off if you need Siri, dictation, Mail, iMessage, HomeKit, the " +
+                "App Store or the Weather widget in this VM."
 
         private const val ABOUT =
             "Builds a VM from Apple's firmware with no computer and no root. The pairing marked tested has been " +

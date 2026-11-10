@@ -14,6 +14,7 @@ pub mod cfw;
 pub mod der;
 pub mod display;
 pub mod error;
+pub mod firstboot;
 pub mod guest;
 pub mod guestfs;
 pub mod host;
