@@ -39,14 +39,45 @@ pub const KNOWN_GPU_SHA1: &str = "b5d95b3886dfcfdeb45de7d60124697bd4916109";
 pub const KNOWN_CLOUD_BUILD: &str = "23E5207q";
 const GPU_IMAGE: &str = ".gpu-driver-system.img";
 
-const GIGALOCKER_SH: &str = r#"x=; for n in 1 2 3 4 5 6 7; do t=$(/System/Library/Filesystems/apfs.fs/apfs.util -p /dev/disk1s$n 2>/dev/null); [ "$t" = xART ] && x=/dev/disk1s$n; done
+/// Where the custom firmware install keeps the gigalocker's own name, before renaming it `AA.gl`
+/// for the patched system's seputil: the SSH ramdisk's stock seputil needs it back.
+pub const GIGALOCKER_NAME_FILE: &str = ".gigalocker-name";
+
+/// In the SSH ramdisk, before the SEP boots: mount xART and give a gigalocker an earlier install
+/// renamed to `AA.gl` its own name back. Without it the SEP's first xART message panics the kernel
+/// (`REQUIRE fail: _gigalocker_state.available`). The name is the one recorded at the rename, or
+/// the one seputil asks for. Exit 3 when `AA.gl` is still there, so the guest never boots the SEP
+/// into that panic. A fresh restore has no gigalocker yet: seputil makes it.
+fn gigalocker_script(known: Option<&str>) -> String {
+    format!(
+        r#"x=; for n in 1 2 3 4 5 6 7; do t=$(/System/Library/Filesystems/apfs.fs/apfs.util -p /dev/disk1s$n 2>/dev/null); [ "$t" = xART ] && x=/dev/disk1s$n; done
 [ -n "$x" ] || x=/dev/disk1s3
 /sbin/mount_apfs "$x" /mnt7 2>/dev/null
 if [ -f /mnt7/AA.gl ]; then
-  out=$(/usr/libexec/seputil --gigalocker-init /mnt7 2>&1)
-  case $out in *"doesn't exist"*) want=${out#*Gigalocker file (}; want=${want%%)*}; mv /mnt7/AA.gl "$want" && echo "gigalocker: AA.gl -> $want";; esac
+  want='{known}'
+  if [ -z "$want" ]; then
+    out=$(/usr/libexec/seputil --gigalocker-init /mnt7 2>&1)
+    echo "seputil: $out"
+    case $out in *"doesn't exist"*) want=${{out#*Gigalocker file (}}; want=${{want%%)*}};; esac
+  fi
+  [ -n "$want" ] && mv /mnt7/AA.gl "$want" && echo "gigalocker: AA.gl -> $want"
+  if [ -f /mnt7/AA.gl ]; then echo "gigalocker: AA.gl is still there"; ls /mnt7; exit 3; fi
 fi
-true"#;
+true"#,
+        known = known.map(|n| format!("/mnt7/{n}")).unwrap_or_default()
+    )
+}
+
+/// The recorded gigalocker name, if it is a plain file name.
+fn known_gigalocker(vm: &Path) -> Option<String> {
+    let name = fs::read_to_string(vm.join(GIGALOCKER_NAME_FILE)).ok()?;
+    let name = name.trim();
+    let plain = !name.is_empty()
+        && name != "AA.gl"
+        && name.ends_with(".gl")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    plain.then(|| name.to_owned())
+}
 const MOUNT_SH: &str = "/usr/bin/mount_filesystems; /sbin/mount";
 const UNMOUNT_SH: &str = "sync; /sbin/umount /mnt2; /sbin/umount /mnt6; /sbin/umount /mnt1; sync";
 
@@ -661,7 +692,18 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         let ssh = ssh_wait(host, &boot_log, Some(params.ecid));
         helper.stop();
         let ssh = ssh?;
-        ssh.exec(GIGALOCKER_SH, Some(Duration::from_secs(300)))?.check("gigalocker")?;
+        let gigalocker = ssh.exec(&gigalocker_script(known_gigalocker(&vm).as_deref()), Some(Duration::from_secs(300)))?;
+        for line in gigalocker.stdout_text().lines() {
+            host.log(line);
+        }
+        if gigalocker.status != 0 {
+            bail!(
+                "the xART gigalocker could not be given back its own name, so the SEP would panic the guest; \
+                 seputil and the volume said:\n{}{}",
+                gigalocker.stdout_text(),
+                gigalocker.stderr_text()
+            );
+        }
         ssh.exec(MOUNT_SH, Some(Duration::from_secs(1800)))?.check("mount_filesystems")?;
         let (sftp, raw) = ssh.sftp()?;
         // The copies of gigabytes go over a few connections: the guest's SSH server is one
@@ -779,7 +821,10 @@ mod tests {
     fn the_scripts_sent_to_the_guest_parse() {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        for script in [GIGALOCKER_SH, MOUNT_SH, UNMOUNT_SH] {
+        let known = super::gigalocker_script(Some("0123ABCD-4567.gl"));
+        let unknown = super::gigalocker_script(None);
+        assert!(known.contains("want='/mnt7/0123ABCD-4567.gl'"));
+        for script in [known.as_str(), unknown.as_str(), MOUNT_SH, UNMOUNT_SH] {
             let mut sh = Command::new("/bin/sh")
                 .arg("-n")
                 .stdin(Stdio::piped())

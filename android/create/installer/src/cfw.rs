@@ -1206,6 +1206,10 @@ impl<'a, 'c> Installer<'a, 'c> {
             if !source.ends_with(".gl") || source == "AA.gl" {
                 continue;
             }
+            // The SSH ramdisk's stock seputil needs this name back on any later install.
+            let record = self.cx.vm.join(crate::steps::GIGALOCKER_NAME_FILE);
+            fs::write(&record, format!("{source}\n")).map_err(|e| Error::path(&record, e))?;
+            self.log(format!("  [+] gigalocker: {source} -> AA.gl (name kept for the SSH ramdisk)"));
             xart.remove_item("AA.gl")?;
             xart.rename(&source, "AA.gl")?;
         }
