@@ -58,6 +58,8 @@ pub struct State {
     pub height: u32,
     /// QEMU has run in this process, so the next VM needs a new one.
     pub needs_restart: bool,
+    /// When QEMU started, in ms since the epoch (0 before then), for the elapsed boot time.
+    pub started_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -80,6 +82,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     width: 0,
     height: 0,
     needs_restart: false,
+    started_ms: 0,
 });
 static NOTICE: Mutex<String> = Mutex::new(String::new());
 static QEMU_DONE: AtomicBool = AtomicBool::new(false);
@@ -366,6 +369,7 @@ pub fn boot(name: &str) -> Result<(), String> {
         s.message.clear();
         s.exit_code = None;
         s.log_path.clear();
+        s.started_ms = 0;
     }
     let name = name.to_string();
     std::thread::Builder::new()
@@ -440,6 +444,7 @@ fn start(name: &str) -> Result<(), String> {
     update(|s| {
         s.needs_restart = true;
         s.phase = Phase::Booting;
+        s.started_ms = crate::create::state::now_ms();
     });
 
     let run_name = name.to_string();
@@ -471,6 +476,11 @@ fn start(name: &str) -> Result<(), String> {
         })
         .map_err(|e| format!("cannot start QEMU's thread: {e}"))?;
 
+    let vcpus = cfg.vcpus;
+    std::thread::Builder::new()
+        .name("vm-status".into())
+        .spawn(move || status_lines(vcpus))
+        .map_err(|e| e.to_string())?;
     if cfg.performance_hints {
         #[cfg(target_os = "android")]
         crate::adpf::start(cfg.vcpus, || QEMU_DONE.load(Ordering::SeqCst), log_line);
@@ -503,6 +513,67 @@ fn sleep_while_up(d: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(250));
     }
     !QEMU_DONE.load(Ordering::SeqCst) && state().phase != Phase::Stopping
+}
+
+/// How often the boot log says how the VM is doing.
+const STATUS_EVERY: Duration = Duration::from_secs(30);
+
+/// Every [`STATUS_EVERY`] until QEMU ends: the phase, the process's CPU and memory, its busiest
+/// threads, and where the guest's vCPUs are. A black screen is then a guest still in its kernel
+/// (EL1), one running its daemons (EL0), or one that has stopped moving.
+fn status_lines(vcpus: u32) {
+    let paths = Paths::get();
+    let mut sampler = crate::create::vm::diag::Sampler::new(paths.files.clone());
+    let mut last: Vec<qmp::Vcpu> = Vec::new();
+    let mut still = 0u32;
+    while sleep_until_done(STATUS_EVERY) {
+        let s = state();
+        let elapsed = crate::create::state::now_ms().saturating_sub(s.started_ms) / 1000;
+        let guest = match qmp::sample_vcpus(&paths.qmp_socket(), vcpus) {
+            Ok(now) => {
+                still = if !now.is_empty() && now == last { still + 1 } else { 0 };
+                let text = guest_summary(&now, still, STATUS_EVERY);
+                last = now;
+                text
+            }
+            Err(e) => format!("guest not readable: {e}"),
+        };
+        let window = if *WINDOW.lock().unwrap() != 0 { "on screen" } else { "no window" };
+        log_line(&format!(
+            "status {}:{:02} {}, {window}: {}; {guest}",
+            elapsed / 60,
+            elapsed % 60,
+            format!("{:?}", s.phase).to_lowercase(),
+            sampler.line(4),
+        ));
+    }
+}
+
+/// False once QEMU has ended; stopping still counts, as a stuck shutdown is worth logging.
+fn sleep_until_done(d: Duration) -> bool {
+    let end = Instant::now() + d;
+    while Instant::now() < end {
+        if QEMU_DONE.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    !QEMU_DONE.load(Ordering::SeqCst)
+}
+
+/// `guest cpu0 EL1 0xfffffe0007a1b2c0, cpu1 EL0 0x1a2b3c`, and how long all of it has not moved.
+fn guest_summary(vcpus: &[qmp::Vcpu], still_samples: u32, every: Duration) -> String {
+    if vcpus.is_empty() {
+        return "guest: no vCPU registers".into();
+    }
+    let list: Vec<String> = vcpus.iter().map(|v| format!("cpu{} EL{} {:#x}", v.index, v.el, v.pc)).collect();
+    let user = vcpus.iter().filter(|v| v.el == 0).count();
+    let mut out = format!("guest {} ({user} of {} in user space)", list.join(", "), vcpus.len());
+    if still_samples > 0 {
+        let secs = u64::from(still_samples) * every.as_secs();
+        out.push_str(&format!("; no vCPU has moved in {secs} s"));
+    }
+    out
 }
 
 /// start-vm.sh's wait: vphoned's health, then `screen.unlock` until it reports unlocked.
@@ -732,6 +803,15 @@ pub fn lock() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_summary_counts_user_space_and_stillness() {
+        let v = |index, el, pc| qmp::Vcpu { index, pc, el };
+        let text = guest_summary(&[v(0, 1, 0xfffffe0007a1b2c0), v(1, 0, 0x1a2b)], 0, STATUS_EVERY);
+        assert_eq!(text, "guest cpu0 EL1 0xfffffe0007a1b2c0, cpu1 EL0 0x1a2b (1 of 2 in user space)");
+        assert!(guest_summary(&[v(0, 1, 4)], 2, STATUS_EVERY).ends_with("no vCPU has moved in 60 s"));
+        assert_eq!(guest_summary(&[], 0, STATUS_EVERY), "guest: no vCPU registers");
+    }
 
     #[test]
     fn letterboxes_the_narrower_axis() {

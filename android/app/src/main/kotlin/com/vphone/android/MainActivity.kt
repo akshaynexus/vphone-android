@@ -33,6 +33,7 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var banner: TextView
     private lateinit var active: Button
+    private lateinit var activeLog: Button
     private lateinit var importButton: Button
     private lateinit var resumeCreate: Button
     private lateinit var importRow: LinearLayout
@@ -57,12 +58,18 @@ class MainActivity : Activity() {
             setBackgroundColor(0xFF7A1F1F.toInt())
             setPadding(32, 24, 32, 24)
             visibility = View.GONE
-            setOnClickListener { if (lastRunLog.isNotEmpty()) App.showLog(this@MainActivity, lastRunLog) }
+            setOnClickListener { if (lastRunLog.isNotEmpty()) VmLogActivity.open(this@MainActivity, lastRunLog) }
         }
         active = Button(this).apply {
             isAllCaps = false
             visibility = View.GONE
             setOnClickListener { startActivity(Intent(this@MainActivity, VmActivity::class.java)) }
+        }
+        activeLog = Button(this).apply {
+            text = "Its log"
+            isAllCaps = false
+            visibility = View.GONE
+            setOnClickListener { VmLogActivity.open(this@MainActivity) }
         }
         importButton = Button(this).apply {
             text = "Import a VM folder"
@@ -106,6 +113,7 @@ class MainActivity : Activity() {
             })
             addView(banner)
             addView(active)
+            addView(activeLog)
             addView(resumeCreate)
             addView(createButton)
             addView(importButton)
@@ -206,6 +214,7 @@ class MainActivity : Activity() {
         val phase = state.getString("phase")
         val vmUp = phase in setOf("preparing", "booting", "unlocking", "running", "stopping")
         active.visibility = if (vmUp) View.VISIBLE else View.GONE
+        activeLog.visibility = active.visibility
         active.text = "Return to ${state.optString("vm")} (${VmService.phaseText(phase)})"
 
         val progress = JSONObject(Native.importProgress())

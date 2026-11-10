@@ -2,6 +2,7 @@ package com.vphone.android
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -27,7 +28,10 @@ import android.widget.Toast
 import android.window.OnBackInvokedDispatcher
 import org.json.JSONObject
 
-/** The guest's screen, full-screen in portrait, with the phone's buttons underneath. */
+/**
+ * The guest's screen, full-screen in portrait. Home, Lock and the rest are behind a floating
+ * button, or a bar underneath for those who choose it; Back opens the same menu.
+ */
 class VmActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var area: FrameLayout
@@ -35,6 +39,10 @@ class VmActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var endPanel: ScrollView
     private lateinit var endText: TextView
+    private lateinit var bar: LinearLayout
+    private lateinit var floating: FloatingButton
+    private lateinit var menu: ControlsMenu
+    private lateinit var root: FrameLayout
     private var guestWidth = 0
     private var guestHeight = 0
     private var trackedPointer = -1
@@ -73,6 +81,7 @@ class VmActivity : Activity() {
             setBackgroundColor(0xB0000000.toInt())
             setPadding(24, 12, 24, 12)
             gravity = Gravity.CENTER
+            setOnClickListener { VmLogActivity.open(this@VmActivity) }
         }
         endText = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -84,7 +93,7 @@ class VmActivity : Activity() {
             addView(LinearLayout(this@VmActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(endText)
-                addView(button("Show the log") { App.showLog(this@VmActivity, App.state().optString("logPath")) })
+                addView(button("Show the log") { VmLogActivity.open(this@VmActivity, App.state().optString("logPath")) })
                 addView(button("Back to VMs") { leave() })
             })
         }
@@ -95,22 +104,73 @@ class VmActivity : Activity() {
             addView(endPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layoutImage() }
         }
-        val bar = LinearLayout(this).apply {
+        bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.BLACK)
             val weight = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
             addView(button("Home") { Native.home() }, weight)
             addView(button("Lock") { Native.lock() }, weight)
-            addView(button("Power") { askStop() }, weight)
+            addView(button("More") { openMenu() }, weight)
         }
-        setContentView(LinearLayout(this).apply {
+        floating = FloatingButton(this, onTap = { openMenu() }, onHold = { Native.home() })
+        menu = ControlsMenu(this)
+        val screen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
             addView(area, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (56 * resources.displayMetrics.density).toInt()))
-        })
+        }
+        root = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            addView(screen, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(floating, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(menu, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+                if (r - l != or - ol || b - t != ob - ot) floating.place(r - l, b - t)
+            }
+        }
+        setContentView(root)
+        applyControls()
 
         onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { onBack() }
+    }
+
+    private val prefs get() = getSharedPreferences("ui", MODE_PRIVATE)
+    private val useBar get() = prefs.getString(KEY_CONTROLS, "float") == "bar"
+
+    private fun applyControls() {
+        bar.visibility = if (useBar) View.VISIBLE else View.GONE
+        floating.visibility = if (useBar || endPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+    }
+
+    private fun heading(): String {
+        val state = App.state()
+        val phase = state.optString("phase")
+        val started = state.optLong("startedMs")
+        val elapsed = if (started > 0 && phase in UP) " · ${VmLogActivity.clock((System.currentTimeMillis() - started) / 1000)}" else ""
+        return "${state.optString("vm")}: ${VmService.phaseText(phase)}$elapsed"
+    }
+
+    private fun openMenu() {
+        val bar = useBar
+        menu.setItems(listOf(
+            ControlsMenu.Item("🏠", "Home") { Native.home() },
+            ControlsMenu.Item("🔒", "Lock") { Native.lock() },
+            ControlsMenu.Item("📄", "Logs") { VmLogActivity.open(this) },
+            ControlsMenu.Item("↩️", "VM list") { toVmList() },
+            ControlsMenu.Item("⏹️", "Shut down") { askStop() },
+            ControlsMenu.Item(if (bar) "🔘" else "▁", if (bar) "Use button" else "Use bar") {
+                prefs.edit().putString(KEY_CONTROLS, if (bar) "float" else "bar").apply()
+                applyControls()
+            },
+        ))
+        menu.open(heading(), if (bar) "" else "Hold the button for Home. Drag it anywhere.")
+    }
+
+    /** The VM keeps running; the list's "Return to" brings this screen back. */
+    private fun toVmList() {
+        startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP))
+        finish()
     }
 
     private fun button(label: String, action: () -> Unit) = Button(this).apply {
@@ -155,9 +215,14 @@ class VmActivity : Activity() {
         val message = state.optString("message")
         val bootError = VmService.lastBootError
         val ended = phase in setOf("exited", "failed") || (phase == "idle" && bootError != null)
+        if (menu.isOpen) menu.setHeading(heading())
         if (ended) {
             status.visibility = View.GONE
-            endPanel.visibility = View.VISIBLE
+            menu.close()
+            if (endPanel.visibility != View.VISIBLE) {
+                endPanel.visibility = View.VISIBLE
+                applyControls()
+            }
             endText.text = when {
                 bootError != null -> bootError
                 phase == "failed" -> "The VM could not start.\n\n$message"
@@ -166,12 +231,18 @@ class VmActivity : Activity() {
             }
             return
         }
-        endPanel.visibility = View.GONE
+        if (endPanel.visibility == View.VISIBLE) {
+            endPanel.visibility = View.GONE
+            applyControls()
+        }
         if (phase == "running" && message.isEmpty()) {
             status.visibility = View.GONE
         } else {
             status.visibility = View.VISIBLE
-            status.text = if (message.isEmpty()) VmService.phaseText(phase) else "${VmService.phaseText(phase)}: $message"
+            val started = state.optLong("startedMs")
+            val elapsed = if (started > 0 && phase in UP) " · ${VmLogActivity.clock((System.currentTimeMillis() - started) / 1000)}" else ""
+            val text = if (message.isEmpty()) VmService.phaseText(phase) else "${VmService.phaseText(phase)}: $message"
+            status.text = "$text$elapsed  ·  tap for the log"
         }
     }
 
@@ -232,19 +303,13 @@ class VmActivity : Activity() {
             .show()
     }
 
-    /** Back must not end a VM by accident. */
+    /** Back opens the menu, whose tiles leave or shut down: never one swipe that ends the VM. */
     private fun onBack() {
-        if (endPanel.visibility == View.VISIBLE) {
-            leave()
-            return
+        when {
+            endPanel.visibility == View.VISIBLE -> leave()
+            menu.isOpen -> menu.close()
+            else -> openMenu()
         }
-        AlertDialog.Builder(this)
-            .setTitle("Leave the VM?")
-            .setMessage("It keeps running in the background.")
-            .setPositiveButton("Keep running") { _, _ -> moveTaskToBack(true) }
-            .setNeutralButton("Shut down") { _, _ -> Native.stop() }
-            .setNegativeButton("Stay", null)
-            .show()
     }
 
     private fun leave() {
@@ -252,6 +317,8 @@ class VmActivity : Activity() {
     }
 
     private companion object {
+        const val KEY_CONTROLS = "controls"
+        val UP = setOf("booting", "unlocking", "running", "stopping")
         const val ACTION_DOWN = 0
         const val ACTION_UP = 1
         const val ACTION_MOVE = 2

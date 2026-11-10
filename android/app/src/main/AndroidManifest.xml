@@ -60,6 +60,11 @@
             android:theme="@style/Theme.Vphone.Create" />
 
         <activity
+            android:name=".VmLogActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Vphone.Create" />
+
+        <activity
             android:name=".StorageActivity"
             android:exported="false"
             android:theme="@style/Theme.Vphone.Create" />

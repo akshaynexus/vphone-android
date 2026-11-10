@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 pub use vphone_create_steps::host::VmKind;
 
-mod diag;
+pub mod diag;
 pub mod display;
 pub mod vitals;
 

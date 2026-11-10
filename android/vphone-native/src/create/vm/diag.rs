@@ -392,6 +392,50 @@ fn busy_list(rows: &[(Thread, f64)]) -> String {
     out.join(", ")
 }
 
+/// CPU use per thread since the last sample, with the process's memory and mappings. Reads only
+/// `/proc`, so it can run in the app's own process, where the crash handler of [`spawn`] must not
+/// go (ART handles SIGSEGV itself).
+pub struct Sampler {
+    hz: f64,
+    limit: u64,
+    files: PathBuf,
+    last: Vec<Thread>,
+    at: Instant,
+}
+
+impl Sampler {
+    pub fn new(files: PathBuf) -> Sampler {
+        // SAFETY: sysconf has no preconditions.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+        Sampler { hz, limit: max_map_count(), files, last: threads(), at: Instant::now() }
+    }
+
+    /// The busy threads, busiest first, with their share of a core since the last call.
+    fn rows(&mut self) -> Vec<(Thread, f64)> {
+        let current = threads();
+        let secs = self.at.elapsed().as_secs_f64().max(0.001);
+        let mut rows: Vec<(Thread, f64)> = current
+            .iter()
+            .map(|t| {
+                let before = self.last.iter().find(|o| o.tid == t.tid).map_or(t.ticks, |o| o.ticks);
+                (t.clone(), t.ticks.saturating_sub(before) as f64 / self.hz / secs * 100.0)
+            })
+            .collect();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        self.last = current;
+        self.at = Instant::now();
+        rows
+    }
+
+    /// `rss ... maps N/65530 total 412%: CPU 0/TCG 98% R, ...`, the busiest `top` threads.
+    pub fn line(&mut self, top: usize) -> String {
+        let rows = self.rows();
+        let total: f64 = rows.iter().map(|r| r.1).sum();
+        let shown: Vec<(Thread, f64)> = rows.into_iter().take(top).collect();
+        format!("{} total {:.0}%: {}", resources(&self.files, self.limit), total, busy_list(&shown))
+    }
+}
+
 /// Starts the monitor: `log` keeps the history, `now` the latest list, for the app to read.
 pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
     // Appending, as the performance-hint line is written to this file from another handle.
@@ -404,30 +448,18 @@ pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
     #[cfg(target_arch = "aarch64")]
     let signal = stack::install();
     let _ = std::thread::Builder::new().name("vm-monitor".into()).spawn(move || {
-        // SAFETY: sysconf has no preconditions.
-        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
         let started = Instant::now();
-        let limit = max_map_count();
-        let mut last = threads();
+        let mut sampler = Sampler::new(files);
         let mut tick = 0u32;
         loop {
             std::thread::sleep(SAMPLE);
             tick += 1;
-            let current = threads();
-            let mut rows: Vec<(Thread, f64)> = current
-                .iter()
-                .map(|t| {
-                    let before = last.iter().find(|o| o.tid == t.tid).map_or(t.ticks, |o| o.ticks);
-                    let percent = t.ticks.saturating_sub(before) as f64 / hz / SAMPLE.as_secs_f64() * 100.0;
-                    (t.clone(), percent)
-                })
-                .collect();
-            rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let rows = sampler.rows();
             let total: f64 = rows.iter().map(|r| r.1).sum();
             let line = format!(
                 "t={}s {} total {:.0}%: {}",
                 started.elapsed().as_secs(),
-                resources(&files, limit),
+                resources(&sampler.files, sampler.limit),
                 total,
                 busy_list(&rows)
             );
@@ -453,7 +485,6 @@ pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
                 }
             }
             let _ = out.flush();
-            last = current;
         }
     });
 }
