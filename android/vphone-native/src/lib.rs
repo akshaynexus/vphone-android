@@ -12,6 +12,7 @@ pub mod platform;
 pub mod preflight;
 pub mod qmp;
 pub mod runtime;
+pub mod share;
 pub mod vphoned;
 
 mod adpf;

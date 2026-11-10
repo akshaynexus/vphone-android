@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <cache-path name="logs" path="shared-logs/" />
+    <external-cache-path name="vms" path="shared-vms/" />
+    <cache-path name="vms-internal" path="shared-vms/" />
 </paths>

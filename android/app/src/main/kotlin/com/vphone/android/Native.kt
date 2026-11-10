@@ -32,6 +32,15 @@ object Native {
     external fun importCancel()
     external fun importProgress(): String
 
+    // Sending a VM to another phone as one .vphone file: see src/share.rs.
+    external fun shareEstimate(name: String): String
+    external fun shareExport(name: String, fd: Int): String
+    external fun shareImport(fd: Int): String
+    external fun sharePath(dir: String, name: String): String
+    external fun shareCleanup(dir: String)
+    external fun shareCancel()
+    external fun shareProgress(): String
+
     // VM creation: see src/create/ in the Rust library.
     external fun createCatalog(): String
     external fun createPreflight(specJson: String): String

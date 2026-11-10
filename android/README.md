@@ -199,3 +199,22 @@ rate (`best second` is the burst's own).
   answered from the kept reading instead, and the shadow copies with the texels they moved
   (`reims-vgpu`'s `perf.rs`). The FIFO figures are sums over every FIFO thread. A `host` far below the frame
   time means the frame waits on the emulated CPU, not on the GPU path.
+
+## Sending a VM to another phone
+
+On the VM list, **Send** packs a VM into one `<name>.vphone` file:
+
+- **Share…** packs it into the app's cache (kept for a day), then opens the share sheet: Quick Share, Files, or any app that takes a file.
+- **Save to…** writes it straight to a place you pick, such as Downloads or a USB drive.
+
+To receive one, open the `.vphone` file from Quick Share's notification or a file manager, or use **Import a VM → A .vphone file**. A name that is already taken gets a number after it.
+
+What goes in: only what a boot reads, which is `Disk.img`, `nvram.bin`, the two boot ROMs, `SEPStorage`, `config.plist`, `ecid`, `serial` and `gfx-res`. Logs, setup leftovers (`iPhone_Restore/`, the transfer image, `.create-*`) and this phone's `android.json` stay behind, so the receiving phone uses its own defaults. A VM can't be sent while it's running or being created.
+
+The format (`vphone-native/src/share.rs`, version 1):
+
+- **Header:** magic `VPHONEVM`, then a JSON header listing the files and their sizes.
+- **Body:** one zstd frame of `offset | length | bytes` records per file. Holes in the disk and all-zero 1 MiB chunks are left out.
+- **Trailer:** a JSON trailer with each file's BLAKE3 hash, then `VPHNEND1`.
+
+The file reads front to back. Importing checks every hash and boots nothing until the VM folder is complete. It needs up to the VM's data size, plus 1 GiB, free on the receiving phone.

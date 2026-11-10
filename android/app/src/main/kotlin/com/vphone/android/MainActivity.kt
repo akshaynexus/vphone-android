@@ -43,6 +43,13 @@ class MainActivity : Activity() {
     private lateinit var importLabel: TextView
     private lateinit var list: LinearLayout
     private var importWasActive = false
+    private lateinit var transferRow: LinearLayout
+    private lateinit var transferLabel: TextView
+    private lateinit var transferBar: ProgressBar
+    private var transferWasActive = false
+    private var transferSample: Pair<Long, Long>? = null
+    /** The VM a "Save to…" is choosing a place for. */
+    private var savingVm = ""
     private var lastRunLog = ""
     private var storageGeneration = 0L
     private lateinit var updateRow: LinearLayout
@@ -80,9 +87,9 @@ class MainActivity : Activity() {
             setOnClickListener { VmLogActivity.open(this@MainActivity) }
         }
         importButton = Button(this).apply {
-            text = "Import a VM folder"
+            text = "Import a VM"
             isAllCaps = false
-            setOnClickListener { pickFolder() }
+            setOnClickListener { askImport() }
         }
         val createButton = Button(this).apply {
             text = "Create a VM on this phone"
@@ -105,6 +112,19 @@ class MainActivity : Activity() {
                 text = "Cancel import"
                 isAllCaps = false
                 setOnClickListener { VmService.cancelImport() }
+            })
+        }
+        transferLabel = TextView(this)
+        transferBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+        transferRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(transferLabel)
+            addView(transferBar)
+            addView(Button(this@MainActivity).apply {
+                text = "Cancel"
+                isAllCaps = false
+                setOnClickListener { Native.shareCancel() }
             })
         }
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -152,6 +172,7 @@ class MainActivity : Activity() {
                 setOnClickListener { Updater.check(this@MainActivity, manual = true) }
             })
             addView(importRow)
+            addView(transferRow)
             addView(list)
         }
         val scroll = ScrollView(this).apply {
@@ -184,6 +205,130 @@ class MainActivity : Activity() {
             intent.removeExtra(EXTRA_IMPORT)
             pickFolder()
         }
+        // A .vphone file opened from Quick Share, a file manager, or shared to this app.
+        val received = when (intent.action) {
+            Intent.ACTION_VIEW -> intent.data
+            Intent.ACTION_SEND -> intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            else -> null
+        }
+        if (received != null) {
+            intent.action = null
+            confirmReceive(received)
+        }
+    }
+
+    private fun askImport() {
+        AlertDialog.Builder(this)
+            .setTitle("Import a VM")
+            .setItems(arrayOf("A .vphone file (sent from another phone)", "A VM folder")) { _, which ->
+                if (which == 0) {
+                    startActivityForResult(
+                        Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"),
+                        PICK_VM_FILE,
+                    )
+                } else {
+                    pickFolder()
+                }
+            }
+            .show()
+    }
+
+    private fun confirmReceive(uri: Uri) {
+        val name = runCatching {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { if (it.moveToFirst()) it.getString(0) else null }
+        }.getOrNull() ?: uri.lastPathSegment ?: "the file"
+        AlertDialog.Builder(this)
+            .setTitle("Import $name?")
+            .setMessage("It is added to your VMs. A VM with the same name is kept, and this one gets a new name.")
+            .setPositiveButton("Import") { _, _ ->
+                runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                VmService.receiveVm(this, uri)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Send `vm`: Quick Share and other apps, or a file in a place the person picks. */
+    private fun askSend(vm: String) {
+        val state = App.state()
+        val running = state.optString("vm") == vm && state.getString("phase") in setOf("preparing", "booting", "unlocking", "running", "stopping")
+        val reason = when {
+            running -> "$vm is running. Shut it down first, so its disk is complete."
+            Native.createPending() == vm -> "$vm is still being created. Finish creating it first."
+            JSONObject(Native.shareProgress()).optBoolean("active") -> "Another VM is being sent or received. Wait for it to finish."
+            else -> ""
+        }
+        if (reason.isNotEmpty()) {
+            AlertDialog.Builder(this).setTitle("Cannot send $vm").setMessage(reason).setPositiveButton("OK", null).show()
+            return
+        }
+        val estimate = JSONObject(Native.shareEstimate(vm))
+        estimate.optString("error").takeIf { it.isNotEmpty() }?.let {
+            AlertDialog.Builder(this).setTitle("Cannot send $vm").setMessage(it).setPositiveButton("OK", null).show()
+            return
+        }
+        val dataMb = estimate.optLong("dataBytes") / MIB
+        val freeMb = (VmService.shareDir(this).apply { mkdirs() }.usableSpace) / MIB
+        AlertDialog.Builder(this)
+            .setTitle("Send $vm")
+            .setMessage(
+                "It holds about $dataMb MB of data, compressed as it is packed into one .vphone file. " +
+                    "Sharing packs it on this phone first ($freeMb MB free there); saving writes it straight to the place you pick.\n\n" +
+                    "Logs and this phone's settings stay here; the other phone uses its own.",
+            )
+            .setPositiveButton("Share…") { _, _ -> VmService.sendVm(this, vm, null) }
+            .setNeutralButton("Save to…") { _, _ ->
+                savingVm = vm
+                startActivityForResult(
+                    Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                        .setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, "$vm.vphone"),
+                    SAVE_VM_FILE,
+                )
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** The send or receive row, and what to do when one ends. */
+    private fun showTransfer() {
+        val p = JSONObject(Native.shareProgress())
+        val active = p.optBoolean("active")
+        transferRow.visibility = if (active) View.VISIBLE else View.GONE
+        if (active) {
+            val done = p.optLong("doneBytes")
+            val total = p.optLong("totalBytes")
+            val now = System.currentTimeMillis()
+            val rate = transferSample?.let { (t, d) -> if (now > t && done >= d) (done - d) * 1000 / (now - t) else 0 } ?: 0
+            transferSample = now to done
+            val left = if (rate > 0 && total > done) ", about ${(total - done) / rate / 60} min ${(total - done) / rate % 60} s left" else ""
+            val verb = if (p.optString("op") == "import") "Receiving" else "Packing"
+            transferBar.progress = if (total > 0) (1000 * done / total).toInt() else 0
+            transferLabel.text = "$verb ${p.optString("name")} (${p.optString("file")}): ${done / MIB} of ${total / MIB} MB, " +
+                "${rate / MIB} MB/s$left; file so far ${p.optLong("archiveBytes") / MIB} MB"
+        } else {
+            transferSample = null
+        }
+        if (transferWasActive && !active) {
+            VmService.lastTransfer?.let { t ->
+                VmService.lastTransfer = null
+                when {
+                    t.error.isNotEmpty() -> AlertDialog.Builder(this)
+                        .setTitle(if (t.op == "import") "The VM did not import" else "${t.name} was not sent")
+                        .setMessage(t.error)
+                        .setPositiveButton("OK", null)
+                        .setNeutralButton("Copy") { _, _ -> App.copy(this, t.error) }
+                        .show()
+                    t.op == "import" -> {
+                        Toast.makeText(this, "${t.name} is ready to boot", Toast.LENGTH_LONG).show()
+                        showVms()
+                    }
+                    t.path.isNotEmpty() -> VmService.shareIntent(this, t)?.let { startActivity(it) }
+                    else -> Toast.makeText(this, "${t.name} is saved (${t.bytes / MIB} MB)", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        transferWasActive = active
     }
 
     override fun onStart() {
@@ -233,6 +378,7 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         showUpdate()
+        showTransfer()
         val cleaned = StorageNative.generation()
         if (cleaned != storageGeneration) {
             storageGeneration = cleaned
@@ -423,6 +569,12 @@ class MainActivity : Activity() {
                     setOnClickListener { tryBoot(name) }
                 })
                 addView(Button(this@MainActivity).apply {
+                    text = "Send"
+                    isAllCaps = false
+                    isEnabled = problems.length() == 0
+                    setOnClickListener { askSend(name) }
+                })
+                addView(Button(this@MainActivity).apply {
                     text = "Settings"
                     isAllCaps = false
                     setOnClickListener { settings(name, config) }
@@ -611,16 +763,24 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        val tree = data?.data
-        if (requestCode != PICK_FOLDER || resultCode != RESULT_OK || tree == null) return
-        contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        VmService.import(this, tree)
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) return
+        when (requestCode) {
+            PICK_FOLDER -> {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                VmService.import(this, uri)
+            }
+            PICK_VM_FILE -> confirmReceive(uri)
+            SAVE_VM_FILE -> if (savingVm.isNotEmpty()) VmService.sendVm(this, savingVm, uri)
+        }
     }
 
     companion object {
         const val EXTRA_BOOT = "boot"
         const val EXTRA_IMPORT = "import"
         private const val PICK_FOLDER = 2
+        private const val PICK_VM_FILE = 3
+        private const val SAVE_VM_FILE = 4
         private const val MIB = 1024L * 1024
     }
 }

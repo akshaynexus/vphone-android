@@ -19,7 +19,11 @@ class App : Application() {
         val external = getExternalFilesDir(null) ?: filesDir
         Native.setup(filesDir.path, cacheDir.path, external.path, applicationInfo.nativeLibraryDir)
         // The APK of an update this app now runs, or of an older one, is no longer needed.
-        if (Application.getProcessName() == packageName) Updater.cleanup(this)
+        if (Application.getProcessName() == packageName) {
+            Updater.cleanup(this)
+            // A packed VM is kept a day, for a share that is still reading it.
+            Native.shareCleanup(VmService.shareDir(this).path)
+        }
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "Virtual machine", NotificationManager.IMPORTANCE_LOW),
         )

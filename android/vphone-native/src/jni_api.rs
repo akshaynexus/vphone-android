@@ -325,3 +325,103 @@ pub extern "system" fn Java_com_vphone_android_Native_importProgress(
         serde_json::to_string(&import::progress()).unwrap_or_default()
     })
 }
+
+// ------------------------------------------------------------------- sending a VM (share.rs)
+
+/// What sending `name` would hold: `{"files": n, "dataBytes": n}` or `{"error": ...}`.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_shareEstimate(
+    mut env: JNIEnv,
+    _this: JObject,
+    name: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let name = text(env, &name);
+        match crate::share::estimate(&Paths::get().vm_dir(&name)) {
+            Ok((files, data)) => json!({"files": files.len(), "dataBytes": data}).to_string(),
+            Err(e) => json!({"error": e}).to_string(),
+        }
+    })
+}
+
+/// Writes VM `name` as a `.vphone` file to `fd`, taking ownership of it. Blocks until done:
+/// `{"bytes": n}` or `{"error": ...}`.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_shareExport(
+    mut env: JNIEnv,
+    _this: JObject,
+    name: JString,
+    fd: jint,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let name = text(env, &name);
+        // SAFETY: Kotlin detached this descriptor from its ParcelFileDescriptor and gave it up.
+        let out = unsafe { File::from_raw_fd(fd) };
+        let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(2).clamp(1, 6) as u32;
+        match crate::share::export(&Paths::get().vm_dir(&name), &name, out, threads) {
+            Ok(bytes) => json!({"bytes": bytes}).to_string(),
+            Err(e) => json!({"error": e}).to_string(),
+        }
+    })
+}
+
+/// Imports a `.vphone` file from `fd`, taking ownership of it. Blocks until done:
+/// `{"name": ...}` or `{"error": ...}`.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_shareImport(
+    mut env: JNIEnv,
+    _this: JObject,
+    fd: jint,
+) -> jstring {
+    guarded(&mut env, |_| {
+        // SAFETY: as in shareExport.
+        let src = unsafe { File::from_raw_fd(fd) };
+        let vms = Paths::get().vms();
+        let _ = std::fs::create_dir_all(&vms);
+        let free = crate::create::engine::free_bytes(&vms);
+        match crate::share::import(&vms, src, free) {
+            Ok(name) => json!({"name": name}).to_string(),
+            Err(e) => json!({"error": e}).to_string(),
+        }
+    })
+}
+
+/// The path a Share export of `name` goes to in `dir`, after clearing older ones there.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_sharePath(
+    mut env: JNIEnv,
+    _this: JObject,
+    dir: JString,
+    name: JString,
+) -> jstring {
+    guarded(&mut env, |env| {
+        let dir = std::path::PathBuf::from(text(env, &dir));
+        let name = text(env, &name);
+        let _ = std::fs::create_dir_all(&dir);
+        crate::share::share_path(&dir, &name).to_string_lossy().into_owned()
+    })
+}
+
+/// Deletes exports in `dir` older than a day, unless one is being written.
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_shareCleanup(
+    mut env: JNIEnv,
+    _this: JObject,
+    dir: JString,
+) {
+    let dir = text(&mut env, &dir);
+    quiet(|| crate::share::remove_old_exports(std::path::Path::new(&dir), 24 * 3600));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_shareCancel(_env: JNIEnv, _this: JObject) {
+    quiet(crate::share::cancel);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vphone_android_Native_shareProgress(
+    mut env: JNIEnv,
+    _this: JObject,
+) -> jstring {
+    guarded(&mut env, |_| serde_json::to_string(&crate::share::progress()).unwrap_or_default())
+}

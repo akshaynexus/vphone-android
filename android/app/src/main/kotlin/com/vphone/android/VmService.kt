@@ -20,6 +20,7 @@ class VmService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var vmActive = false
     @Volatile private var importing = false
+    @Volatile private var transferring = false
     private var monitor: Thread? = null
     private var lastText = ""
 
@@ -46,7 +47,22 @@ class VmService : Service() {
                 startMonitor()
             }
             ACTION_CANCEL_IMPORT -> Native.importCancel()
-            else -> if (!vmActive && !importing) stopSelf()
+            ACTION_SEND_VM, ACTION_RECEIVE_VM -> {
+                if (transferring) return START_NOT_STICKY
+                transferring = true
+                lastTransfer = null
+                val sending = intent.action == ACTION_SEND_VM
+                goForeground(if (sending) "Preparing a VM to send" else "Receiving a VM")
+                val vm = intent.getStringExtra(EXTRA_VM).orEmpty()
+                val uri = intent.data
+                thread(name = "vm-transfer") {
+                    lastTransfer = if (sending) sendVm(vm, uri) else receiveVm(uri)
+                    transferring = false
+                }
+                startMonitor()
+            }
+            ACTION_CANCEL_TRANSFER -> Native.shareCancel()
+            else -> if (!vmActive && !importing && !transferring) stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -88,8 +104,12 @@ class VmService : Service() {
                 val state = App.state()
                 val phase = state.getString("phase")
                 if (vmActive && phase in ENDED) vmActive = false
-                if (!vmActive && !importing) break
-                val text = if (importing) importText() else phaseText(phase)
+                if (!vmActive && !importing && !transferring) break
+                val text = when {
+                    importing -> importText()
+                    transferring -> transferText()
+                    else -> phaseText(phase)
+                }
                 if (text != lastText) {
                     lastText = text
                     getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(text))
@@ -108,6 +128,69 @@ class VmService : Service() {
         val total = p.optLong("totalBytes")
         val percent = if (total > 0) 100 * p.optLong("doneBytes") / total else 0
         return "Importing ${p.optString("name")}: $percent%"
+    }
+
+    private fun transferText(): String {
+        val p = JSONObject(Native.shareProgress())
+        val total = p.optLong("totalBytes")
+        val percent = if (total > 0) 100 * p.optLong("doneBytes") / total else 0
+        val verb = if (p.optString("op") == "import") "Receiving" else "Packing"
+        return "$verb ${p.optString("name")}: $percent%"
+    }
+
+    /** Packs `vm` into `dest`, or into the app's share folder when `dest` is null. */
+    private fun sendVm(vm: String, dest: Uri?): Transfer {
+        return try {
+            val (fd, path) = if (dest != null) {
+                val pfd = contentResolver.openFileDescriptor(dest, "wt") ?: return Transfer("export", vm, "Cannot open the chosen file")
+                pfd.detachFd() to ""
+            } else {
+                val path = Native.sharePath(shareDir(this).path, vm)
+                val pfd = ParcelFileDescriptor.open(java.io.File(path), ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE or ParcelFileDescriptor.MODE_WRITE_ONLY)
+                pfd.detachFd() to path
+            }
+            val r = JSONObject(Native.shareExport(vm, fd))
+            val error = r.optString("error")
+            if (error.isNotEmpty()) {
+                if (dest != null) runCatching { DocumentsContract.deleteDocument(contentResolver, dest) }
+                if (path.isNotEmpty()) java.io.File(path).delete()
+                Transfer("export", vm, if (error == "cancelled") "Sending cancelled" else error)
+            } else {
+                val t = Transfer("export", vm, "", path, r.optLong("bytes"))
+                if (path.isNotEmpty()) notifyReady(t)
+                t
+            }
+        } catch (e: Exception) {
+            Transfer("export", vm, e.message ?: e.toString())
+        }
+    }
+
+    private fun receiveVm(src: Uri?): Transfer {
+        if (src == null) return Transfer("import", "", "No file was given")
+        return try {
+            val pfd = contentResolver.openFileDescriptor(src, "r") ?: return Transfer("import", "", "Cannot open the file")
+            val r = JSONObject(Native.shareImport(pfd.detachFd()))
+            val error = r.optString("error")
+            Transfer("import", r.optString("name"), if (error == "cancelled") "Receiving cancelled" else error)
+        } catch (e: Exception) {
+            Transfer("import", "", e.message ?: e.toString())
+        }
+    }
+
+    /** "Ready to send", tapping which opens the share sheet even if the app is not on screen. */
+    private fun notifyReady(t: Transfer) {
+        val chooser = shareIntent(this, t) ?: return
+        val pending = PendingIntent.getActivity(this, 3, chooser, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        getSystemService(NotificationManager::class.java).notify(
+            NOTIFICATION_READY,
+            Notification.Builder(this, App.CHANNEL)
+                .setSmallIcon(R.drawable.ic_phone)
+                .setContentTitle("${t.name} is ready to send")
+                .setContentText("${t.bytes / (1024 * 1024)} MB. Tap to share it, with Quick Share or another app.")
+                .setContentIntent(pending)
+                .setAutoCancel(true)
+                .build(),
+        )
     }
 
     private fun import(tree: Uri) {
@@ -169,6 +252,41 @@ class VmService : Service() {
         private const val ACTION_STOP = "stop"
         private const val ACTION_IMPORT = "import"
         private const val ACTION_CANCEL_IMPORT = "cancel-import"
+        private const val ACTION_SEND_VM = "send-vm"
+        private const val ACTION_RECEIVE_VM = "receive-vm"
+        private const val ACTION_CANCEL_TRANSFER = "cancel-transfer"
+        private const val NOTIFICATION_READY = 2
+
+        /** A send or receive that ended: `error` is "" when it worked. */
+        class Transfer(val op: String, val name: String, val error: String, val path: String = "", val bytes: Long = 0)
+
+        @Volatile var lastTransfer: Transfer? = null
+
+        fun shareDir(context: Context) = java.io.File(context.externalCacheDir ?: context.cacheDir, "shared-vms")
+
+        /** The share sheet for a packed VM. */
+        fun shareIntent(context: Context, t: Transfer): Intent? {
+            if (t.path.isEmpty()) return null
+            val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.logs", java.io.File(t.path))
+            val send = Intent(Intent.ACTION_SEND)
+                .setType("application/octet-stream")
+                .putExtra(Intent.EXTRA_STREAM, uri)
+                .putExtra(Intent.EXTRA_SUBJECT, "${t.name} (vphone VM)")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            return Intent.createChooser(send, "Send ${t.name}").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+
+        fun sendVm(context: Context, vm: String, dest: Uri?) {
+            context.startForegroundService(Intent(context, VmService::class.java).setAction(ACTION_SEND_VM).putExtra(EXTRA_VM, vm).setData(dest))
+        }
+
+        fun receiveVm(context: Context, src: Uri) {
+            context.startForegroundService(Intent(context, VmService::class.java).setAction(ACTION_RECEIVE_VM).setData(src))
+        }
+
+        fun cancelTransfer(context: Context) {
+            context.startService(Intent(context, VmService::class.java).setAction(ACTION_CANCEL_TRANSFER))
+        }
         private const val EXTRA_VM = "vm"
         private val ENDED = setOf("idle", "exited", "failed")
 
