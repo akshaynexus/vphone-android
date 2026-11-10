@@ -320,7 +320,7 @@ fn a_large_copy_over_several_connections_arrives_the_same_and_faster() {
         let told = Told::default();
         let more = tree::MoreLinks { open: &open, streams };
         let start = std::time::Instant::now();
-        let stats = tree::upload_tree_over("the cache", &ssh, Some(&more), dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+        let stats = tree::upload_tree_over("the cache", &ssh, Some(&more), None, dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
         let rate = total as f64 / 1e6 / start.elapsed().as_secs_f64();
         println!("{streams} stream(s): {rate:.0} MB/s  ({})", told.lines.lock().unwrap().last().unwrap());
         rates.push(rate);
@@ -336,6 +336,82 @@ fn a_large_copy_over_several_connections_arrives_the_same_and_faster() {
         fs::remove_dir_all(&dest).unwrap();
     }
     assert!(rates[2] > rates[0] * 1.3, "four connections were not faster than one: {rates:?}");
+}
+
+/// The transfer disk's copy, with this host as the guest: the "device" its tar reads is the disk's
+/// file itself. The same tree arrives as over SSH (contents, modes, links, long names, directory
+/// times), with one reader and with several; the log names the way; the file's space is given
+/// back; and a small copy stays on SSH.
+#[test]
+fn a_copy_by_the_transfer_disk_arrives_the_same() {
+    use std::os::unix::fs::FileExt;
+    let server = start_dropbear("ecdsa", None);
+    let ssh = connect(server.port);
+    let dir = tmp();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    sample_tree(&source);
+    let mut total: u64 = 8 + 9 + 12_000_000;
+    for (i, mb) in [20u64, 12, 9].iter().enumerate() {
+        let f = fs::File::create(source.join(format!("cache.{i}"))).unwrap();
+        // Not a whole number of blocks, and not all zeros.
+        f.set_len(mb * 1_000_000 + 7).unwrap();
+        for m in 0..*mb {
+            f.write_all_at(format!("cache {i} at {m}").as_bytes(), m * 1_000_000).unwrap();
+        }
+        total += mb * 1_000_000 + 7;
+    }
+    fs::create_dir_all(source.join("many/kept")).unwrap();
+    for i in 0..2100u32 {
+        fs::write(source.join(format!("many/{}{i}", if i % 2 == 0 { "" } else { "kept/" })), i.to_le_bytes().repeat(i as usize % 50)).unwrap();
+        total += 4 * (i as u64 % 50);
+    }
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    fs::File::open(source.join("many")).unwrap().set_modified(old).unwrap();
+    fs::File::open(source.join("many/4")).unwrap().set_modified(old).unwrap();
+
+    let image = dir.path().join(tree::TRANSFER_IMAGE);
+    tree::TransferDisk::create(&image).unwrap();
+    for readers in [1usize, 3] {
+        let disk = tree::TransferDisk::open(&image, image.to_str().unwrap()).unwrap().with_readers(readers);
+        let dest = dir.path().join(format!("dest{readers}"));
+        fs::create_dir_all(&dest).unwrap();
+        let told = Told::default();
+        let stats = tree::upload_tree_over("the cache", &ssh, None, Some(&disk), dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+        assert_eq!((stats.files, stats.bytes, stats.symlinks, stats.dirs), (4 + 3 + 2100, total, 2, 4 + 2), "{readers} readers");
+        assert_trees_equal(&source, &dest);
+        for sub in ["many", "many/4"] {
+            assert_eq!(fs::metadata(dest.join(sub)).unwrap().modified().unwrap(), old, "{readers} readers: {sub}'s time");
+        }
+        assert_eq!(fs::metadata(dest.join("a/b/file")).unwrap().permissions().mode() & 0o7777, 0o4755);
+        let lines = told.lines.lock().unwrap();
+        let way = if readers == 1 { "one reader" } else { "3 readers" };
+        assert!(lines[0].contains("2107 files") && lines[0].contains(&format!("(transfer disk {}, {way})", image.display())), "{lines:?}");
+        assert!(lines[1].starts_with("[+] copied the cache: ") && lines[1].contains("packed here in") && lines[1].contains("unpacked by the VM in"), "{lines:?}");
+        let progress = told.progress.lock().unwrap();
+        assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0), "progress never goes back");
+        assert!(progress.iter().all(|p| p.1 == total), "one total for the bar throughout");
+        assert_eq!(progress.last().unwrap().0, total);
+        assert!(progress[0].2.starts_with("Packing the cache for the VM's transfer disk: 0%"), "{:?}", progress[0]);
+        // The archive's space went back; the label is still there for the next copy.
+        assert!(fs::metadata(&image).unwrap().blocks() * 512 < 1 << 20, "the disk's file still holds the archive");
+        assert_eq!(fs::metadata(&image).unwrap().len(), tree::TRANSFER_CAPACITY);
+    }
+    // A failing guest tar fails the copy, with what it said.
+    let disk = tree::TransferDisk::open(&image, image.to_str().unwrap()).unwrap();
+    let err = tree::upload_tree_over("the cache", &ssh, None, Some(&disk), "/nonexistent/destination", &LocalTree::new(&source), None, &|_| false, &Silent).unwrap_err();
+    assert!(err.to_string().contains("guest tar failed") && err.to_string().contains("/nonexistent/destination"), "{err}");
+    // A small copy is not worth an archive: over SSH, and the log says so.
+    let small = dir.path().join("small");
+    fs::create_dir_all(&small).unwrap();
+    sample_tree(&small);
+    let dest = dir.path().join("dest-small");
+    fs::create_dir_all(&dest).unwrap();
+    let told = Told::default();
+    tree::upload_tree_over("a small tree", &ssh, None, Some(&disk), dest.to_str().unwrap(), &LocalTree::new(&small), None, &|_| false, &told).unwrap();
+    let lines = told.lines.lock().unwrap();
+    assert!(lines[0].contains("not by the transfer disk (12 MB is a small copy)") && lines[1].contains("tar over SSH, one stream"), "{lines:?}");
+    assert_trees_equal(&small, &dest);
 }
 
 /// A copy too small to be worth a second key exchange stays on the one connection, and so does a
@@ -357,7 +433,7 @@ fn a_small_copy_or_no_second_connection_means_one_stream() {
     let dest = dir.path().join("dest");
     fs::create_dir_all(&dest).unwrap();
     let told = Told::default();
-    tree::upload_tree_over("a small tree", &ssh, Some(&more), dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+    tree::upload_tree_over("a small tree", &ssh, Some(&more), None, dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
     assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 0, "a small copy asks for no connection");
     assert_trees_equal(&source, &dest);
     // Large, and the guest takes no second connection: one stream, said in the log, and it works.
@@ -365,7 +441,7 @@ fn a_small_copy_or_no_second_connection_means_one_stream() {
     let dest = dir.path().join("dest-large");
     fs::create_dir_all(&dest).unwrap();
     let told = Told::default();
-    tree::upload_tree_over("a large tree", &ssh, Some(&more), dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
+    tree::upload_tree_over("a large tree", &ssh, Some(&more), None, dest.to_str().unwrap(), &LocalTree::new(&source), None, &|_| false, &told).unwrap();
     assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1, "it stops asking at the first refusal");
     let lines = told.lines.lock().unwrap();
     assert!(lines[0].contains("no further connection to the VM's SSH") && lines[1].contains("one stream"), "{lines:?}");

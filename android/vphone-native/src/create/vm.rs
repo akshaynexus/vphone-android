@@ -170,6 +170,31 @@ pub fn dfu_spec(
     spec
 }
 
+/// The SSH ramdisk's boot: the DFU start, and the transfer disk when the step made its file. That
+/// is a second disk the guest only reads: the custom firmware's large copies are written to the
+/// file by the app and read from the disk by the guest, past its SSH server and its USB.
+pub fn ramdisk_spec(
+    b: &Bundle,
+    cfg: &VmConfig,
+    paths: &Paths,
+    run: &Path,
+    vusb: &Path,
+    display: bool,
+) -> RunSpec {
+    let mut spec = dfu_spec(b, cfg, paths, run, vusb, display);
+    let image = b.dir.join(vphone_create_steps::tree::TRANSFER_IMAGE);
+    if image.is_file() {
+        let file = opt(&image.to_string_lossy());
+        spec.args.extend([
+            "-drive".to_string(),
+            format!("file={file},if=none,id=transfer,format=raw,readonly=on,file.locking=off"),
+            "-device".to_string(),
+            "vmapple-virtio-blk-pci,variant=root,drive=transfer".to_string(),
+        ]);
+    }
+    spec
+}
+
 /// The first boot: the normal launcher's arguments. The GPU stays attached either way; without
 /// `display` it draws nowhere (QEMU's `REIMS_VGPU_WINDOW=0`).
 pub fn first_boot_spec(
@@ -727,7 +752,7 @@ impl Supervisor {
         *self.display_status.lock().unwrap() = (setting.name().to_string(), note);
         let spec = match kind {
             VmKind::Dfu => with_unsafe_cache(dfu_spec(&bundle, &cfg, &self.paths, run, vusb, show)),
-            VmKind::Ramdisk => dfu_spec(&bundle, &cfg, &self.paths, run, vusb, show),
+            VmKind::Ramdisk => ramdisk_spec(&bundle, &cfg, &self.paths, run, vusb, show),
             VmKind::FirstBoot { gfx: true } => {
                 first_boot_spec(&bundle, &cfg, &self.paths, run, show)
             }
@@ -847,6 +872,34 @@ mod tests {
         assert!(line.contains(&format!("-drive file={v}/SEPStorage,if=none,id=sep-storage,format=raw,file.locking=off")));
         assert!(!line.contains("apple-gfx"));
         assert!(spec.env.iter().any(|(k, _)| k == "VPHONE_TARGET_PAGE_BITS"));
+    }
+
+    #[test]
+    fn the_ssh_ramdisk_boot_attaches_the_transfer_disk_only_when_its_file_is_there() {
+        let dir = fixture("ramdisk-transfer");
+        let b = Bundle::open(&dir).unwrap();
+        let image = dir.join(vphone_create_steps::tree::TRANSFER_IMAGE);
+        let _ = fs::remove_file(&image);
+        let boot = |b: &Bundle| ramdisk_spec(b, &cfg(), &paths(), &dir.join("r"), Path::new("/cv/vusb.sock"), false);
+        let dfu = dfu_spec(&b, &cfg(), &paths(), &dir.join("r"), Path::new("/cv/vusb.sock"), false);
+        assert_eq!(boot(&b).args, dfu.args, "without the file it is the DFU start");
+        fs::write(&image, b"x").unwrap();
+        let spec = boot(&b);
+        let line = spec.args.join(" ");
+        let v = dir.to_string_lossy();
+        assert!(
+            line.ends_with(&format!(
+                "-drive file={v}/.cfw-transfer.img,if=none,id=transfer,format=raw,readonly=on,file.locking=off \
+                 -device vmapple-virtio-blk-pci,variant=root,drive=transfer"
+            )),
+            "{line}"
+        );
+        assert_eq!(spec.args[..dfu.args.len()], dfu.args[..], "the rest is the DFU start");
+        assert!(spec.sync_on_exit.is_empty(), "the guest only reads it");
+        // The restore and the first boot never see it.
+        assert!(!dfu.args.join(" ").contains("id=transfer"));
+        assert!(!first_boot_spec(&b, &cfg(), &paths(), &dir.join("r"), false).args.join(" ").contains("id=transfer"));
+        fs::remove_file(&image).unwrap();
     }
 
     #[test]

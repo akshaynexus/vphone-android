@@ -17,7 +17,7 @@ use crate::progress::{check_cancel, Progress, Silent, StepRecord};
 use crate::ramdisk::{self, Ramdisk};
 use crate::resources::{self, Release};
 use crate::ssh::{Connect, GuestSsh, Target};
-use crate::tree::ApfsTree;
+use crate::tree::{ApfsTree, TransferDisk, TRANSFER_IMAGE};
 use plist::Value;
 use serde_json::json;
 use sha1::{Digest, Sha1};
@@ -48,10 +48,10 @@ pub const GIGALOCKER_NAME_FILE: &str = ".gigalocker-name";
 /// (`REQUIRE fail: _gigalocker_state.available`). The name is the one recorded at the rename, or
 /// the one seputil asks for. Exit 3 when `AA.gl` is still there, so the guest never boots the SEP
 /// into that panic. A fresh restore has no gigalocker yet: seputil makes it.
-fn gigalocker_script(known: Option<&str>) -> String {
+fn gigalocker_script(known: Option<&str>, container: u32) -> String {
     format!(
-        r#"x=; for n in 1 2 3 4 5 6 7; do t=$(/System/Library/Filesystems/apfs.fs/apfs.util -p /dev/disk1s$n 2>/dev/null); [ "$t" = xART ] && x=/dev/disk1s$n; done
-[ -n "$x" ] || x=/dev/disk1s3
+        r#"x=; for n in 1 2 3 4 5 6 7; do t=$(/System/Library/Filesystems/apfs.fs/apfs.util -p /dev/disk{container}s$n 2>/dev/null); [ "$t" = xART ] && x=/dev/disk{container}s$n; done
+[ -n "$x" ] || x=/dev/disk{container}s3
 /sbin/mount_apfs "$x" /mnt7 2>/dev/null
 if [ -f /mnt7/AA.gl ]; then
   want='{known}'
@@ -66,6 +66,32 @@ fi
 true"#,
         known = known.map(|n| format!("/mnt7/{n}")).unwrap_or_default()
     )
+}
+
+/// Which disk is the VM's APFS container: the first whose first slice is a volume with a name.
+/// It is `disk1` with the VM's own disk alone; with the transfer disk attached too, that one takes
+/// a number before the container is found (measured: the transfer disk `disk0`, the VM's disk
+/// `disk1`, the container `disk2`).
+const CONTAINER_SH: &str = r#"for n in 1 2 3 4 5 6; do [ -n "$(/System/Library/Filesystems/apfs.fs/apfs.util -p /dev/disk${n}s1 2>/dev/null)" ] && { echo $n; break; }; done; true"#;
+
+/// The ramdisk's `mount_filesystems` and `mount`. That script names the container `disk1`: for
+/// another number it is run with its device names rewritten, and is otherwise the script as it is.
+fn mount_script(container: u32) -> String {
+    if container == 1 {
+        MOUNT_SH.to_owned()
+    } else {
+        format!("/usr/bin/sed 's#/dev/disk1s#/dev/disk{container}s#g' /usr/bin/mount_filesystems | /bin/bash; /sbin/mount")
+    }
+}
+
+/// Removes the transfer disk's file when the SSH ramdisk boot is over, however it ended. A VM
+/// still holding it open keeps reading it until it stops.
+struct TransferFile(PathBuf);
+
+impl Drop for TransferFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// The recorded gigalocker name, if it is a plain file name.
@@ -93,6 +119,10 @@ const SSH_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
 /// How many connections a copy of gigabytes to the guest uses (measured through the ramdisk's
 /// dropbear on a PC: 133 MB/s over one, 236 over two, 412 over four).
 const COPY_STREAMS: usize = 3;
+/// How many of the guest's tars read the transfer disk at once (measured on a PC with six vCPUs,
+/// 44,000 small files and 2 GB of large ones: 104 MB/s with one, 126 with three, 130 with four,
+/// 114 with six; the guest makes files no faster with more).
+const DISK_READERS: usize = 3;
 /// Between attempts that failed straight away; one still waiting blocks in `connect` instead.
 const SSH_RETRY: Duration = Duration::from_secs(1);
 
@@ -594,6 +624,37 @@ pub struct CfwParams<'a> {
     pub log: &'a Path,
 }
 
+/// In the SSH ramdisk of the VM at `vm`, once its SSH answers: finds the VM's container, sees to
+/// the gigalocker's name before the SEP boots, and mounts the volumes as the ramdisk's
+/// `mount_filesystems` does (System at /mnt1, Data at /mnt2, Preboot at /mnt6, xART at /mnt7).
+pub fn mount_guest_volumes(ssh: &GuestSsh, vm: &Path, host: &dyn Progress) -> Result<()> {
+    let found = ssh.exec(CONTAINER_SH, Some(Duration::from_secs(300)))?.stdout_text();
+    let container: u32 = match found.trim().parse() {
+        Ok(n) => n,
+        Err(_) => {
+            host.log("the ramdisk did not show which disk is the VM's container; taking disk1");
+            1
+        }
+    };
+    if container != 1 {
+        host.log(&format!("[*] the VM's container is disk{container} in this boot"));
+    }
+    let gigalocker = ssh.exec(&gigalocker_script(known_gigalocker(vm).as_deref(), container), Some(Duration::from_secs(300)))?;
+    for line in gigalocker.stdout_text().lines() {
+        host.log(line);
+    }
+    if gigalocker.status != 0 {
+        bail!(
+            "the xART gigalocker could not be given back its own name, so the SEP would panic the guest; \
+             seputil and the volume said:\n{}{}",
+            gigalocker.stdout_text(),
+            gigalocker.stderr_text()
+        );
+    }
+    ssh.exec(&mount_script(container), Some(Duration::from_secs(1800)))?.check("mount_filesystems")?;
+    Ok(())
+}
+
 /// A stream to the guest's SSH port. With the VM's ECID, only its own device is taken: one whose
 /// serial carries that ECID, or the sole device when its serial carries none (the SSH ramdisk).
 fn connect_ssh(socket: &Path, timeout: Duration, ecid: Option<u64>) -> Result<std::os::unix::net::UnixStream> {
@@ -648,6 +709,8 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
     let mut records = StepRecord::open(&vm)?;
     let rd = Ramdisk::new(vm.join(".sshramdisk"));
     let library = params.library.to_string_lossy().into_owned();
+    // A run that was killed left its transfer disk's file: no boot but the SSH ramdisk's uses it.
+    let _ = fs::remove_file(vm.join(TRANSFER_IMAGE));
     let cli_ok = |args: &[String], env: &[(String, String)], timeout: Option<Duration>| -> Result<()> {
         let code = host.run_helper(CLI, args, env, params.log, timeout).map_err(Error::msg)?;
         if code != 0 {
@@ -673,6 +736,14 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         host.stop_vm(&vm).map_err(Error::msg)?;
         let run = vm.join(".runs-sshrd");
         fs::create_dir_all(&run).map_err(|e| Error::path(&run, e))?;
+        // The disk the large copies go by: a file here, a second disk of the ramdisk VM. Without
+        // it (no room for the file's bookkeeping, a filesystem without sparse files) they go
+        // over SSH, as they did.
+        let transfer = TransferFile(vm.join(TRANSFER_IMAGE));
+        if let Err(e) = TransferDisk::create(&transfer.0) {
+            host.log(&format!("[*] no transfer disk for this boot ({e}): the large copies go over SSH"));
+            let _ = fs::remove_file(&transfer.0);
+        }
         host.start_vm(VmKind::Ramdisk, &vm, &run).map_err(Error::msg)?;
         let ecid = format!("0x{:016x}", params.ecid);
         cli_ok(&["recovery-probe".into(), "--ecid".into(), ecid.clone(), "--timeout".into(), "600".into()], &[], None)?;
@@ -692,23 +763,12 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         let ssh = ssh_wait(host, &boot_log, Some(params.ecid));
         helper.stop();
         let ssh = ssh?;
-        let gigalocker = ssh.exec(&gigalocker_script(known_gigalocker(&vm).as_deref()), Some(Duration::from_secs(300)))?;
-        for line in gigalocker.stdout_text().lines() {
-            host.log(line);
-        }
-        if gigalocker.status != 0 {
-            bail!(
-                "the xART gigalocker could not be given back its own name, so the SEP would panic the guest; \
-                 seputil and the volume said:\n{}{}",
-                gigalocker.stdout_text(),
-                gigalocker.stderr_text()
-            );
-        }
-        ssh.exec(MOUNT_SH, Some(Duration::from_secs(1800)))?.check("mount_filesystems")?;
+        mount_guest_volumes(&ssh, &vm, host)?;
+        let disk = TransferDisk::find(&ssh, &transfer.0, host)?.map(|disk| disk.with_readers(DISK_READERS));
         let (sftp, raw) = ssh.sftp()?;
-        // The copies of gigabytes go over a few connections: the guest's SSH server is one
-        // process a connection, and the slowest part of the path. Three leave the guest's other
-        // vCPUs to its tar and its filesystem.
+        // Without the transfer disk, the copies of gigabytes go over a few connections: the
+        // guest's SSH server is one process a connection, and the slowest part of that path.
+        // Three leave the guest's other vCPUs to its tar and its filesystem.
         let mux = host.usbmux_socket();
         let ecid_value = params.ecid;
         let open = move || -> Result<GuestSsh> {
@@ -717,6 +777,7 @@ pub fn cfw(params: &CfwParams) -> Result<InstallReport> {
         };
         let context = InstallContext {
             more: Some(crate::tree::MoreLinks { open: &open, streams: COPY_STREAMS }),
+            disk,
             host,
             vm: &vm,
             release: params.release,
@@ -821,10 +882,16 @@ mod tests {
     fn the_scripts_sent_to_the_guest_parse() {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let known = super::gigalocker_script(Some("0123ABCD-4567.gl"));
-        let unknown = super::gigalocker_script(None);
+        let known = super::gigalocker_script(Some("0123ABCD-4567.gl"), 1);
+        let unknown = super::gigalocker_script(None, 2);
         assert!(known.contains("want='/mnt7/0123ABCD-4567.gl'"));
-        for script in [known.as_str(), unknown.as_str(), MOUNT_SH, UNMOUNT_SH] {
+        assert!(known.contains("/dev/disk1s$n") && !known.contains("disk2"), "{known}");
+        assert!(unknown.contains("/dev/disk2s$n") && unknown.contains("x=/dev/disk2s3") && !unknown.contains("disk1"), "{unknown}");
+        // The container at disk1 is the ramdisk's own script, untouched; elsewhere it is rewritten.
+        assert_eq!(super::mount_script(1), MOUNT_SH);
+        let moved = super::mount_script(2);
+        assert!(moved.contains("s#/dev/disk1s#/dev/disk2s#g"), "{moved}");
+        for script in [known.as_str(), unknown.as_str(), MOUNT_SH, moved.as_str(), super::CONTAINER_SH, UNMOUNT_SH] {
             let mut sh = Command::new("/bin/sh")
                 .arg("-n")
                 .stdin(Stdio::piped())

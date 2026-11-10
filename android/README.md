@@ -77,9 +77,15 @@ What the steps do, where it differs from the desktop flow:
   `/usr/local/share/restore/options.plist` sets `SealedVolumeUseFastMtree`. That is made sure of before
   every restore (`installer/src/restore_options.rs`), so a VM patched by an older build has it too; the
   step's log says `Fast mtree: ON` or `OFF` with the reason, and repeats the guest's own word on it.
-- **Copies into the guest.** The large copies of `cfw` (iOS's system files, the patched dyld cache) say how
-  much there is before they start and show their share, speed and time left. Above 256 MiB they use three
-  SSH connections, each its own server process in the guest.
+- **Copies into the guest.** The large copies of `cfw` (iOS's system files, the patched dyld cache) go by a
+  transfer disk: a sparse file in the VM's folder (`.cfw-transfer.img`) that the SSH ramdisk VM has as a
+  second, read-only disk. The app writes tar archives into the file and the guest's tar reads them from the
+  block device, so nothing of them passes the guest's SSH server or its USB. They say how much there is
+  before they start, name the way they go, and show their share, speed and time left. A copy under 32 MiB,
+  one whose archive does not fit the free storage, or a boot without the disk goes as tar over SSH (three
+  connections above 256 MiB); which way is decided once and logged, not retried. Measured on a PC against a
+  real SSH ramdisk (`create/vusb/bench-copy.sh`): 2 GB of large files 8.6 MB/s over SSH and 426 MB/s by the
+  disk; 44,000 small files 10.5 and 27 MB/s (the guest makes about 2,000 files a second either way).
 - **Performance hints.** Setup boots ask Android's performance hints for the vCPU threads from the VM's
   own process. One line in the step's log (`[vm] performance hints: ON` or `OFF (why)`) says whether the
   system granted them and which CPUs the process may run on.

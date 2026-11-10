@@ -305,6 +305,52 @@ impl GuestSsh {
         })
     }
 
+    /// Run a command that may take long and says how far it is on its standard error: each piece
+    /// of that goes to `on_stderr` as it arrives (and is kept, for an error message). No time
+    /// limit; a cancel closes the channel and returns `Cancelled`.
+    pub fn exec_watching(&self, command: &str, on_stderr: &(dyn Fn(&[u8]) + Sync), progress: &dyn Progress) -> Result<Output> {
+        self.block_on(async {
+            let mut channel = self
+                .client
+                .channel_open_session()
+                .await
+                .map_err(|e| Error::Ssh(format!("channel: {e}")))?;
+            channel
+                .exec(true, command)
+                .await
+                .map_err(|e| Error::Ssh(format!("exec: {e}")))?;
+            let mut out = Output::default();
+            let mut status = None;
+            loop {
+                tokio::select! {
+                    msg = channel.wait() => match msg {
+                        Some(ChannelMsg::Data { data }) => out.stdout.extend_from_slice(&data),
+                        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                            on_stderr(&data);
+                            // What is kept is for an error message: its end says why.
+                            out.stderr.extend_from_slice(&data);
+                            if out.stderr.len() > 64 << 10 {
+                                let cut = out.stderr.len() - (32 << 10);
+                                out.stderr.drain(..cut);
+                            }
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                        Some(ChannelMsg::Close) | None => break,
+                        Some(_) => {}
+                    },
+                    _ = tokio::time::sleep(LIMIT_TICK) => {
+                        if check_cancel(progress).is_err() {
+                            let _ = channel.close().await;
+                            return Err(Error::Cancelled);
+                        }
+                    }
+                }
+            }
+            out.status = status.unwrap_or(255);
+            Ok(out)
+        })
+    }
+
     async fn sftp_channel(&self) -> Result<russh::ChannelStream<client::Msg>> {
         let channel = self
             .client

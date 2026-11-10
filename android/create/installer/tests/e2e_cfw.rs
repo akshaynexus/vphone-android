@@ -245,6 +245,7 @@ fn run_install(version: &str, plan: Option<plist::Value>) -> (tempfile::TempDir,
     let log = vm.join("log.txt");
     let cx = InstallContext {
         more: None,
+        disk: None,
         host: &host,
         vm: &vm,
         release: &release,
