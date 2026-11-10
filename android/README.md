@@ -49,13 +49,40 @@ QEMU, installs the CFW, and does the first boot, ending on a running iOS home sc
 and iOS version; the wizard defaults to the tested iPhone17,3 + iOS 26.6.2 at 1x and marks pairings the
 Linux flow has not verified as under test.
 
-Expect it to take many hours (the wizard shows an estimate). It keeps going with the screen off and survives
+Expect it to take many hours. The wizard gives a time only from what this phone has measured: each step's
+running time is kept in `<filesDir>/create/step-times.json` when it finishes, and until every step left has
+a time there the screen says there is no estimate. It keeps going with the screen off and survives
 the phone restarting: creation resumes from the first unfinished step, with `.create-state` per VM. Charging
 is recommended; a hot phone slows down, and at critical temperature the guest pauses until it cools. It
 needs about 60 GB free in the app's internal storage (at least 25 GB free during the restore, it waits
 below that), and 8 GB of RAM or more. VMs and their restore trees live in internal storage (`<filesDir>/vms`,
 real sparse files); downloaded firmware is in `<filesDir>/fw-cache` and is reused for later VMs unless
 you ask to delete it.
+
+What the steps do, where it differs from the desktop flow:
+
+- **GPU driver.** The cloudOS system image in the IPSW is an encrypted archive (AEA profile 1) that carries
+  its own key in its header. `gpu-driver` reads that member from the IPSW, decrypts it on up to eight
+  threads (`installer/src/aea.rs`: every segment's HMAC and checksum is checked), reads the bundle from the
+  APFS volume inside and checks the driver's SHA-1; the decrypted image exists only in `fw-cache` while the
+  step runs. A cloudOS whose image has no key field is restored into a temporary VM instead, as on the
+  desktop. `cargo run --release --example gpu_driver -- <cloudOS.ipsw> <out dir> [threads]` runs it on a PC.
+- **Pause.** Pause stops the guest (QMP `stop`) and the helpers (SIGSTOP), for as long as you like; a hot
+  phone or low storage does the same. Nothing counts that time: the restore's USB device stays attached
+  across a stop (QEMU's `vusb-pci`), and the helpers' time limits run on a clock that leaves stopped time
+  out (`vusb/common/src/active.rs`, the same in the patched libimobiledevice-glue, which the restore tool's
+  and usbmuxd's waits use). A step that fails after a pause is reported; it is not run again by itself.
+  A pause does not survive the app's process ending: the step then starts again.
+- **Fast mtree.** The guest's restore hashes the whole system volume on one CPU unless its ramdisk's
+  `/usr/local/share/restore/options.plist` sets `SealedVolumeUseFastMtree`. That is made sure of before
+  every restore (`installer/src/restore_options.rs`), so a VM patched by an older build has it too; the
+  step's log says `Fast mtree: ON` or `OFF` with the reason, and repeats the guest's own word on it.
+- **Copies into the guest.** The large copies of `cfw` (iOS's system files, the patched dyld cache) say how
+  much there is before they start and show their share, speed and time left. Above 256 MiB they use three
+  SSH connections, each its own server process in the guest.
+- **Performance hints.** Setup boots ask Android's performance hints for the vCPU threads from the VM's
+  own process. One line in the step's log (`[vm] performance hints: ON` or `OFF (why)`) says whether the
+  system granted them and which CPUs the process may run on.
 
 Each QEMU boot runs as its own executable, `libvphone_vm.so`, a child of the `:create` foreground service, so an app kill or crash costs at most the step in progress. Step logs are in
 `<vm>/.create-logs/` and reachable from the wizard. Nothing here has been run on a phone yet:
