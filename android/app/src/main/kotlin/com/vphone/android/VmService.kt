@@ -47,7 +47,7 @@ class VmService : Service() {
                 startMonitor()
             }
             ACTION_CANCEL_IMPORT -> Native.importCancel()
-            ACTION_SEND_VM, ACTION_RECEIVE_VM -> {
+            ACTION_SEND_VM, ACTION_RECEIVE_VM, ACTION_RECEIVE_USB -> {
                 if (transferring) return START_NOT_STICKY
                 transferring = true
                 lastTransfer = null
@@ -55,8 +55,14 @@ class VmService : Service() {
                 goForeground(if (sending) "Preparing a VM to send" else "Receiving a VM")
                 val vm = intent.getStringExtra(EXTRA_VM).orEmpty()
                 val uri = intent.data
+                val usbDevice = intent.getStringExtra(EXTRA_USB_DEVICE)
+                val usbHandle = intent.getIntExtra(EXTRA_USB_HANDLE, 0)
                 thread(name = "vm-transfer") {
-                    lastTransfer = if (sending) sendVm(vm, uri) else receiveVm(uri)
+                    lastTransfer = when {
+                        sending -> sendVm(vm, uri)
+                        usbDevice != null -> receiveVmFromUsb(usbDevice, usbHandle)
+                        else -> receiveVm(uri)
+                    }
                     transferring = false
                 }
                 startMonitor()
@@ -177,6 +183,44 @@ class VmService : Service() {
         }
     }
 
+    /**
+     * Streams a `.vphone` file from a phone in File transfer mode straight into the importer: the
+     * MTP read fills one end of a pipe while the importer reads the other, so nothing is staged.
+     */
+    private fun receiveVmFromUsb(deviceName: String, handle: Int): Transfer {
+        val device = getSystemService(android.hardware.usb.UsbManager::class.java).deviceList[deviceName]
+            ?: return Transfer("import", "", "The phone was unplugged before the copy started")
+        return try {
+            val mtp = UsbVmSource.open(this, device)
+            try {
+                val (read, write) = ParcelFileDescriptor.createReliablePipe()
+                var mtpOk = false
+                val reader = thread(name = "vm-usb-read") {
+                    write.use { mtpOk = mtp.importFile(handle, it) }
+                }
+                val r = JSONObject(Native.shareImport(read.detachFd()))
+                // An import that stopped early leaves the MTP read blocked on a full pipe: closing
+                // the device ends it.
+                if (reader.isAlive) mtp.close()
+                reader.join(10_000)
+                val error = r.optString("error")
+                Transfer(
+                    "import",
+                    r.optString("name"),
+                    when {
+                        error == "cancelled" -> "Receiving cancelled"
+                        error.isNotEmpty() && !mtpOk -> "$error (the USB copy from ${UsbVmSource.label(device)} also failed: check the cable and that the phone stays unlocked in File transfer mode)"
+                        else -> error
+                    },
+                )
+            } finally {
+                mtp.close()
+            }
+        } catch (e: Exception) {
+            Transfer("import", "", e.message ?: e.toString())
+        }
+    }
+
     /** "Ready to send", tapping which opens the share sheet even if the app is not on screen. */
     private fun notifyReady(t: Transfer) {
         val chooser = shareIntent(this, t) ?: return
@@ -255,6 +299,9 @@ class VmService : Service() {
         private const val ACTION_SEND_VM = "send-vm"
         private const val ACTION_RECEIVE_VM = "receive-vm"
         private const val ACTION_CANCEL_TRANSFER = "cancel-transfer"
+        private const val ACTION_RECEIVE_USB = "receive-usb"
+        private const val EXTRA_USB_DEVICE = "usb-device"
+        private const val EXTRA_USB_HANDLE = "usb-handle"
         private const val NOTIFICATION_READY = 2
 
         /** A send or receive that ended: `error` is "" when it worked. */
@@ -282,6 +329,13 @@ class VmService : Service() {
 
         fun receiveVm(context: Context, src: Uri) {
             context.startForegroundService(Intent(context, VmService::class.java).setAction(ACTION_RECEIVE_VM).setData(src))
+        }
+
+        fun receiveVmFromUsb(context: Context, found: UsbVmSource.Found) {
+            context.startForegroundService(
+                Intent(context, VmService::class.java).setAction(ACTION_RECEIVE_USB)
+                    .putExtra(EXTRA_USB_DEVICE, found.device).putExtra(EXTRA_USB_HANDLE, found.handle),
+            )
         }
 
         fun cancelTransfer(context: Context) {

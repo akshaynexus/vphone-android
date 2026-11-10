@@ -280,3 +280,13 @@ The format (`vphone-native/src/share.rs`, version 1):
 - **Trailer:** a JSON trailer with each file's BLAKE3 hash, then `VPHNEND1`.
 
 The file reads front to back. Importing checks every hash and boots nothing until the VM folder is complete. It needs up to the VM's data size, plus 1 GiB, free on the receiving phone.
+
+### Over a USB cable
+
+A phone can receive a VM straight from another phone over USB-C, with no cloud copy and no file staged on the receiving phone:
+
+1. On the sending phone, tap **Send → Save to…** and choose Downloads.
+2. Connect the phones. On the sending phone, tap the USB notification and choose **File transfer**, then keep it unlocked.
+3. On the receiving phone, choose **USB controlled by: This device** if Android asks, then tap **Import a VM → From a phone plugged in by USB**.
+
+vphone reads the other phone's shared folders over MTP with Android's USB host API (`UsbVmSource.kt`), looking up to three folders deep and skipping `Android/`. It streams the picked file through a pipe into the same importer, so the checksums and holes are handled the same way. Android doesn't let an app act as the MTP device itself, so the sending side is the system's own File transfer mode.
