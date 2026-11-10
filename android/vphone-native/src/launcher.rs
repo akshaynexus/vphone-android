@@ -27,7 +27,7 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     if let Some(serial) = &b.serial {
         machine += &format!(",serial={serial}");
     }
-    machine += &gfx_machine(&res);
+    machine += &gfx_machine(&res, cfg.refresh_hz);
 
     let mut args: Vec<String> = vec!["qemu-system-aarch64".into(), "-M".into(), machine];
     let mut push = |parts: &[&str]| args.extend(parts.iter().map(|s| s.to_string()));
@@ -106,6 +106,9 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     if cfg.software_display && cfg.display {
         env.push(("REIMS_VGPU_SOFTWARE_DISPLAY", "1".to_string()));
     }
+    // The frames the guest presents are counted, for the `gpu` line of the log; nothing is
+    // written by the GPU device itself (`collect`).
+    env.push(("REIMS_VGPU_STATS", "collect".to_string()));
     if cfg.gpu_diagnostics && cfg.display {
         env.push(("REIMS_VGPU_FRAME_DUMP", dir(frame_dump_dir(paths))));
     }
@@ -116,9 +119,10 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
     Launch { args, env }
 }
 
-/// run-vphone.sh's GFX=1 part of `-M`, for a screen of `res` (`1290x2796`).
-pub fn gfx_machine(res: &str) -> String {
-    format!(",gfx-device=apple-gfx-mmio,memory-backend=ram0,gfx-modes={res}@60")
+/// run-vphone.sh's GFX=1 part of `-M`, for a screen of `res` (`1290x2796`) at `refresh_hz`: the one
+/// display mode iOS is offered.
+pub fn gfx_machine(res: &str, refresh_hz: u32) -> String {
+    format!(",gfx-device=apple-gfx-mmio,memory-backend=ram0,gfx-modes={res}@{refresh_hz}")
 }
 
 /// run-vphone.sh's GFX=1 arguments: the paravirtual GPU needs guest RAM as a shared mapping.
@@ -183,12 +187,25 @@ mod tests {
             ram_mib: 4096,
             tb_mib: 1024,
             performance_hints: false,
-            display: true,
-            gpu_compression: false,
             gpu_diagnostics: true,
-            swapchain_layout: SwapchainLayout::Auto,
-            software_display: false,
+            refresh_hz: 60,
+            ..VmConfig::for_phone(11 * 1024, 8)
         }
+    }
+
+    #[test]
+    fn the_refresh_rate_is_the_guests_display_mode() {
+        let dir = fixture("refresh");
+        let bundle = Bundle::open(&dir).unwrap();
+        let fast = build(&bundle, &VmConfig { refresh_hz: 120, ..cfg() }, &paths());
+        assert!(fast.args[2].ends_with("@120"), "{}", fast.args[2]);
+        assert!(build(&bundle, &cfg(), &paths()).args[2].ends_with("@60"));
+        assert!(fast.env.contains(&("REIMS_VGPU_STATS", "collect".to_string())));
+        // The defaults: 120 Hz, no driver chatter, no frame dumps.
+        let default = build(&bundle, &VmConfig::for_phone(15 * 1024, 8), &paths());
+        assert!(default.args[2].ends_with("@120"));
+        assert!(default.env.contains(&("TU_DEBUG", "noubwc".to_string())));
+        assert!(!default.env.iter().any(|(k, _)| *k == "REIMS_VGPU_FRAME_DUMP"));
     }
 
     #[test]

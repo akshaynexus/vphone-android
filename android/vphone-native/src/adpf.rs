@@ -7,22 +7,94 @@
 //! be refused. Whichever way it goes, `report` is told once, in one line that also names the
 //! CPUs this process may run on.
 
+use crate::config::Performance;
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const PERIOD: Duration = Duration::from_millis(50);
-const TARGET_NS: i64 = 40_000_000;
+
+/// The time a period's work is said to be due in. The work reported is the busiest vCPU's CPU
+/// time in the period, at most [`PERIOD`], so the target is the share of a core above which the
+/// system is told the work ran late and raises the clocks. TCG has no deadline of its own: a
+/// guest that keeps a vCPU busy runs faster for every step of clock it gets.
+///
+/// Until 0.5.8 the target was 40 ms, 80% of a core. A guest at 75-85% then reported 37-43 ms
+/// against it, which is "on time": the system held the clocks at 1.6-2.0 GHz of 3.6-4.6, as it
+/// should for work that meets its deadline.
+pub fn target_ns(performance: Performance) -> i64 {
+    match performance {
+        // Over a fifth of a core is late: a busy guest gets the highest clocks.
+        Performance::Max => 10_000_000,
+        // Over three fifths of a core is late: the clocks follow the load more slowly.
+        Performance::Balanced => 30_000_000,
+    }
+}
+
+/// The nice value the vCPU threads are given: Android's `THREAD_PRIORITY_URGENT_DISPLAY` (-8)
+/// for Max, `THREAD_PRIORITY_DISPLAY` (-4) for Balanced. Both are values an app may give its own
+/// threads.
+pub fn vcpu_nice(performance: Performance) -> i32 {
+    match performance {
+        Performance::Max => -8,
+        Performance::Balanced => -4,
+    }
+}
+
+/// The vCPU threads' clocks, summed over the samples since the last reading: how many CPUs were
+/// sampled, their clocks as thousandths of each CPU's highest, and how many ran at 95% or more.
+static CLOCK_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static CLOCK_PERMILLE: AtomicU64 = AtomicU64::new(0);
+static CLOCK_AT_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// One sample of a vCPU thread's CPU: its clock now and its highest, in kHz.
+fn clock_sample(now_khz: u64, max_khz: u64) {
+    if max_khz == 0 {
+        return;
+    }
+    let permille = (now_khz.saturating_mul(1000) / max_khz).min(1000);
+    CLOCK_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    CLOCK_PERMILLE.fetch_add(permille, Ordering::Relaxed);
+    CLOCK_AT_MAX.fetch_add(u64::from(permille >= 950), Ordering::Relaxed);
+}
+
+/// `vCPU clocks 54% of max, 12% of the time at max`, over the samples since the last call; `None`
+/// where there were none (hints off, or clocks an app cannot read).
+pub fn take_clock_summary() -> Option<String> {
+    let samples = CLOCK_SAMPLES.swap(0, Ordering::Relaxed);
+    let permille = CLOCK_PERMILLE.swap(0, Ordering::Relaxed);
+    let at_max = CLOCK_AT_MAX.swap(0, Ordering::Relaxed);
+    clock_summary(samples, permille, at_max)
+}
+
+fn clock_summary(samples: u64, permille: u64, at_max: u64) -> Option<String> {
+    (samples > 0).then(|| {
+        format!(
+            "vCPU clocks {}% of max, {}% of the time at max",
+            (permille + samples * 5) / (samples * 10),
+            (at_max * 100 + samples / 2) / samples
+        )
+    })
+}
 
 type GetManager = unsafe extern "C" fn() -> *mut c_void;
 type CreateSession = unsafe extern "C" fn(*mut c_void, *const i32, usize, i64) -> *mut c_void;
 type ReportActual = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
 type CloseSession = unsafe extern "C" fn(*mut c_void);
 
+/// `APerformanceHint_setPreferPowerEfficiency` (API 35).
+type PreferEfficiency = unsafe extern "C" fn(*mut c_void, bool) -> c_int;
+/// `APerformanceHint_notifyWorkloadIncrease` (API 36): session, cpu, gpu, a name for traces.
+type WorkloadIncrease = unsafe extern "C" fn(*mut c_void, bool, bool, *const c_char) -> c_int;
+
 struct Api {
     get_manager: GetManager,
     create_session: CreateSession,
     report_actual: ReportActual,
     close_session: CloseSession,
+    /// Newer calls, where this Android has them.
+    prefer_efficiency: Option<PreferEfficiency>,
+    workload_increase: Option<WorkloadIncrease>,
 }
 
 fn dl_error() -> String {
@@ -63,6 +135,12 @@ impl Api {
                     c"APerformanceHint_reportActualWorkDuration",
                 )?),
                 close_session: std::mem::transmute::<*mut c_void, CloseSession>(symbol(c"APerformanceHint_closeSession")?),
+                prefer_efficiency: symbol(c"APerformanceHint_setPreferPowerEfficiency")
+                    .ok()
+                    .map(|f| std::mem::transmute::<*mut c_void, PreferEfficiency>(f)),
+                workload_increase: symbol(c"APerformanceHint_notifyWorkloadIncrease")
+                    .ok()
+                    .map(|f| std::mem::transmute::<*mut c_void, WorkloadIncrease>(f)),
             })
         }
     }
@@ -135,7 +213,12 @@ fn status_line(result: &Result<usize, String>, cpus: &str) -> String {
 }
 
 /// Starts the reporting thread. `report` gets one line saying whether the hints took effect.
-pub fn start(vcpus: u32, done: impl Fn() -> bool + Send + 'static, report: impl Fn(&str) + Send + 'static) {
+pub fn start(
+    vcpus: u32,
+    performance: Performance,
+    done: impl Fn() -> bool + Send + 'static,
+    report: impl Fn(&str) + Send + 'static,
+) {
     let spawned = std::thread::Builder::new().name("vm-adpf".into()).spawn(move || {
         let said = std::cell::Cell::new(false);
         let say = |result: Result<usize, String>| {
@@ -143,7 +226,7 @@ pub fn start(vcpus: u32, done: impl Fn() -> bool + Send + 'static, report: impl 
                 report(&status_line(&result, &allowed_cpus()));
             }
         };
-        if let Err(why) = run(vcpus as usize, &done, &say, &|line| report(line)) {
+        if let Err(why) = run(vcpus as usize, performance, &done, &say, &|line| report(line)) {
             if said.get() {
                 report(&format!("performance hints stopped: {why}"));
             } else {
@@ -190,7 +273,35 @@ fn placement_line(cpus: &[usize], speeds: &[(u64, u64)], reports: u64) -> String
     format!("performance hints: vCPU threads last ran on CPUs {}, {clock}; {reports} work reports accepted in all", cpu_list(&on))
 }
 
-fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>), say_more: &dyn Fn(&str)) -> Result<(), String> {
+/// Gives each of `tids` the nice value `nice`: how many took it, and the first refusal.
+fn raise_priority(tids: &[i32], nice: i32) -> (usize, Option<String>) {
+    let mut refusal = None;
+    let mut raised = 0;
+    for tid in tids {
+        // SAFETY: setpriority on a thread of this process; a refusal is an error code.
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, *tid as libc::id_t, nice) } == 0 {
+            raised += 1;
+        } else if refusal.is_none() {
+            refusal = Some(std::io::Error::last_os_error().to_string());
+        }
+    }
+    (raised, refusal)
+}
+
+fn priority_line(nice: i32, threads: usize, raised: usize, refusal: Option<&str>) -> String {
+    match refusal {
+        None => format!("performance: {raised} vCPU threads run at nice {nice}"),
+        Some(why) => format!("performance: {raised} of {threads} vCPU threads took nice {nice}; the system refused the rest ({why})"),
+    }
+}
+
+fn run(
+    vcpus: usize,
+    performance: Performance,
+    done: &dyn Fn() -> bool,
+    say: &dyn Fn(Result<usize, String>),
+    say_more: &dyn Fn(&str),
+) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut tids = vcpu_threads();
     while tids.len() < vcpus {
@@ -217,6 +328,10 @@ fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>
             break;
         }
     }
+    // The priority does not need the hint service, so it is set before anything can refuse.
+    let nice = vcpu_nice(performance);
+    let (raised, refusal) = raise_priority(&tids, nice);
+    say_more(&priority_line(nice, tids.len(), raised, refusal.as_deref()));
     if tids.iter().any(|t| cpu_ns(*t).is_none()) {
         return Err("this kernel has no schedstat to measure the vCPU threads by".into());
     }
@@ -226,11 +341,23 @@ fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>
     if manager.is_null() {
         return Err("this device has no performance hint manager".into());
     }
+    let target = target_ns(performance);
     // SAFETY: tids are this process's threads and outlive the call.
-    let session = unsafe { (api.create_session)(manager, tids.as_ptr(), tids.len(), TARGET_NS) };
+    let session = unsafe { (api.create_session)(manager, tids.as_ptr(), tids.len(), target) };
     if session.is_null() {
         return Err("the system refused a hint session for the vCPU threads".into());
     }
+    if let (Performance::Max, Some(prefer)) = (performance, api.prefer_efficiency) {
+        // SAFETY: session is live; the call only sets a flag of it.
+        unsafe { prefer(session, false) };
+    }
+    say_more(&format!(
+        "performance: {performance:?}; a vCPU busier than {}% of a core is reported late{}{}",
+        target * 100 / PERIOD.as_nanos() as i64,
+        if api.prefer_efficiency.is_some() { ", power efficiency not preferred" } else { "" },
+        if api.workload_increase.is_some() { ", workload increases notified" } else { "" },
+    ));
+    let mut ticks = 0u64;
     let mut last: Vec<i64> = tids.iter().map(|t| cpu_ns(*t).unwrap_or(0)).collect();
     let mut outcome = Ok(());
     let (mut reports, mut placed_at) = (0u64, Instant::now());
@@ -244,9 +371,24 @@ fn run(vcpus: usize, done: &dyn Fn() -> bool, say: &dyn Fn(Result<usize, String>
             let speeds: Vec<(u64, u64)> = cpus.iter().filter_map(|c| Some((cpu_khz(*c, "scaling_cur_freq")?, cpu_khz(*c, "cpuinfo_max_freq")?))).collect();
             say_more(&placement_line(&cpus, &speeds, reports));
         }
+        ticks += 1;
+        // The clocks the vCPU threads get, for the status line: every fifth of a second.
+        if ticks % 4 == 0 {
+            for cpu in tids.iter().filter_map(|t| last_cpu(*t)) {
+                if let (Some(now), Some(max)) = (cpu_khz(cpu, "scaling_cur_freq"), cpu_khz(cpu, "cpuinfo_max_freq")) {
+                    clock_sample(now, max);
+                }
+            }
+        }
         let now: Vec<i64> = tids.iter().map(|t| cpu_ns(*t).unwrap_or(0)).collect();
         let busiest = now.iter().zip(&last).map(|(a, b)| a - b).max().unwrap_or(0);
         last = now;
+        // A guest that stays late, every two seconds: the system may raise the clocks at once
+        // rather than step by step.
+        if let (Performance::Max, Some(increase), true) = (performance, api.workload_increase, busiest > target && ticks % 40 == 0) {
+            // SAFETY: session is live; the name is a static C string.
+            unsafe { increase(session, true, false, c"vphone vCPU".as_ptr()) };
+        }
         if busiest > 0 {
             // SAFETY: session is live until the close below.
             let status = unsafe { (api.report_actual)(session, busiest) };
@@ -292,6 +434,50 @@ mod tests {
     }
 
     #[test]
+    fn a_busy_vcpu_is_always_late_and_an_idle_one_never() {
+        let period = PERIOD.as_nanos() as i64;
+        // The 0.5.7 log's vCPUs: 70-90% of a core, 35-45 ms of a 50 ms period.
+        for busy in [35_000_000, 40_000_000, 45_000_000] {
+            assert!(busy > target_ns(Performance::Max) * 3, "far past the target, not at it");
+            assert!(busy > target_ns(Performance::Balanced));
+        }
+        // An idle guest's few percent is on time in both, so the clocks may fall.
+        assert!(period / 10 < target_ns(Performance::Max));
+        assert!(target_ns(Performance::Max) < target_ns(Performance::Balanced));
+        assert!(target_ns(Performance::Balanced) < period);
+        assert!(vcpu_nice(Performance::Max) < vcpu_nice(Performance::Balanced));
+        // Nothing below what an app may ask for its own threads (-20 is the kernel's floor).
+        assert!(vcpu_nice(Performance::Max) >= -19);
+    }
+
+    #[test]
+    fn the_clock_summary_is_a_mean_and_a_share() {
+        assert_eq!(clock_summary(0, 0, 0), None);
+        // Four samples: 1.8 of 3.6 GHz twice, and 4.6 of 4.6 twice.
+        assert_eq!(
+            clock_summary(4, 500 + 500 + 1000 + 1000, 2).as_deref(),
+            Some("vCPU clocks 75% of max, 50% of the time at max")
+        );
+        clock_sample(1_800_000, 3_600_000);
+        clock_sample(4_600_000, 4_600_000);
+        clock_sample(1, 0);
+        let line = take_clock_summary().unwrap();
+        assert!(line.starts_with("vCPU clocks 75% of max, 50%"), "{line}");
+        assert_eq!(take_clock_summary(), None);
+    }
+
+    #[test]
+    fn the_priority_line_says_what_took() {
+        assert_eq!(priority_line(-8, 7, 7, None), "performance: 7 vCPU threads run at nice -8");
+        let refused = priority_line(-8, 7, 0, Some("Permission denied"));
+        assert!(refused.starts_with("performance: 0 of 7 vCPU threads took nice -8") && refused.ends_with("(Permission denied)"), "{refused}");
+        // A thread that is not there is a refusal, not a crash.
+        let (raised, refusal) = raise_priority(&[i32::MAX - 7], 0);
+        assert_eq!(raised, 0);
+        assert!(refusal.is_some());
+    }
+
+    #[test]
     fn the_line_says_plainly_which_way_it_went() {
         let on = status_line(&Ok(7), "0-7 of 0-7");
         assert!(on.starts_with("performance hints: ON") && on.contains("7 vCPU threads") && on.ends_with("CPUs 0-7 of 0-7"), "{on}");
@@ -305,7 +491,7 @@ mod tests {
     fn without_vcpu_threads_it_reports_off_once() {
         let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = lines.clone();
-        start(2, || true, move |line| sink.lock().unwrap().push(line.to_owned()));
+        start(2, Performance::Max, || true, move |line| sink.lock().unwrap().push(line.to_owned()));
         let end = Instant::now() + Duration::from_secs(10);
         while lines.lock().unwrap().is_empty() && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));

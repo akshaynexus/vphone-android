@@ -100,7 +100,7 @@ pub fn dfu_spec(
     }
     let res = format!("{}x{}", b.res.0, b.res.1);
     if display {
-        machine += &launcher::gfx_machine(&res);
+        machine += &launcher::gfx_machine(&res, 60);
     }
     let (nvram, disk) = (file("nvram.bin"), file("Disk.img"));
     let mut args: Vec<String> = ["qemu-system-aarch64", "-name", "vphone,debug-threads=on", "-M", &machine, "-accel"]
@@ -343,7 +343,7 @@ pub fn run_spec_file(file: &Path) -> Result<(), String> {
     if spec.hint_vcpus > 0 {
         // One line, in the log the step's own follows as [vm]: whether the hints took effect.
         let threads_log = spec.threads_log.clone();
-        crate::adpf::start(spec.hint_vcpus, || false, move |line| {
+        crate::adpf::start(spec.hint_vcpus, crate::config::Performance::Balanced, || false, move |line| {
             log(TAG, line);
             if let Ok(mut out) = fs::OpenOptions::new().append(true).open(&threads_log) {
                 use std::io::Write;
@@ -872,11 +872,9 @@ mod tests {
             ram_mib: 6144,
             tb_mib: 1024,
             performance_hints: false,
-            display: true,
-            gpu_compression: false,
             gpu_diagnostics: true,
-            swapchain_layout: crate::config::SwapchainLayout::Auto,
-            software_display: false,
+            refresh_hz: 60,
+            ..VmConfig::for_phone(11 * 1024, 8)
         }
     }
 

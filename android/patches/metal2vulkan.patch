@@ -394,7 +394,7 @@ index 59062a3d739ecfb28f760135991837af5abb5de6..0a0f9dad7617aea8b5f645358e96a01a
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
-index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce946c79d8 100644
+index 1957d120a3cd349b49eb0476141638fb7d5e19c7..380dd5d4326aa786309411043e892f03fe5f1b0f 100644
 --- a/crates/metal2vulkan-runtime/src/host_memory.rs
 +++ b/crates/metal2vulkan-runtime/src/host_memory.rs
 @@ -667,7 +667,7 @@ pub(super) fn import_refused(error: vk::Result) -> Error {
@@ -482,7 +482,50 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce
  fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) -> Option<bool> {
      use std::io::BufRead;
      let maps = kept_maps()?;
-@@ -875,7 +875,7 @@ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) ->
+@@ -864,9 +864,40 @@ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) ->
+     }
+     // The lines are read from a file of their own: reading moves its position, which the kept
+     // one's queries share among threads.
++    let began = std::time::Instant::now();
+     let maps = std::fs::File::open("/proc/self/maps").ok()?;
+-    let lines = std::io::BufReader::new(maps).lines().map_while(Result::ok);
+-    Some(permitted(lines, start, end, access, asked))
++    let lines = std::io::BufReader::with_capacity(1 << 18, maps)
++        .lines()
++        .map_while(Result::ok);
++    let answer = permitted(lines, start, end, access, asked);
++    MAPS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    MAPS_READ_NANOS.fetch_add(
++        u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
++        std::sync::atomic::Ordering::Relaxed,
++    );
++    Some(answer)
++}
++
++/// Readings of `/proc/self/maps`' lines made where the kernel does not answer `PROCMAP_QUERY`
++/// ([`mappings_permitted`]), and the nanoseconds they took.
++#[cfg(any(target_os = "linux", target_os = "android"))]
++static MAPS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++#[cfg(any(target_os = "linux", target_os = "android"))]
++static MAPS_READ_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// How many times the process's mappings were read as lines of `/proc/self/maps`, and the
++/// nanoseconds those readings took in all, since the process started: the cost of an import's or
++/// a copy's permission check where the kernel does not answer `PROCMAP_QUERY` (before Linux 6.11,
++/// or refused, as Android's SELinux policy refuses an app's). A diagnostic: no Metal call
++/// answers it. `(0, 0)` off Linux.
++pub fn host_maps_line_reads() -> (u64, u64) {
++    #[cfg(any(target_os = "linux", target_os = "android"))]
++    {
++        use std::sync::atomic::Ordering::Relaxed;
++        (MAPS_READS.load(Relaxed), MAPS_READ_NANOS.load(Relaxed))
++    }
++    #[cfg(not(any(target_os = "linux", target_os = "android")))]
++    (0, 0)
+ }
+ 
+ /// This process's `/proc/self/maps`, opened once for [`queried_permitted`] and kept with the id of
+@@ -875,7 +906,7 @@ fn mappings_permitted(start: u64, end: u64, access: Access, asked: &mut u64) ->
  /// answers as one opened for the call, without the opening, which cost each import about as much
  /// as its queries (an import over 57 mappings, the consumer's guest pages). A process forked
  /// since holds the file of its parent's mappings, so one of another id opens its own.
@@ -491,7 +534,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce
  pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
      static KEPT: Mutex<Option<(u32, std::sync::Arc<std::fs::File>)>> = Mutex::new(None);
      let process = std::process::id();
-@@ -890,7 +890,7 @@ pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
+@@ -890,7 +921,7 @@ pub(super) fn kept_maps() -> Option<std::sync::Arc<std::fs::File>> {
  
  /// `struct procmap_query` of Linux's `include/uapi/linux/fs.h` (Linux 6.11): the argument of
  /// [`PROCMAP_QUERY`].
@@ -500,7 +543,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce
  #[repr(C)]
  #[derive(Default)]
  struct ProcmapQuery {
-@@ -911,21 +911,21 @@ struct ProcmapQuery {
+@@ -911,21 +942,21 @@ struct ProcmapQuery {
      build_id_addr: u64,
  }
  
@@ -526,7 +569,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce
  const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
  
  /// Whether the process maps `[start, end)` without a gap, each mapping with `access`, as the
-@@ -934,7 +934,7 @@ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
+@@ -934,7 +965,7 @@ const PROCMAP_QUERY_VMA_WRITABLE: u64 = 0x02;
  /// and each added to `asked`. `None` where the kernel does not answer the query (before Linux
  /// 6.11, `ENOTTY`) or fails it otherwise; a missing mapping (`ENOENT`) is an answer, not
  /// permitted.
@@ -535,7 +578,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce
  pub(super) fn queried_permitted(
      maps: &std::fs::File,
      start: u64,
-@@ -978,7 +978,7 @@ pub(super) fn queried_permitted(
+@@ -978,7 +1009,7 @@ pub(super) fn queried_permitted(
  
  /// Refuse the window's pages unless the process can write them: no check off Linux (MoltenVK
  /// hands the range to Metal, which reads read-only pages).
@@ -544,7 +587,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce
  pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> Result<(), Error> {
      Ok(())
  }
-@@ -987,7 +987,7 @@ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> R
+@@ -987,7 +1018,7 @@ pub(super) fn refuse_unwritable(_window: &ImportWindow, _counts: &Counters) -> R
  /// `[start, end)` without a gap, each with `access`, adding to `asked` each mapping it judged (one
  /// ending past the address it reached). Reading stops at the first line past `end`; a line that
  /// does not parse is skipped.
@@ -553,7 +596,7 @@ index 1957d120a3cd349b49eb0476141638fb7d5e19c7..7d38654a0e47ab9d8bbb122856b3a5ce
  pub(super) fn permitted(
      maps: impl IntoIterator<Item = String>,
      start: u64,
-@@ -1016,7 +1016,7 @@ pub(super) fn permitted(
+@@ -1016,7 +1047,7 @@ pub(super) fn permitted(
  }
  
  /// One line of `/proc/<pid>/maps`: the mapping's start, its end, and whether it has `access`.
@@ -607,7 +650,7 @@ index 4c166a5c14a810779f5298a8763d1f90e52379c5..4766a1ebc35f1fcb2248cf0312ee5844
          Some((libc::MAP_SHARED | libc::MAP_ANON, None))
      }
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index 606eab5326bf79f6961a3f0227ad9ee05bf77a7f..1388c1cf0cfbefe79b08d49e5b415a0abee2282b 100644
+index 606eab5326bf79f6961a3f0227ad9ee05bf77a7f..44f9f1f8e0431ca785e1e59308c3d864752b075b 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
 @@ -269,6 +269,8 @@ pub use copy_plan::{BlitOption, CopyProblem};
@@ -619,6 +662,14 @@ index 606eab5326bf79f6961a3f0227ad9ee05bf77a7f..1388c1cf0cfbefe79b08d49e5b415a0a
  pub use device::{
      DebugMessage, Device, DeviceHandles, DeviceKind, DeviceOptions, ExtraQueue, LayerSetting,
      LayerSettingValue, MessageKind, MessageSeverity, MessageSink, PhysicalDeviceIdentity,
+@@ -311,6 +313,7 @@ pub use gpu_time::host_time;
+ pub use heap::{Heap, HeapDescriptor, HeapProblem, HeapType, SizeAndAlign};
+ pub use host_backing::HostBacking;
+ pub use host_bytes::HostBytes;
++pub use host_memory::host_maps_line_reads;
+ pub use host_memory::{Deallocator, HostMemory, ImportGate, ImportRequest, KeepAlive, RunResolver};
+ pub use host_ram::{HostRam, HostRamUse};
+ pub use indirect_command_buffer::{
 diff --git a/crates/metal2vulkan-runtime/src/loaded.rs b/crates/metal2vulkan-runtime/src/loaded.rs
 index 0514c9ba88724454742b49d6e3a425bba8f2887c..7a3b9e6fd31b9992424ef252bb14cbeae2a034bc 100644
 --- a/crates/metal2vulkan-runtime/src/loaded.rs

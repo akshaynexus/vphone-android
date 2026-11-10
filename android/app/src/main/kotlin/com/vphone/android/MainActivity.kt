@@ -445,8 +445,26 @@ class MainActivity : Activity() {
         val ram = number("RAM (MiB)", config.getInt("ramMib"))
         val tb = number("Code cache (MiB)", config.getInt("tbMib"))
         val hints = CheckBox(this).apply {
-            text = "Performance hints"
+            text = "Performance hints (tell Android how busy the emulated CPUs are)"
             isChecked = config.getBoolean("performanceHints")
+        }
+        val performanceValues = listOf("max", "balanced")
+        val performance = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("Max (highest CPU clocks; warmer, more battery)", "Balanced (cooler, slower)"),
+            )
+            setSelection(performanceValues.indexOf(config.optString("performance", "max")).coerceAtLeast(0))
+        }
+        val refreshValues = listOf(120, 60)
+        val refresh = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("120 Hz", "60 Hz"),
+            )
+            setSelection(refreshValues.indexOf(config.optInt("refreshHz", 120)).coerceAtLeast(0))
         }
         val display = CheckBox(this).apply {
             text = "Show the screen (off: iOS runs with nothing drawn)"
@@ -475,7 +493,7 @@ class MainActivity : Activity() {
         val diagnostics = CheckBox(this).apply {
             text = "GPU diagnostics: image layouts in the log, and pictures of the guest's screen " +
                 "in the log screen's Share"
-            isChecked = config.optBoolean("gpuDiagnostics", true)
+            isChecked = config.optBoolean("gpuDiagnostics", false)
         }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -484,7 +502,9 @@ class MainActivity : Activity() {
         labelled(form, "vCPUs", vcpus)
         labelled(form, "RAM (MiB)", ram)
         labelled(form, "Code cache (MiB)", tb)
+        labelled(form, "Performance", performance)
         form.addView(hints)
+        labelled(form, "Refresh rate (iOS's display mode, and the rate asked of this phone's screen)", refresh)
         form.addView(display)
         form.addView(compression)
         labelled(
@@ -502,6 +522,9 @@ class MainActivity : Activity() {
                     .put("vcpus", vcpus.text.toString().toIntOrNull() ?: 0)
                     .put("ramMib", ram.text.toString().toIntOrNull() ?: 0)
                     .put("tbMib", tb.text.toString().toIntOrNull() ?: 0)
+                    .put("version", config.optInt("version", 2))
+                    .put("performance", performanceValues[performance.selectedItemPosition.coerceIn(0, 1)])
+                    .put("refreshHz", refreshValues[refresh.selectedItemPosition.coerceIn(0, 1)])
                     .put("performanceHints", hints.isChecked)
                     .put("display", display.isChecked)
                     .put("gpuCompression", compression.isChecked)

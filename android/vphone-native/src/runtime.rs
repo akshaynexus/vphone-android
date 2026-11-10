@@ -62,6 +62,10 @@ pub struct State {
     pub needs_restart: bool,
     /// When QEMU started, in ms since the epoch (0 before then), for the elapsed boot time.
     pub started_ms: u64,
+    /// The VM's performance setting (`balanced` or `max`) and refresh rate, once it boots: the
+    /// screen asks Android for that rate, and leaves sustained-performance mode off for `max`.
+    pub performance: String,
+    pub refresh_hz: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -85,6 +89,8 @@ static STATE: Mutex<State> = Mutex::new(State {
     height: 0,
     needs_restart: false,
     started_ms: 0,
+    performance: String::new(),
+    refresh_hz: 0,
 });
 static NOTICE: Mutex<String> = Mutex::new(String::new());
 static QEMU_DONE: AtomicBool = AtomicBool::new(false);
@@ -103,6 +109,8 @@ pub(crate) struct Qemu {
     pub(crate) set_gipa: unsafe extern "C" fn(*mut c_void),
     pub(crate) set_window: unsafe extern "C" fn(*mut c_void),
     pointer: unsafe extern "C" fn(u16, u16, u32),
+    /// `rvg_android_perf_line`: where the guest's frame time went since the last call.
+    perf_line: unsafe extern "C" fn(u32, *mut u8, usize) -> usize,
 }
 static QEMU: OnceLock<Qemu> = OnceLock::new();
 
@@ -269,6 +277,7 @@ pub(crate) fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
             )?),
             set_window: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_set_window")?),
             pointer: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_pointer")?),
+            perf_line: std::mem::transmute::<*mut c_void, _>(dlsym(h, c"rvg_android_perf_line")?),
         }
     };
     Ok(QEMU.get_or_init(|| q))
@@ -433,6 +442,8 @@ fn start(name: &str) -> Result<(), String> {
     update(|s| {
         s.log_path = log_path.clone();
         (s.width, s.height) = bundle.res;
+        s.performance = format!("{:?}", cfg.performance).to_lowercase();
+        s.refresh_hz = cfg.refresh_hz;
     });
     for w in report.warnings {
         notice(w);
@@ -453,6 +464,7 @@ fn start(name: &str) -> Result<(), String> {
         if matches!(key, "TU_DEBUG"
                 | "TU_ANDROID_SWAPCHAIN_LAYOUT"
                 | "REIMS_VGPU_SOFTWARE_DISPLAY"
+                | "REIMS_VGPU_STATS"
                 | "REIMS_VGPU_FRAME_DUMP") {
             log_line(&format!("GPU setting: {key}={value}"));
         }
@@ -512,14 +524,14 @@ fn start(name: &str) -> Result<(), String> {
         })
         .map_err(|e| format!("cannot start QEMU's thread: {e}"))?;
 
-    let vcpus = cfg.vcpus;
+    let (vcpus, refresh_hz) = (cfg.vcpus, cfg.refresh_hz);
     std::thread::Builder::new()
         .name("vm-status".into())
-        .spawn(move || status_lines(vcpus))
+        .spawn(move || status_lines(vcpus, refresh_hz))
         .map_err(|e| e.to_string())?;
     if cfg.performance_hints {
         #[cfg(target_os = "android")]
-        crate::adpf::start(cfg.vcpus, || QEMU_DONE.load(Ordering::SeqCst), log_line);
+        crate::adpf::start(cfg.vcpus, cfg.performance, || QEMU_DONE.load(Ordering::SeqCst), log_line);
     }
     std::thread::Builder::new()
         .name("vphoned-watch".into())
@@ -557,7 +569,19 @@ const STATUS_EVERY: Duration = Duration::from_secs(30);
 /// Every [`STATUS_EVERY`] until QEMU ends: the phase, the process's CPU and memory, its busiest
 /// threads, and where the guest's vCPUs are. A black screen is then a guest still in its kernel
 /// (EL1), one running its daemons (EL0), or one that has stopped moving.
-fn status_lines(vcpus: u32) {
+/// The GPU device's line of where the guest's frame time went since the last call, for a display
+/// mode of `cap_hz`; empty where the library gives none.
+fn gpu_line(qemu: &Qemu, cap_hz: u32) -> String {
+    let mut buffer = vec![0u8; 2048];
+    // SAFETY: the buffer holds the capacity given; the call writes at most that.
+    let written = unsafe { (qemu.perf_line)(cap_hz, buffer.as_mut_ptr(), buffer.len()) };
+    buffer.truncate(written.min(buffer.len()));
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// The stack sampler's cost is two signals and one reading of the process's mappings a sample,
+/// on this thread: the first four status lines carry one, then every fourth (two minutes).
+fn status_lines(vcpus: u32, refresh_hz: u32) {
     let paths = Paths::get();
     let mut sampler = crate::create::vm::diag::Sampler::new(paths.files.clone()).with_stacks();
     let mut tick = 0u32;
@@ -578,13 +602,18 @@ fn status_lines(vcpus: u32) {
             Err(e) => format!("guest not readable: {e}"),
         };
         let window = if *WINDOW.lock().unwrap() != 0 { "on screen" } else { "no window" };
+        let clocks = crate::adpf::take_clock_summary().map_or(String::new(), |c| format!("; {c}"));
         log_line(&format!(
-            "status {}:{:02} {}, {window}: {}; {guest}",
+            "status {}:{:02} {}, {window}: {}{clocks}; {guest}",
             elapsed / 60,
             elapsed % 60,
             format!("{:?}", s.phase).to_lowercase(),
             sampler.line(4),
         ));
+        // Where a guest frame's time goes, against the refresh rate's budget.
+        if let Some(line) = QEMU.get().map(|q| gpu_line(q, refresh_hz)).filter(|l| !l.is_empty()) {
+            log_line(&format!("gpu {}:{:02} {line}", elapsed / 60, elapsed % 60));
+        }
         // A boot that is not moving says where it is stuck: the first minutes, then every few.
         // QEMU's main loop not answering is a boot not moving whatever the CPU use, so its
         // thread's stack and the reclaimer's are read even when they are blocked.

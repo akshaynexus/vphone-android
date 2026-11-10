@@ -88,10 +88,10 @@ index 7af10ee68ac41a8005c55115d6e0bbd12154d532..cbe17df7cc058befd8ebf69227d253ad
  }
 diff --git a/crates/reims-vgpu-c/include/reims_vgpu_android.h b/crates/reims-vgpu-c/include/reims_vgpu_android.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..56b71174123cbcdf19981e3e431bcc2a361745ba
+index 0000000000000000000000000000000000000000..c91f847de8e473b7185f4fae13bb1e7323c27f52
 --- /dev/null
 +++ b/crates/reims-vgpu-c/include/reims_vgpu_android.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,40 @@
 +/*
 + * reims_vgpu_android.h: the Android-only part of reims-vgpu's C API (crates/reims-vgpu-c/src/android.rs).
 + *
@@ -100,6 +100,7 @@ index 0000000000000000000000000000000000000000..56b71174123cbcdf19981e3e431bcc2a
 +#ifndef REIMS_VGPU_ANDROID_H
 +#define REIMS_VGPU_ANDROID_H
 +
++#include <stddef.h>
 +#include <stdint.h>
 +
 +#ifdef __cplusplus
@@ -121,6 +122,11 @@ index 0000000000000000000000000000000000000000..56b71174123cbcdf19981e3e431bcc2a
 +// callback, on the library's own thread.
 +void rvg_android_pointer(uint16_t x, uint16_t y, uint32_t buttons);
 +
++// Writes one line saying where the guest's frame time went since the last call, for a display
++// mode of cap_hz, into buffer: at most capacity bytes, with no terminator. Returns the bytes
++// written. A diagnostic: call it rarely (every 30 seconds).
++size_t rvg_android_perf_line(uint32_t cap_hz, uint8_t *buffer, size_t capacity);
++
 +#ifdef __cplusplus
 +}
 +#endif
@@ -128,10 +134,10 @@ index 0000000000000000000000000000000000000000..56b71174123cbcdf19981e3e431bcc2a
 +#endif /* REIMS_VGPU_ANDROID_H */
 diff --git a/crates/reims-vgpu-c/src/android.rs b/crates/reims-vgpu-c/src/android.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..b4ae92d68afe7ea383d373f3652c6150d0c67a5e
+index 0000000000000000000000000000000000000000..f309b7a77d4ab69234ea54843292e94867c2fd5a
 --- /dev/null
 +++ b/crates/reims-vgpu-c/src/android.rs
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,73 @@
 +//! The Android-only C API, `include/reims_vgpu_android.h`: what the app gives the library that a
 +//! desktop host's window system gives it itself. Each call runs on the caller's thread.
 +
@@ -173,6 +179,37 @@ index 0000000000000000000000000000000000000000..b4ae92d68afe7ea383d373f3652c6150
 +    ffi::export(|| {
 +        reims_vgpu::android::pointer(x, y, buttons);
 +    })
++}
++
++/// Writes the frame path's line (`reims_vgpu::perf`) for a display mode of `cap_hz` into
++/// `buffer`, at most `capacity` bytes with no terminator, and returns the bytes written: where
++/// the guest's frame time goes, since the last call. A diagnostic; a host calls it rarely (each
++/// call has the runtime settle its commits to count them).
++///
++/// # Safety
++///
++/// `buffer` is NULL or `capacity` writable bytes.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_android_perf_line(
++    cap_hz: u32,
++    buffer: *mut u8,
++    capacity: usize,
++) -> usize {
++    if buffer.is_null() {
++        return 0;
++    }
++    let mut written = 0;
++    ffi::export(|| {
++        let line = reims_vgpu::perf::line(cap_hz);
++        let mut length = line.len().min(capacity);
++        while !line.is_char_boundary(length) {
++            length -= 1;
++        }
++        // SAFETY: the caller's buffer holds `capacity` bytes, and `length` is no more.
++        unsafe { std::ptr::copy_nonoverlapping(line.as_ptr(), buffer, length) };
++        written = length;
++    });
++    written
 +}
 diff --git a/crates/reims-vgpu-c/src/ffi/catch.rs b/crates/reims-vgpu-c/src/ffi/catch.rs
 index 599c7a0a49260e829159ab21c5ab50fe9904d980..6d55500b9621f33e495c0a2b8fd8582c5acf5c57 100644
@@ -276,6 +313,212 @@ index 57c4dcb20920379147b1d9fb118bba8602d6c32b..7c71f2fee303c4c2eb3103bb1654e3ea
      /// The pipeline the display's own window draws over a frame of the display in a target of
      /// `format` with ([`DisplayPipelineCache::overlay_for`]), in the display's pass
      /// ([`DisplayCore::encode_current_frame_with`]): asked before the encode, which makes none.
+diff --git a/crates/reims-vgpu-core/src/fifo/thread.rs b/crates/reims-vgpu-core/src/fifo/thread.rs
+index 1f521dbe4175b52c79144415cbfc0924bec32441..377fa807c16b632ba829e93b92aad4f715d2c5e5 100644
+--- a/crates/reims-vgpu-core/src/fifo/thread.rs
++++ b/crates/reims-vgpu-core/src/fifo/thread.rs
+@@ -179,9 +179,11 @@ impl<P: Platform> Fifo<P> {
+         while !self.quiesced.load(Ordering::SeqCst) {
+             self.latch_offset();
+             let mut header = [0u8; COMMAND_HEADER_SIZE];
++            let waiting = crate::perf::now();
+             if !self.read_bytes(&mut header) {
+                 continue;
+             }
++            let read = crate::perf::add(crate::perf::Stage::FifoIdle, waiting);
+             let command: FifoCommand = zerocopy::transmute!(header);
+             let (barrier_count, barrier_len, payload_len) = match self.frame(&command, ring_length)
+             {
+@@ -266,6 +268,10 @@ impl<P: Platform> Fifo<P> {
+                     continue;
+                 }
+             }
++            let met = match barrier_count {
++                0 => crate::perf::now(),
++                _ => crate::perf::add(crate::perf::Stage::FifoBarrier, read),
++            };
+             // The read count publishes before the push, which may block.
+             self.advance();
+             if barrier_count != 0 {
+@@ -281,6 +287,8 @@ impl<P: Platform> Fifo<P> {
+             self.push_stamp(command.stamp_value, command.command_id);
+             let body = payload.get(..payload_len).unwrap_or(&[]);
+             self.dispatch(&command, body);
++            let ran = crate::perf::add(crate::perf::Stage::FifoRun, met);
++            crate::perf::opcode(u32::from(command.command_id), ran.saturating_sub(met));
+             // ran: FIFO, opcode, stamp value: its handler returned
+             crate::trace::event(
+                 "ran",
+diff --git a/crates/reims-vgpu-core/src/lib.rs b/crates/reims-vgpu-core/src/lib.rs
+index a81d9ea8353ac3ed7a5accfd10d43a2679d3494a..9922db6aedeccc8d97b48257cb61b4fe9accd0aa 100644
+--- a/crates/reims-vgpu-core/src/lib.rs
++++ b/crates/reims-vgpu-core/src/lib.rs
+@@ -44,6 +44,7 @@ pub mod iosurface;
+ pub mod logging;
+ pub mod memory;
+ pub mod num;
++pub mod perf;
+ pub mod platform;
+ pub mod process;
+ pub mod raise;
+diff --git a/crates/reims-vgpu-core/src/perf.rs b/crates/reims-vgpu-core/src/perf.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ff30ba9f44b0a72adf4bb1830a6ffbe658234d1
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/perf.rs
+@@ -0,0 +1,152 @@
++//! Where the frame path's wall time goes, a diagnostic a host reads as one line
++//! (`reims_vgpu::perf_line`, the Android app's `[vphone] gpu` line). Every figure is a sum since
++//! the last reading: no line is written here, and nothing the guest or the host sees changes.
++//!
++//! - **The FIFO threads** ([`Stage::FifoIdle`], [`Stage::FifoBarrier`], [`Stage::FifoRun`]): each
++//!   command's wait for its bytes (the guest has sent nothing: the host is idle), its wait for its
++//!   barriers (the stamps of earlier work, the GPU's completions among them) and its handler's
++//!   run (the host's own work: decoding, the runtime's calls, the driver's). Summed over every
++//!   FIFO thread, so a period of S seconds with N busy FIFOs can hold up to N x S of each.
++//! - **Each opcode's handler time** ([`opcode`], [`top_opcodes`]): which commands the run time
++//!   is spent in.
++//! - **The window** ([`Stage::Acquire`], [`Stage::WindowEncode`], [`Stage::Present`]): a drawn
++//!   frame's wait for a swapchain image, its encoding and commit, and its present.
++//!
++//! A reading costs two clock reads a stage (the vDSO's, tens of nanoseconds) and two relaxed
++//! atomic adds.
++
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::time::Instant;
++
++/// A part of the frame path whose time is summed.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Stage {
++    /// A FIFO thread waiting for the guest's next command.
++    FifoIdle,
++    /// A FIFO thread waiting for a command's barriers.
++    FifoBarrier,
++    /// A FIFO thread running a command's handler.
++    FifoRun,
++    /// The window's wait for a swapchain image.
++    Acquire,
++    /// The window's frame encoded and committed.
++    WindowEncode,
++    /// The window's present.
++    Present,
++}
++
++/// How many stages there are.
++const STAGES: usize = 6;
++
++/// Opcodes whose handler time is kept apart; a higher one is summed into the last slot.
++const OPCODES: usize = 512;
++
++/// A sum of times and how many.
++struct Sum {
++    count: AtomicU64,
++    nanos: AtomicU64,
++}
++
++impl Sum {
++    const fn new() -> Sum {
++        Sum {
++            count: AtomicU64::new(0),
++            nanos: AtomicU64::new(0),
++        }
++    }
++
++    fn add(&self, nanos: u64) {
++        self.count.fetch_add(1, Relaxed);
++        self.nanos.fetch_add(nanos, Relaxed);
++    }
++
++    fn take(&self) -> (u64, u64) {
++        (self.count.swap(0, Relaxed), self.nanos.swap(0, Relaxed))
++    }
++}
++
++static SUMS: [Sum; STAGES] = [const { Sum::new() }; STAGES];
++static BY_OPCODE: [Sum; OPCODES] = [const { Sum::new() }; OPCODES];
++
++/// Nanoseconds since the first call, on the monotonic clock.
++#[allow(
++    clippy::disallowed_methods,
++    reason = "a diagnostic's own clock: it must not go through a platform's, which tests replace"
++)]
++pub fn now() -> u64 {
++    static BASE: OnceLock<Instant> = OnceLock::new();
++    let base = *BASE.get_or_init(Instant::now);
++    u64::try_from(Instant::now().saturating_duration_since(base).as_nanos()).unwrap_or(u64::MAX)
++}
++
++/// Adds the time since `began` ([`now`]) to `stage`; the time now, for the next stage.
++pub fn add(stage: Stage, began: u64) -> u64 {
++    let at = now();
++    if let Some(sum) = SUMS.get(stage as usize) {
++        sum.add(at.saturating_sub(began));
++    }
++    at
++}
++
++/// Adds `nanos` to opcode `id`'s handler time.
++pub fn opcode(id: u32, nanos: u64) {
++    let slot = usize::try_from(id).unwrap_or(usize::MAX).min(OPCODES - 1);
++    if let Some(sum) = BY_OPCODE.get(slot) {
++        sum.add(nanos);
++    }
++}
++
++/// `stage`'s count and nanoseconds since the last call, which starts its next period.
++pub fn take(stage: Stage) -> (u64, u64) {
++    SUMS.get(stage as usize).map_or((0, 0), Sum::take)
++}
++
++/// The `top` opcodes by handler time since the last call, as (opcode, count, nanoseconds),
++/// longest first; starts every opcode's next period.
++pub fn top_opcodes(top: usize) -> Vec<(u32, u64, u64)> {
++    let mut all: Vec<(u32, u64, u64)> = BY_OPCODE
++        .iter()
++        .zip(0u32..)
++        .map(|(sum, id)| {
++            let (count, nanos) = sum.take();
++            (id, count, nanos)
++        })
++        .filter(|&(_, count, _)| count > 0)
++        .collect();
++    all.sort_by_key(|&(_, _, nanos)| std::cmp::Reverse(nanos));
++    all.truncate(top);
++    all
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_stage_sums_and_a_reading_starts_it_again() {
++        // Stages are process-wide: this test owns `Present`, which no other core test adds to.
++        let _ = take(Stage::Present);
++        let began = now();
++        let after = add(Stage::Present, began);
++        assert!(after >= began);
++        add(Stage::Present, began);
++        let (count, nanos) = take(Stage::Present);
++        assert_eq!(count, 2);
++        assert!(nanos >= after - began);
++        assert_eq!(take(Stage::Present), (0, 0));
++    }
++
++    #[test]
++    fn opcodes_are_ranked_by_their_time() {
++        // Opcodes no handler has (the table ends far below): this test's own slots.
++        opcode(500, 30);
++        opcode(501, 50);
++        opcode(501, 50);
++        opcode(9_999, 7);
++        let top = top_opcodes(OPCODES);
++        let ours: Vec<_> = top.iter().filter(|t| t.0 >= 500).copied().collect();
++        assert_eq!(ours, [(501, 2, 100), (500, 1, 30), (511, 1, 7)]);
++        assert!(top_opcodes(OPCODES).iter().all(|t| t.0 < 500));
++    }
++}
 diff --git a/crates/reims-vgpu-core/src/testkit/death/sys.rs b/crates/reims-vgpu-core/src/testkit/death/sys.rs
 index acd0b3a5633468e980692089ea8ee46fef1c15fa..a2d675919f0087003a3388bb46686228a5bf217b 100644
 --- a/crates/reims-vgpu-core/src/testkit/death/sys.rs
@@ -523,10 +766,10 @@ index 8f7d7464839060ef90ab745e8760615fd2cb47aa..aa8457d873bd5d049d78a143b5c9aad8
          assert_eq!(read(alias.at, 0), 0xa5);
          for offset in [PAGE, 2 * PAGE + 5, 3 * PAGE - 1] {
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/device.rs b/crates/reims-vgpu-vulkan/src/gpu/device.rs
-index efb4230a11c041cfaf56d9214b1d4d1386443aeb..1f9faeeef0bc08f3b2e7131ffb7d793fb4d6a906 100644
+index efb4230a11c041cfaf56d9214b1d4d1386443aeb..352ae3d0bd5a57b0600b7f9584527288ae1746eb 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/device.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/device.rs
-@@ -322,7 +322,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
+@@ -322,13 +322,14 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
      }
      metal_space::count_sampler_ids(&raw);
      crate::answer::native::device_made(raw.properties());
@@ -535,7 +778,14 @@ index efb4230a11c041cfaf56d9214b1d4d1386443aeb..1f9faeeef0bc08f3b2e7131ffb7d793f
      crate::os::learn_view_imports(&raw);
      #[cfg(not(test))]
      if let Some(home) = std::env::var_os("HOME") {
-@@ -778,7 +778,7 @@ impl VulkanDevice {
+         crate::records::warm(&raw, crate::records::path_in(home.as_ref()));
+     }
+     crate::work_log::start(&raw);
++    crate::perf_counts::adopt(&raw);
+     let made = Obj::new(DeviceObject {
+         awake: crate::awake::Awake::start(&raw),
+         raw,
+@@ -778,7 +779,7 @@ impl VulkanDevice {
      /// (`newBufferWithIOSurface:`) answers the allocation size too, its first byte the surface's at
      /// the base address, and reads 0 past the allocation's end (measured on the M3 Max at 0x40,
      /// 0x1000 and 0x4000, by a kernel's copy). So the buffer is over an alias of the allocation's
@@ -544,7 +794,25 @@ index efb4230a11c041cfaf56d9214b1d4d1386443aeb..1f9faeeef0bc08f3b2e7131ffb7d793f
      /// offset into it, where the pages past the allocation would be other memory or none; what a
      /// write past the allocation's end does on Metal is not measured, and here it reaches those
      /// pages alone. On Linux a surface over several ranges of the guest's pages lends its own
-@@ -2791,7 +2791,7 @@ pub(crate) mod tests {
+@@ -2006,7 +2007,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
+                             match token {
+                                 Some(token) => {
+                                     self.raw.new_heap_with_bytes_no_copy_and_range_token(
+-                                        crate::os::host_memory(first, true),
++                                        crate::os::host_memory_vouched(first, true, !read_only),
+                                         &descriptor,
+                                         None,
+                                         Some(keep),
+@@ -2014,7 +2015,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
+                                     )
+                                 }
+                                 None => self.raw.new_heap_with_bytes_no_copy(
+-                                    crate::os::host_memory(first, true),
++                                    crate::os::host_memory_vouched(first, true, !read_only),
+                                     &descriptor,
+                                     None,
+                                     Some(keep),
+@@ -2791,7 +2792,7 @@ pub(crate) mod tests {
      /// command buffer completes, and the memory is unmapped once the import was freed. The command
      /// buffer reads another texture through its ID, so no command of it names the surface's.
      /// Linux's: on macOS IOSurface's memory is the surface's own
@@ -553,7 +821,7 @@ index efb4230a11c041cfaf56d9214b1d4d1386443aeb..1f9faeeef0bc08f3b2e7131ffb7d793f
      #[test]
      fn a_released_surface_texture_keeps_the_surfaces_memory_while_imported() {
          use std::sync::atomic::{AtomicU32, Ordering};
-@@ -3014,7 +3014,7 @@ pub(crate) mod tests {
+@@ -3014,7 +3015,7 @@ pub(crate) mod tests {
      /// own twin. Counted by the process's mappings of the guest's pages' file, which every view of
      /// them mapped from it takes (`/proc/self/maps`), a view through dma-bufs none, a twin always
      /// a mapping a run. Linux's: on macOS IOSurface maps the surface
@@ -602,10 +870,30 @@ index 22c34a3dbe8faccaa9fd4620c373b13b1eca3a7e..4b04cfc6c0e18655db4dba93389c5640
      CLOCKS.map(|clock| {
          let mut at = Timespec { sec: 0, nsec: 0 };
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource.rs b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
-index a053113024372d0fc8a54b0f7b918d4d51aad270..5d5ea485da43f2a216851056b85c67dee02121d3 100644
+index a053113024372d0fc8a54b0f7b918d4d51aad270..fc76f30b5ad0d9ae1a4197f2ff4b4ea6196dbfa7 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
-@@ -2402,7 +2402,7 @@ pub(crate) mod tests {
+@@ -1280,7 +1280,8 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
+                     // keep-alive is dropped, as nothing else frees or remaps it.
+                     unsafe {
+                         (self.raw).rebind_bytes_no_copy(
+-                            crate::os::host_memory(first, true),
++                            // Writable unless read-only (above): the kernel is not asked.
++                            crate::os::host_memory_vouched(first, true, !read_only),
+                             None,
+                             Some(keep),
+                         )
+@@ -2043,7 +2044,8 @@ impl Heap<VulkanPlatform> for VulkanHeap {
+                     // which is the runtime's import unit on this host.
+                     unsafe {
+                         (self.raw).rebind_bytes_no_copy(
+-                            crate::os::host_memory(first, true),
++                            // Writable unless read-only (above): the kernel is not asked.
++                            crate::os::host_memory_vouched(first, true, !read_only),
+                             None,
+                             Some(keep),
+                         )
+@@ -2402,7 +2404,7 @@ pub(crate) mod tests {
      /// A no-copy buffer over `pages` pages of zeros mapped read-only, which the runtime imports
      /// through a writable twin of them on Linux, and the pages' first byte, which the caller
      /// frees once the buffer is gone.
@@ -614,7 +902,7 @@ index a053113024372d0fc8a54b0f7b918d4d51aad270..5d5ea485da43f2a216851056b85c67de
      pub(crate) fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
          use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
  
-@@ -2428,7 +2428,7 @@ pub(crate) mod tests {
+@@ -2428,7 +2430,7 @@ pub(crate) mod tests {
      /// runtime imports a writable twin of the pages, which the fill would reach, where Metal
      /// drops the write (`os/linux/import.rs`, [`crate::gpu::writes::kept_write`]). The rest of
      /// the command buffer runs, and the pages stay zeros
@@ -623,7 +911,7 @@ index a053113024372d0fc8a54b0f7b918d4d51aad270..5d5ea485da43f2a216851056b85c67de
      #[test]
      fn a_fill_into_read_only_pages_dies_on_linux() {
          use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-@@ -4356,7 +4356,7 @@ pub(crate) mod tests {
+@@ -4356,7 +4358,7 @@ pub(crate) mod tests {
      /// an x86_64 guest's pages, is made on every host. The runtime's heap covers 16 KiB
      /// ([`crate::gpu::backing::HEAP_GRANULE`]), so on a host of 4 KiB pages its alias has zeros
      /// past the page: on Linux a file of their own, which the runtime imports with the guest's
@@ -660,10 +948,18 @@ index ffeda6f7cd3d48b563fa4db5fa954cd9f97e64fd..c000fedac24b9ec4711712938cb86d27
      fn drop(&mut self) {
          KEPT_NOW.fetch_sub(1, Ordering::SeqCst);
 diff --git a/crates/reims-vgpu-vulkan/src/lib.rs b/crates/reims-vgpu-vulkan/src/lib.rs
-index 05f527456835a8d38692e17cca618c36e7de4994..597f6c62f24a7aeb53ccdd9ac71baeabe7e147c0 100644
+index 05f527456835a8d38692e17cca618c36e7de4994..aa37c5ae69b564e34d332f07de3ffbb6ed4dc730 100644
 --- a/crates/reims-vgpu-vulkan/src/lib.rs
 +++ b/crates/reims-vgpu-vulkan/src/lib.rs
-@@ -37,3 +37,9 @@ pub mod swapchain;
+@@ -30,6 +30,7 @@ pub mod gpu;
+ #[cfg(target_os = "linux")]
+ pub mod host_gpus;
+ pub mod os;
++pub mod perf_counts;
+ pub mod platform;
+ pub(crate) mod records;
+ pub mod remap;
+@@ -37,3 +38,9 @@ pub mod swapchain;
  pub(crate) mod work_log;
  
  pub use platform::{Obj, VulkanPlatform};
@@ -1035,6 +1331,104 @@ index 55921c3f35ad4826e945ee8c9e6b5c0c9fbfdbf4..c83407395ec27de4cd7603509f6e0efc
          assert_eq!(
              (at == s.base_address().as_ptr::<u8>().addr(), landed == 1),
              (in_view, in_view),
+diff --git a/crates/reims-vgpu-vulkan/src/perf_counts.rs b/crates/reims-vgpu-vulkan/src/perf_counts.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fe01a8284f34b7b4ac28ad187b288b65f032b76
+--- /dev/null
++++ b/crates/reims-vgpu-vulkan/src/perf_counts.rs
+@@ -0,0 +1,92 @@
++//! The runtime's work counts a host's frame-path line reads (`reims_vgpu::perf_line`): the few
++//! of `rt::WorkCounts` that say where a frame's host time went, from the first device adopted. A
++//! diagnostic: nothing here is read unless a host asks, and a reading has the runtime settle its
++//! commits as `work_log`'s does, so a host asks rarely (the Android app, every 30 seconds).
++
++use std::sync::OnceLock;
++
++use metal2vulkan_runtime as rt;
++
++/// The first device adopted, whose counts are read.
++static DEVICE: OnceLock<rt::Device> = OnceLock::new();
++
++/// Keeps `device` for [`counts`], where it is the process's first.
++pub(crate) fn adopt(device: &rt::Device) {
++    let _ = DEVICE.get_or_init(|| device.clone());
++}
++
++/// What the runtime did so far, since the device was adopted.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Counts {
++    /// `VkCommandBuffer`s submitted.
++    pub command_buffers: u64,
++    /// `vkQueueSubmit` calls.
++    pub submissions: u64,
++    /// Nanoseconds inside `vkQueueSubmit`.
++    pub submit_nanos: u64,
++    /// Nanoseconds inside `vkCreateGraphicsPipelines` and `vkCreateComputePipelines`.
++    pub pipeline_nanos: u64,
++    /// Shader functions translated (not found in a cache).
++    pub translated: u64,
++    /// Nanoseconds reading the shader cache on disk.
++    pub shader_cache_nanos: u64,
++    /// Nanoseconds the batches' host steps took (records read, commands recorded).
++    pub host_step_nanos: u64,
++    /// Nanoseconds batches spent held before their submission.
++    pub hold_nanos: u64,
++    /// Nanoseconds makes of a command buffer waited for a slot of a full queue.
++    pub slot_wait_nanos: u64,
++    /// Shadow copies of textures over host bytes.
++    pub shadow_copies: u64,
++    /// Mappings asked about before imports of host pages.
++    pub mappings_queried: u64,
++    /// Readings of `/proc/self/maps`' lines for those, where the kernel answers no query.
++    pub maps_reads: u64,
++    /// Nanoseconds those readings took.
++    pub maps_read_nanos: u64,
++}
++
++impl Counts {
++    /// What happened since `earlier`.
++    #[must_use]
++    pub fn since(&self, earlier: &Counts) -> Counts {
++        Counts {
++            command_buffers: self.command_buffers.saturating_sub(earlier.command_buffers),
++            submissions: self.submissions.saturating_sub(earlier.submissions),
++            submit_nanos: self.submit_nanos.saturating_sub(earlier.submit_nanos),
++            pipeline_nanos: self.pipeline_nanos.saturating_sub(earlier.pipeline_nanos),
++            translated: self.translated.saturating_sub(earlier.translated),
++            shader_cache_nanos: (self.shader_cache_nanos)
++                .saturating_sub(earlier.shader_cache_nanos),
++            host_step_nanos: self.host_step_nanos.saturating_sub(earlier.host_step_nanos),
++            hold_nanos: self.hold_nanos.saturating_sub(earlier.hold_nanos),
++            slot_wait_nanos: self.slot_wait_nanos.saturating_sub(earlier.slot_wait_nanos),
++            shadow_copies: self.shadow_copies.saturating_sub(earlier.shadow_copies),
++            mappings_queried: self.mappings_queried.saturating_sub(earlier.mappings_queried),
++            maps_reads: self.maps_reads.saturating_sub(earlier.maps_reads),
++            maps_read_nanos: self.maps_read_nanos.saturating_sub(earlier.maps_read_nanos),
++        }
++    }
++}
++
++/// The counts now; `None` before the first device.
++pub fn counts() -> Option<Counts> {
++    let work = DEVICE.get()?.work_counts();
++    let (maps_reads, maps_read_nanos) = rt::host_maps_line_reads();
++    Some(Counts {
++        command_buffers: work.command_buffers_submitted,
++        submissions: work.queue_submissions,
++        submit_nanos: work.batch_submit_nanos,
++        pipeline_nanos: (work.render_pipeline_create_nanos)
++            .saturating_add(work.compute_pipeline_create_nanos),
++        translated: work.functions_translated,
++        shader_cache_nanos: work.shader_cache_read_nanos,
++        host_step_nanos: work.host_step_nanos,
++        hold_nanos: work.batch_hold_nanos,
++        slot_wait_nanos: work.slot_wait_nanos,
++        shadow_copies: work.shadow_copies,
++        mappings_queried: work.host_mappings_queried,
++        maps_reads,
++        maps_read_nanos,
++    })
++}
 diff --git a/crates/reims-vgpu-vulkan/src/remap.rs b/crates/reims-vgpu-vulkan/src/remap.rs
 index 22da52db0a29c24d01992b0ca2b0f7ac54b39771..c51fbdebb326f20d81699eb3ec0c8ed10f778512 100644
 --- a/crates/reims-vgpu-vulkan/src/remap.rs
@@ -2621,7 +3015,7 @@ index 8f3f29d68f8d13d571d148dfe711f3374a98bb0d..379c6ce0d54a09610609b93638d87b57
  #[cfg(target_os = "macos")]
  mod macos;
 diff --git a/crates/reims-vgpu/src/lib.rs b/crates/reims-vgpu/src/lib.rs
-index 8e00fe240133d3e407643e048360f3b459e5ce2b..f32b82a2384ff1f4f65d16fe58ba96cc5dbd7507 100644
+index 8e00fe240133d3e407643e048360f3b459e5ce2b..665e180b80d194b4cd8fe8ad459964999760ba70 100644
 --- a/crates/reims-vgpu/src/lib.rs
 +++ b/crates/reims-vgpu/src/lib.rs
 @@ -29,7 +29,7 @@
@@ -2633,7 +3027,16 @@ index 8e00fe240133d3e407643e048360f3b459e5ce2b..f32b82a2384ff1f4f65d16fe58ba96cc
  compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
  
  /// The unit tests' allocator, which counts a thread's allocations where a test asks.
-@@ -94,7 +94,7 @@ pub use video::{
+@@ -52,6 +52,8 @@ pub mod platform;
+ mod retained;
+ mod scaler;
+ pub mod singleton;
++#[cfg(feature = "vulkan")]
++pub mod perf;
+ mod stats;
+ mod video;
+ mod window;
+@@ -94,7 +96,7 @@ pub use video::{
  #[cfg(target_os = "macos")]
  pub type DefaultPlatform = MetalPlatform;
  /// The platform every handle is made on by default: `VulkanPlatform` on Linux.
@@ -2642,7 +3045,7 @@ index 8e00fe240133d3e407643e048360f3b459e5ce2b..f32b82a2384ff1f4f65d16fe58ba96cc
  pub type DefaultPlatform = VulkanPlatform;
  pub use reims_vgpu_window::{
      BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
-@@ -110,3 +110,27 @@ pub const DEVICE_MMIO_SIZE: u64 = reims_vgpu_core::device::config::DEFAULT_MMIO_
+@@ -110,3 +112,27 @@ pub const DEVICE_MMIO_SIZE: u64 = reims_vgpu_core::device::config::DEFAULT_MMIO_
  pub const PCI_VENDOR_ID: u16 = 0x106b;
  /// The PCI device ID of the device.
  pub const PCI_DEVICE_ID: u16 = 0xeeee;
@@ -2668,6 +3071,297 @@ index 8e00fe240133d3e407643e048360f3b459e5ce2b..f32b82a2384ff1f4f65d16fe58ba96cc
 +        };
 +        // SAFETY: the caller's.
 +        unsafe { reims_vgpu_vulkan::set_android_vulkan_gipa(gipa) };
++    }
++}
+diff --git a/crates/reims-vgpu/src/perf.rs b/crates/reims-vgpu/src/perf.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd71cdf7773c9dd44adf71dee880e36c2a135966
+--- /dev/null
++++ b/crates/reims-vgpu/src/perf.rs
+@@ -0,0 +1,285 @@
++//! One line saying where a guest frame's time goes, for a host that asks ([`line`]; the Android
++//! app writes it as `[vphone] gpu ...` every 30 seconds). A diagnostic: nothing the guest sees.
++//!
++//! The line holds, over the time since the last one:
++//! - the guest's presents a second against the cap (the display mode's refresh rate), the time
++//!   between two as a multiple of the cap's frame budget, and the longest gap. They need
++//!   `REIMS_VGPU_STATS` (`collect` keeps them without the every-second lines of `crate::stats`);
++//! - per guest frame, in milliseconds and as a share of the budget: the FIFO threads' time
++//!   waiting for the guest (`guest`), waiting for barriers (`barriers`) and running commands
++//!   (`host`), with the opcodes that took most of it; the window's wait for an image, its
++//!   encoding and its present (`reims_vgpu_core::perf`); and the runtime's own figures
++//!   (`reims_vgpu_vulkan::perf_counts`): `vkQueueSubmit`, pipeline makings, host steps, batches
++//!   held, readings of `/proc/self/maps`.
++//!
++//! The FIFO figures are sums over every FIFO thread, so `guest + barriers + host` can exceed
++//! the time between two frames: several FIFOs wait at once. `host` is the bound: a frame cannot
++//! come sooner than the host's own work for it, and a `host` far below the frame time says the
++//! frame waits on the guest's CPU, not on this library.
++
++use std::fmt::Write as _;
++use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
++
++use reims_vgpu_core::fifo::commands::Opcode;
++use reims_vgpu_core::perf::{self, Stage};
++use reims_vgpu_core::sync::Mutex;
++use reims_vgpu_vulkan::perf_counts::{self, Counts};
++
++/// How the window presents: 0 not yet, 1 MAILBOX, 2 FIFO.
++static PRESENTS_WITH: AtomicU8 = AtomicU8::new(0);
++
++/// The runtime's counts at the last line.
++static LAST: Mutex<Option<Counts>> = Mutex::new(None);
++
++/// The window's swapchain was made, with MAILBOX or FIFO.
++pub(crate) fn presents_with(mailbox: bool) {
++    PRESENTS_WITH.store(if mailbox { 1 } else { 2 }, Relaxed);
++}
++
++/// What a line is written from.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct Reading {
++    /// The cap: the display mode's refresh rate, in Hz.
++    pub cap_hz: u32,
++    /// Seconds the reading covers.
++    pub seconds: f64,
++    /// The guest's presents, and the longest gap between two in nanoseconds; `None` where the
++    /// statistics are off.
++    pub guest: Option<(u64, Option<u64>)>,
++    /// The window's draws, and of those with a GPU time, how many and their nanoseconds.
++    pub drawn: (u64, u64, u64),
++    /// How the window presents ([`PRESENTS_WITH`]).
++    pub mode: u8,
++    /// Each stage's count and nanoseconds, in [`STAGES`]' order.
++    pub stages: [(u64, u64); 6],
++    /// The opcodes that took most of the handlers' time: (opcode, count, nanoseconds).
++    pub opcodes: Vec<(u32, u64, u64)>,
++    /// The runtime's counts over the reading; `None` before a device.
++    pub counts: Option<Counts>,
++}
++
++/// The stages of a reading, in order.
++const STAGES: [Stage; 6] = [
++    Stage::FifoIdle,
++    Stage::FifoBarrier,
++    Stage::FifoRun,
++    Stage::Acquire,
++    Stage::WindowEncode,
++    Stage::Present,
++];
++
++/// Takes a reading for a display mode of `cap_hz`: every figure's next period starts.
++pub fn read(cap_hz: u32) -> Reading {
++    let taken = crate::stats::taken();
++    let counts = perf_counts::counts();
++    let since = {
++        let mut last = LAST.lock();
++        let since = counts.map(|now| now.since(&last.unwrap_or_default()));
++        *last = counts.or(*last);
++        since
++    };
++    Reading {
++        cap_hz,
++        seconds: taken.map_or(0.0, |t| t.seconds),
++        guest: taken.map(|t| (t.guest, t.guest_gap)),
++        drawn: taken.map_or((0, 0, 0), |t| (t.drawn, t.gpu.0, t.gpu.1)),
++        mode: PRESENTS_WITH.load(Relaxed),
++        stages: STAGES.map(perf::take),
++        opcodes: perf::top_opcodes(3),
++        counts: since,
++    }
++}
++
++/// [`read`], as its line ([`Reading::line`]).
++pub fn line(cap_hz: u32) -> String {
++    read(cap_hz).line()
++}
++
++/// Nanoseconds as milliseconds.
++fn ms(nanos: u64) -> f64 {
++    nanos as f64 / 1e6
++}
++
++impl Reading {
++    /// The line (the module docs). Per-frame figures divide by the guest's presents; with none
++    /// (or the statistics off) they are given a second, and say so.
++    pub fn line(&self) -> String {
++        let cap = self.cap_hz.max(1);
++        let budget = 1000.0 / f64::from(cap);
++        let mut out = String::new();
++        let frames = self.guest.map_or(0, |g| g.0);
++        match self.guest {
++            None => out.push_str("guest frames not counted"),
++            Some((count, gap)) => {
++                let fps = if self.seconds > 0.0 {
++                    count as f64 / self.seconds
++                } else {
++                    0.0
++                };
++                let _ = write!(out, "guest {fps:.1} fps of {cap}");
++                if count > 0 && fps > 0.0 {
++                    let each = 1000.0 / fps;
++                    let _ = write!(
++                        out,
++                        " ({each:.1} ms a frame, {:.1}x the {budget:.1} ms budget",
++                        each / budget
++                    );
++                    if let Some(gap) = gap {
++                        let _ = write!(out, ", longest gap {:.0} ms", ms(gap));
++                    }
++                    out.push(')');
++                }
++            }
++        }
++        let window = if self.seconds > 0.0 {
++            self.drawn.0 as f64 / self.seconds
++        } else {
++            0.0
++        };
++        let mode = match self.mode {
++            1 => " MAILBOX",
++            2 => " FIFO",
++            _ => "",
++        };
++        let _ = write!(out, "; window {window:.1} fps{mode}");
++        // Per guest frame where there is one, else per second.
++        let (per, unit) = if frames > 0 {
++            (frames as f64, "per guest frame")
++        } else {
++            (self.seconds.max(1e-9), "per second (no guest frame)")
++        };
++        let share = |nanos: u64| {
++            let each = ms(nanos) / per;
++            if frames > 0 {
++                format!("{each:.1} ms ({:.0}%)", each / budget * 100.0)
++            } else {
++                format!("{each:.1} ms")
++            }
++        };
++        let [idle, barrier, run, acquire, encode, present] = self.stages;
++        let _ = write!(
++            out,
++            "; {unit}: guest {}, barriers {}, host {} in {:.0} commands",
++            share(idle.1),
++            share(barrier.1),
++            share(run.1),
++            run.0 as f64 / per
++        );
++        if !self.opcodes.is_empty() {
++            let top: Vec<String> = (self.opcodes.iter())
++                .map(|&(id, count, nanos)| {
++                    let name = u16::try_from(id)
++                        .ok()
++                        .and_then(Opcode::from_id)
++                        .map_or_else(|| format!("op{id}"), |op| format!("{op:?}"));
++                    format!("{name} {:.1} ms x{:.1}", ms(nanos) / per, count as f64 / per)
++                })
++                .collect();
++            let _ = write!(out, " [{}]", top.join(", "));
++        }
++        let _ = write!(
++            out,
++            "; window acquire {} + encode {} + present {}",
++            share(acquire.1),
++            share(encode.1),
++            share(present.1)
++        );
++        if let Some(mean) = self.drawn.2.checked_div(self.drawn.1) {
++            let _ = write!(out, ", GPU {:.1} ms a draw", ms(mean));
++        }
++        match &self.counts {
++            None => out.push_str("; no device yet"),
++            Some(c) => {
++                let _ = write!(
++                    out,
++                    "; runtime: {:.1} command buffers, submit {}, pipelines {}, host steps {}, \
++                     held {}, slot waits {}, maps reads {:.1} = {}, shadow copies {:.1}, \
++                     translated {}",
++                    c.command_buffers as f64 / per,
++                    share(c.submit_nanos),
++                    share(c.pipeline_nanos.saturating_add(c.shader_cache_nanos)),
++                    share(c.host_step_nanos),
++                    share(c.hold_nanos),
++                    share(c.slot_wait_nanos),
++                    c.maps_reads as f64 / per,
++                    share(c.maps_read_nanos),
++                    c.shadow_copies as f64 / per,
++                    c.translated
++                );
++            }
++        }
++        out
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const MS: u64 = 1_000_000;
++
++    #[test]
++    fn a_line_gives_each_stage_its_share_of_the_caps_budget() {
++        let reading = Reading {
++            cap_hz: 120,
++            seconds: 30.0,
++            guest: Some((120, Some(800 * MS))),
++            drawn: (120, 120, 240 * MS),
++            mode: 1,
++            stages: [
++                (9_000, 120 * 200 * MS),
++                (600, 120 * 10 * MS),
++                (9_000, 120 * 50 * MS),
++                (120, 120 * MS / 10),
++                (120, 120 * MS / 2),
++                (120, 120 * MS / 5),
++            ],
++            opcodes: vec![(0, 240, 120 * 25 * MS), (400, 120, 120 * MS)],
++            counts: Some(Counts {
++                command_buffers: 1_200,
++                submit_nanos: 120 * 2 * MS,
++                maps_reads: 600,
++                maps_read_nanos: 600 * 12 * MS,
++                ..Counts::default()
++            }),
++        };
++        let line = reading.line();
++        assert!(
++            line.starts_with(
++                "guest 4.0 fps of 120 (250.0 ms a frame, 30.0x the 8.3 ms budget, longest gap \
++                 800 ms); window 4.0 fps MAILBOX; per guest frame: guest 200.0 ms (2400%), \
++                 barriers 10.0 ms (120%), host 50.0 ms (600%) in 75 commands [Debug 25.0 ms \
++                 x2.0, op400 1.0 ms x1.0]; window acquire 0.1 ms (1%) + encode 0.5 ms (6%) + \
++                 present 0.2 ms (2%), GPU 2.0 ms a draw; runtime: 10.0 command buffers, submit \
++                 2.0 ms (24%), "
++            ),
++            "{line}"
++        );
++        assert!(line.contains("maps reads 5.0 = 60.0 ms (720%)"), "{line}");
++    }
++
++    #[test]
++    fn with_no_guest_frame_the_figures_are_a_second() {
++        let reading = Reading {
++            cap_hz: 60,
++            seconds: 10.0,
++            guest: Some((0, None)),
++            stages: [(5, 20_000 * MS), (0, 0), (5, 50 * MS), (0, 0), (0, 0), (0, 0)],
++            ..Reading::default()
++        };
++        let line = reading.line();
++        assert!(
++            line.starts_with(
++                "guest 0.0 fps of 60; window 0.0 fps; per second (no guest frame): guest \
++                 2000.0 ms, barriers 0.0 ms, host 5.0 ms in 0 commands; window acquire"
++            ),
++            "{line}"
++        );
++        assert!(line.ends_with("; no device yet"), "{line}");
++        let off = Reading {
++            guest: None,
++            ..reading
++        };
++        assert!(off.line().starts_with("guest frames not counted; window"));
 +    }
 +}
 diff --git a/crates/reims-vgpu/src/platform.rs b/crates/reims-vgpu/src/platform.rs
@@ -2718,6 +3412,77 @@ index c8e3a4ace816b7e54455b153b48393dd52bb13ef..b1773b3868a4dce84936db6e70877640
              println!("{gpu}: a read-only destination: no such surface of the platform's own");
              continue;
          }
+diff --git a/crates/reims-vgpu/src/stats.rs b/crates/reims-vgpu/src/stats.rs
+index ca66b193a42596f67240f715eb18483411be9577..55a2edab38281505ecdef8b8ec9640a9b6d034f6 100644
+--- a/crates/reims-vgpu/src/stats.rs
++++ b/crates/reims-vgpu/src/stats.rs
+@@ -56,10 +56,57 @@ const NONE: u64 = u64::MAX;
+ /// Whether the environment turns the statistics on, read once per process. A value that is not
+ /// UTF-8 counts as unset.
+ fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var(STATS_VAR).is_ok_and(|v| switch(&v) || collects(&v)))
++}
++
++/// Whether the environment has the lines written to stderr every second: not with `collect`,
++/// which keeps the statistics for a host that reads them itself (`crate::perf`).
++fn printing() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+     *ON.get_or_init(|| std::env::var(STATS_VAR).is_ok_and(|v| switch(&v)))
+ }
+ 
++/// Whether a switch's value keeps the statistics without writing them.
++fn collects(value: &str) -> bool {
++    value.trim().eq_ignore_ascii_case("collect")
++}
++
++/// What a display's statistics hold since they were last taken ([`taken`]).
++#[derive(Debug, Clone, Copy, Default, PartialEq)]
++pub(crate) struct Taken {
++    /// Seconds since they were last taken.
++    pub(crate) seconds: f64,
++    /// The guest's presents.
++    pub(crate) guest: u64,
++    /// The longest time between two of them, in nanoseconds.
++    pub(crate) guest_gap: Option<u64>,
++    /// The window's draws.
++    pub(crate) drawn: u64,
++    /// The window's draws whose GPU time was reported, and those times' sum in nanoseconds.
++    pub(crate) gpu: (u64, u64),
++}
++
++/// The statistics of the live display of the lowest port, taken: its next period starts. `None`
++/// with the statistics off or no display.
++pub(crate) fn taken() -> Option<Taken> {
++    let live = registry().lock().live();
++    let stats = live.first()?;
++    let now = mono_now(&*stats.clock);
++    let since = stats.since.swap(now, Relaxed);
++    let (guest, guest_gap) = stats.guest.take(now);
++    let (drawn, _) = stats.drawn.take(now);
++    let gpu = (stats.gpu.count.swap(0, Relaxed), stats.gpu.total.swap(0, Relaxed));
++    stats.gpu.max.store(0, Relaxed);
++    Some(Taken {
++        seconds: Duration::from_nanos(now.saturating_sub(since)).as_secs_f64(),
++        guest,
++        guest_gap,
++        drawn,
++        gpu,
++    })
++}
++
+ /// Whether a switch's value turns it on.
+ fn switch(value: &str) -> bool {
+     let value = value.trim();
+@@ -297,7 +344,7 @@ fn key<P: Platform>(display: &Weak<CoreDisplay<P>>) -> usize {
+ pub(crate) fn register<P: Platform>(stats: &Arc<DisplayStats>, display: &Weak<CoreDisplay<P>>) {
+     let mut registry = registry().lock();
+     registry.add(key(display), stats);
+-    if !registry.reporting {
++    if !registry.reporting && printing() {
+         registry.reporting = start(Arc::clone(&stats.clock));
+     }
+ }
 diff --git a/crates/reims-vgpu/src/video/backend_choice.rs b/crates/reims-vgpu/src/video/backend_choice.rs
 index d7f1134db6b05371559e034a54f28be838686f31..3bb14613d096b6fc400c7decf5107fcff97f3f7f 100644
 --- a/crates/reims-vgpu/src/video/backend_choice.rs
@@ -3472,7 +4237,7 @@ index 0000000000000000000000000000000000000000..18b91a39bd52f672c33efea3d3ad9a71
 +    }
 +}
 diff --git a/crates/reims-vgpu/src/window/vulkan/swapchain.rs b/crates/reims-vgpu/src/window/vulkan/swapchain.rs
-index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..b682010c407f81526b666a74c8ec457cbac85d17 100644
+index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..144b2678da6bb2d16b0e83954651927eb7c90042 100644
 --- a/crates/reims-vgpu/src/window/vulkan/swapchain.rs
 +++ b/crates/reims-vgpu/src/window/vulkan/swapchain.rs
 @@ -29,6 +29,9 @@
@@ -3505,7 +4270,15 @@ index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..b682010c407f81526b666a74c8ec457c
          // SAFETY: the target makes the surface on the instance it is given, and hands it over.
          let made = entry::run(|_| unsafe {
              Swapchain::over(&self.queue, |get_instance_proc_addr, instance| {
-@@ -136,6 +145,7 @@ impl SwapchainSink {
+@@ -122,6 +131,7 @@ impl SwapchainSink {
+         });
+         match made {
+             Ok(swapchain) => {
++                crate::perf::presents_with(swapchain.is_mailbox());
+                 log::info!(
+                     target: "reims_vgpu::window",
+                     "the window of the display on port {} presents with {}, {}",
+@@ -136,6 +146,7 @@ impl SwapchainSink {
                  Some(Box::new(SwapchainPresenter {
                      display: Arc::clone(&self.display),
                      swapchain,
@@ -3513,7 +4286,7 @@ index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..b682010c407f81526b666a74c8ec457c
                  }))
              }
              Err(refused) => {
-@@ -155,6 +165,8 @@ struct SwapchainPresenter {
+@@ -155,6 +166,8 @@ struct SwapchainPresenter {
      display: Arc<SinkDisplay<VulkanPlatform>>,
      /// The swapchain.
      swapchain: Swapchain,
@@ -3522,10 +4295,26 @@ index 3e6b16d7f4a667360579b8bb91a703548ef53f2d..b682010c407f81526b666a74c8ec457c
  }
  
  impl Presenter for SwapchainPresenter {
-@@ -209,6 +221,7 @@ impl Presenter for SwapchainPresenter {
+@@ -178,7 +191,11 @@ impl Presenter for SwapchainPresenter {
+         decoration: Option<&Decoration>,
+     ) -> Drawn {
+         entry::run(|_| {
+-            let frame = match self.swapchain.acquire(drawable) {
++            use reims_vgpu_core::perf::{self, Stage};
++            let began = perf::now();
++            let acquired = self.swapchain.acquire(drawable);
++            let taken = perf::add(Stage::Acquire, began);
++            let frame = match acquired {
+                 Acquired::Image(frame) => frame,
+                 Acquired::Retry => return Drawn::Retry,
+                 Acquired::Failed => return Drawn::Ended,
+@@ -208,7 +225,10 @@ impl Presenter for SwapchainPresenter {
+             let Some(command_buffer) = image.ready else {
                  return Drawn::Nothing;
              };
++            let encoded = perf::add(Stage::WindowEncode, taken);
              self.swapchain.present(frame, command_buffer);
++            perf::add(Stage::Present, encoded);
 +            self.dumps.presented(&self.display);
              Drawn::Presented
          })

@@ -10,6 +10,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
+import android.view.Surface
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -49,16 +51,68 @@ class VmActivity : Activity() {
 
     private val poll = object : Runnable {
         override fun run() {
+            applySpeed()
             refresh()
             handler.postDelayed(this, 500)
         }
     }
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
-        override fun surfaceCreated(holder: SurfaceHolder) = Native.setSurface(holder.surface)
-        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) =
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            askFrameRate(holder.surface)
             Native.setSurface(holder.surface)
+        }
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            askFrameRate(holder.surface)
+            Native.setSurface(holder.surface)
+        }
         override fun surfaceDestroyed(holder: SurfaceHolder) = Native.setSurface(null)
+    }
+
+    /** The VM's performance setting and refresh rate as last applied to the window. */
+    private var appliedSpeed = ""
+
+    /**
+     * The VM's settings that are the window's to ask for, applied when they are first known and
+     * when they change: the refresh rate, and Android's sustained-performance mode, which holds
+     * the CPU's clocks down to what the phone can keep up for hours and so is on for Balanced
+     * alone.
+     */
+    private fun applySpeed() {
+        val state = App.state()
+        val performance = state.optString("performance")
+        val hz = state.optInt("refreshHz")
+        val speed = "$performance@$hz"
+        if (performance.isEmpty() || speed == appliedSpeed) return
+        appliedSpeed = speed
+        if (getSystemService(PowerManager::class.java).isSustainedPerformanceModeSupported) {
+            window.setSustainedPerformanceMode(performance == "balanced")
+        }
+        if (hz > 0) {
+            val mode = display?.supportedModes
+                ?.filter { it.physicalWidth == display?.mode?.physicalWidth && it.physicalHeight == display?.mode?.physicalHeight }
+                ?.filter { it.refreshRate >= hz - 1f }
+                ?.minByOrNull { it.refreshRate }
+            window.attributes = window.attributes.apply {
+                preferredRefreshRate = hz.toFloat()
+                if (mode != null) preferredDisplayModeId = mode.modeId
+            }
+            Log.i("vphone", "screen: asked for $hz Hz" +
+                (mode?.let { ", display mode ${it.modeId} at ${it.refreshRate} Hz" } ?: ", no display mode of this size reaches it") +
+                "; modes ${display?.supportedModes?.joinToString { "${it.physicalWidth}x${it.physicalHeight}@${it.refreshRate.toInt()}" }}")
+            if (::surface.isInitialized && surface.holder.surface?.isValid == true) askFrameRate(surface.holder.surface)
+        }
+    }
+
+    /** Asks the compositor to show the guest's screen at the VM's refresh rate. */
+    private fun askFrameRate(target: Surface) {
+        val hz = App.state().optInt("refreshHz")
+        if (hz <= 0 || !target.isValid) return
+        try {
+            target.setFrameRate(hz.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, Surface.CHANGE_FRAME_RATE_ALWAYS)
+        } catch (e: RuntimeException) {
+            Log.w("vphone", "screen: the surface refused $hz Hz: $e")
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -67,9 +121,7 @@ class VmActivity : Activity() {
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
-        if (getSystemService(PowerManager::class.java).isSustainedPerformanceModeSupported) {
-            window.setSustainedPerformanceMode(true)
-        }
+        applySpeed()
 
         surface = SurfaceView(this).apply {
             holder.setFormat(PixelFormat.RGBA_8888)

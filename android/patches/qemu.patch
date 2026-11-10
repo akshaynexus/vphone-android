@@ -1824,7 +1824,7 @@ index 26225f4f1e15b3f4fc5de63108a37e6294c88014..0310d994315a8557877700a02130cca3
   * memory_region_init_ram_from_fd:  Initialize RAM memory region with a
   *                                  mmap-ed backend.
 diff --git a/meson.build b/meson.build
-index 1380d7c4dc98fbccae3d116483eb9f6525226d41..4695406f254324e9116cc9e5806f77787ed75f7c 100644
+index 1380d7c4dc98fbccae3d116483eb9f6525226d41..5a237506b3c14b5248e04f6754265e37f61c8d4f 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -64,6 +64,8 @@ sh = find_program('sh')
@@ -1887,7 +1887,7 @@ index 1380d7c4dc98fbccae3d116483eb9f6525226d41..4695406f254324e9116cc9e5806f7778
 +                     '-Wl,-z,max-page-size=16384']
 +if pvg.found()
 +  foreach sym : ['rvg_android_set_vulkan_gipa', 'rvg_android_set_window',
-+                 'rvg_android_pointer']
++                 'rvg_android_pointer', 'rvg_android_perf_line']
 +    android_link_args += '-Wl,-u,' + sym
 +  endforeach
 +else
@@ -1970,10 +1970,10 @@ index c483fda69e5baedb2da63b67a268e7512b73af48..1f003b1bc820a089482ddbd59ca91651
  ##
 diff --git a/system/android-exports.map b/system/android-exports.map
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8c21f59eb4d7853c6661c1c53f0128b7f472495
+index 0000000000000000000000000000000000000000..c8d4b47b871b815302a9b3a335ef5a031a23bfaa
 --- /dev/null
 +++ b/system/android-exports.map
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +/*
 + * What libqemu-vphone.so shows to the app: QEMU's entry point and the entry
 + * points the app calls in reims-vgpu's static library.
@@ -1984,6 +1984,7 @@ index 0000000000000000000000000000000000000000..d8c21f59eb4d7853c6661c1c53f0128b
 +    rvg_android_set_vulkan_gipa;
 +    rvg_android_set_window;
 +    rvg_android_pointer;
++    rvg_android_perf_line;
 +  local:
 +    *;
 +};

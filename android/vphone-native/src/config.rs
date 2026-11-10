@@ -34,9 +34,40 @@ impl SwapchainLayout {
     }
 }
 
+/// How hard the phone is asked to run the vCPUs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Performance {
+    /// The clocks follow the load: a vCPU must be busier before they rise, and Android's
+    /// sustained-performance mode stays on, which holds them below what the phone cannot keep up.
+    Balanced,
+    /// The highest clocks whenever the guest is busy: more heat and battery. The default, as an
+    /// emulated CPU is the limit of everything iOS does here.
+    #[default]
+    Max,
+}
+
+/// The refresh rates a VM's screen can be given.
+pub const REFRESH_RATES: [u32; 2] = [60, 120];
+
+/// The settings' version this build writes. A file of an older one has the defaults that
+/// changed since applied over it ([`VmConfig::load`]).
+pub const VERSION: u32 = 2;
+
+fn unversioned() -> u32 {
+    0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct VmConfig {
+    /// [`VERSION`] of the build that saved the file; 0 for a file from before it had one.
+    #[serde(default = "unversioned")]
+    pub version: u32,
+    pub performance: Performance,
+    /// The refresh rate of the display mode iOS is offered, and the rate Android is asked to
+    /// show the window at: one of [`REFRESH_RATES`].
+    pub refresh_hz: u32,
     pub vcpus: u32,
     pub ram_mib: u32,
     pub tb_mib: u32,
@@ -53,6 +84,8 @@ pub struct VmConfig {
     /// Diagnostics for a wrong picture: the driver prints each image's layout
     /// (`TU_DEBUG=layout`), and the surface behind the frame on screen is saved every few
     /// seconds (`REIMS_VGPU_FRAME_DUMP`), for the log screen's Share.
+    /// Off by default since 0.5.9: in 0.5.7's log the driver wrote 7,767 layout lines in four
+    /// and a half minutes, each through the app's capture of stderr.
     pub gpu_diagnostics: bool,
     pub swapchain_layout: SwapchainLayout,
     /// Draw the screen on the CPU: the GPU device copies the guest's surface into the window's
@@ -80,13 +113,16 @@ impl VmConfig {
             _ => (4096, 1024),
         };
         VmConfig {
+            version: VERSION,
+            performance: Performance::Max,
+            refresh_hz: 120,
             vcpus: 6.min(cpus.max(1)),
             ram_mib,
             tb_mib,
             performance_hints: true,
             display: true,
             gpu_compression: false,
-            gpu_diagnostics: true,
+            gpu_diagnostics: false,
             swapchain_layout: SwapchainLayout::Auto,
             software_display: false,
         }
@@ -107,8 +143,21 @@ impl VmConfig {
     pub fn load(vm: &Path) -> VmConfig {
         std::fs::read(vm.join(FILE))
             .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
+            .and_then(|b| serde_json::from_slice::<VmConfig>(&b).ok())
+            .map(VmConfig::migrated)
             .unwrap_or_default()
+    }
+
+    /// A file of an older version with the defaults that changed since: the GPU diagnostics,
+    /// which every file saved by 0.5.7 and 0.5.8 has on because they were the default then, go
+    /// off. The settings 0.5.9 added are absent from such a file and take their defaults as it is
+    /// read.
+    pub fn migrated(mut self) -> VmConfig {
+        if self.version < 2 {
+            self.gpu_diagnostics = false;
+        }
+        self.version = VERSION;
+        self
     }
 
     pub fn save(&self, vm: &Path) -> Result<(), String> {
@@ -125,6 +174,9 @@ impl VmConfig {
             return Err(format!(
                 "RAM must be at least {MIN_RAM_MIB} MiB and below the phone's {total_mib} MiB"
             ));
+        }
+        if !REFRESH_RATES.contains(&self.refresh_hz) {
+            return Err("the refresh rate must be 60 or 120 Hz".into());
         }
         if !(MIN_TB_MIB..=MAX_TB_MIB).contains(&self.tb_mib) {
             return Err(format!(
@@ -158,18 +210,10 @@ mod tests {
 
     #[test]
     fn validation_and_ram_form() {
-        let c = VmConfig {
-            vcpus: 9,
-            ram_mib: 4096,
-            tb_mib: 1024,
-            performance_hints: true,
-            display: true,
-            gpu_compression: false,
-            gpu_diagnostics: true,
-            swapchain_layout: SwapchainLayout::Auto,
-            software_display: false,
-        };
+        let c = VmConfig { vcpus: 9, ram_mib: 4096, tb_mib: 1024, ..VmConfig::for_phone(11 * 1024, 8) };
         assert!(c.validate(8, 11000).is_err());
+        assert!(VmConfig { vcpus: 6, ..c }.validate(8, 11000).is_ok());
+        assert!(VmConfig { vcpus: 6, refresh_hz: 90, ..c }.validate(8, 11000).is_err());
         assert_eq!(VmConfig { vcpus: 6, ..c }.ram_arg(), "4G");
         assert_eq!(VmConfig { ram_mib: 5000, ..c }.ram_arg(), "5000M");
     }
@@ -185,10 +229,34 @@ mod tests {
         assert!(serde_json::to_string(&off).unwrap().contains(r#""display":false"#));
     }
 
-    /// Settings saved before the GPU switches run without compression and with the diagnostics.
+    /// Settings saved by 0.5.8 and before lose the diagnostics those versions had on by default,
+    /// and get the speed settings 0.5.9 added; a file 0.5.9 saved keeps what it says.
+    #[test]
+    fn an_older_file_gets_the_defaults_that_changed() {
+        let dir = std::env::temp_dir().join(format!("vphone-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE), r#"{"vcpus":4,"gpuDiagnostics":true,"performanceHints":true}"#).unwrap();
+        let old = VmConfig::load(&dir);
+        assert_eq!((old.vcpus, old.gpu_diagnostics, old.version), (4, false, VERSION));
+        assert_eq!((old.performance, old.refresh_hz), (Performance::Max, 120));
+        assert_eq!(old.tu_debug().as_deref(), Some("noubwc"));
+        std::fs::write(dir.join(FILE), r#"{"version":2,"gpuDiagnostics":true,"performance":"balanced","refreshHz":60}"#).unwrap();
+        let new = VmConfig::load(&dir);
+        assert!(new.gpu_diagnostics);
+        assert_eq!((new.performance, new.refresh_hz), (Performance::Balanced, 60));
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains(r#""performance":"balanced""#) && json.contains(r#""refreshHz":60"#) && json.contains(r#""version":2"#), "{json}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        // With no file: this build's defaults.
+        let fresh = VmConfig::for_phone(15 * 1024, 8);
+        assert!(!fresh.gpu_diagnostics && !fresh.gpu_compression);
+        assert_eq!((fresh.performance, fresh.refresh_hz, fresh.version), (Performance::Max, 120, VERSION));
+    }
+
+    /// The GPU switches name the driver's flags.
     #[test]
     fn gpu_switches_default_and_name_the_drivers_flags() {
-        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"display":true}"#).unwrap();
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"display":true,"gpuDiagnostics":true}"#).unwrap();
         assert!(!old.gpu_compression && old.gpu_diagnostics);
         assert_eq!(old.tu_debug().as_deref(), Some("noubwc,layout"));
         let set: VmConfig =

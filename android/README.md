@@ -130,10 +130,12 @@ GPU task on threads inside QEMU.
 
 | Setting | Default | What it sets |
 |---|---|---|
+| Performance | Max | How Android is asked to clock the vCPU threads (`adpf.rs`). Max: a vCPU busier than 20% of a core is reported late to the Performance Hint service, the threads run at nice -8, and sustained-performance mode is off. Balanced: late above 60%, nice -4, sustained-performance mode on. |
+| Refresh rate | 120 Hz | The one display mode iOS is offered (`gfx-modes=<res>@<hz>`), and the rate asked of the phone's screen for the VM's window (`Surface.setFrameRate`, the window's preferred display mode). |
 | GPU image compression (UBWC) | off | Off runs Turnip with `TU_DEBUG=noubwc`, for the driver's own images. |
 | Screen buffer layout | Auto | `TU_ANDROID_SWAPCHAIN_LAYOUT=auto\|linear\|ubwc`: how Turnip lays out the swapchain's images, which gralloc allocates and the compositor reads. Auto is what gralloc says of each buffer, and linear where it says nothing. Linear is linear whatever gralloc says. Compressed asks gralloc for UBWC buffers (vendor usage bit `0x10000000`) and lays the images out as gralloc then says, UBWC where it says nothing. |
 | Draw the screen on the CPU | off | `REIMS_VGPU_SOFTWARE_DISPLAY=1`: the GPU device makes no swapchain; for each frame it reads the guest's surface as a frame dump does and copies it into the window's buffer (`ANativeWindow_lock`, at the buffer's stride; `reims-vgpu`'s `window/vulkan/software.rs`). No driver is between the surface and the screen. It costs a conversion and a copy of the frame on the CPU per frame. |
-| GPU diagnostics | on | `TU_DEBUG=layout`: the driver prints each image's format, size, pitch, tile mode and UBWC sizes to `serial.log`. `REIMS_VGPU_FRAME_DUMP=<files>/runs/frames`: every 15 s at most, the GPU device saves the bytes of the guest surface behind the frame on screen, read by the CPU from the guest's pages with no GPU command between (`reims-vgpu`'s `window/vulkan/dump.rs`). The log screen's *Share* sends the last four as `guest-surface-N.png` with the log. No dumps are made while the screen is drawn on the CPU. |
+| GPU diagnostics | off | `TU_DEBUG=layout`: the driver prints each image's format, size, pitch, tile mode and UBWC sizes to `serial.log`. `REIMS_VGPU_FRAME_DUMP=<files>/runs/frames`: every 15 s at most, the GPU device saves the bytes of the guest surface behind the frame on screen, read by the CPU from the guest's pages with no GPU command between (`reims-vgpu`'s `window/vulkan/dump.rs`). The log screen's *Share* sends the last four as `guest-surface-N.png` with the log. No dumps are made while the screen is drawn on the CPU. |
 
 **The scrambled screen of 0.5.6 and 0.5.7** (Adreno 840, Android 17) was the swapchain's layout. The
 frame dumps of 0.5.7 showed the guest's surface right while the screen showed every 16 rows smeared
@@ -158,3 +160,17 @@ as the compositor reads it; the swapchain image's `layout` line says how Turnip 
 
 Android 17 adds a per-app memory limit based on the phone's RAM. A VM it ends is reported as such;
 lower the RAM or the code cache.
+
+## Reading a boot log for speed
+
+Every 30 s `serial.log` has two lines:
+
+- `[vphone] status ...`: memory, the busiest threads, and `vCPU clocks N% of max, M% of the time at max`,
+  sampled five times a second from the CPUs the vCPU threads last ran on.
+- `[vphone] gpu ...`: the guest's presents a second against the refresh rate, and per guest frame, in
+  milliseconds and as a share of the refresh rate's frame budget (8.3 ms at 120 Hz): the GPU device's FIFO
+  threads waiting for the guest (`guest`), waiting for earlier work (`barriers`) and running the guest's
+  commands (`host`, with the three opcodes that took most), the window's acquire, encode and present, and the
+  Metal runtime's `vkQueueSubmit`, pipeline makings, host steps and readings of `/proc/self/maps`
+  (`reims-vgpu`'s `perf.rs`). The FIFO figures are sums over every FIFO thread. A `host` far below the frame
+  time means the frame waits on the emulated CPU, not on the GPU path.

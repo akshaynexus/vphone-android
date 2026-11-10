@@ -93,12 +93,7 @@ mod tests {
             vcpus: 6,
             ram_mib: 4096,
             tb_mib: 1024,
-            performance_hints: true,
-            display: true,
-            gpu_compression: false,
-            gpu_diagnostics: true,
-            swapchain_layout: crate::config::SwapchainLayout::Auto,
-            software_display: false,
+            ..VmConfig::for_phone(11 * 1024, 8)
         };
         let mut r = Report::default();
         check_memory(
