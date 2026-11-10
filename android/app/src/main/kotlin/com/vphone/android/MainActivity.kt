@@ -43,6 +43,12 @@ class MainActivity : Activity() {
     private var importWasActive = false
     private var lastRunLog = ""
     private var storageGeneration = 0L
+    private lateinit var updateRow: LinearLayout
+    private lateinit var updateText: TextView
+    private lateinit var updateBar: ProgressBar
+    private lateinit var updatePrimary: Button
+    private lateinit var updateSecondary: Button
+    private var shownUpdate: Updater.State? = null
 
     private val poll = object : Runnable {
         override fun run() {
@@ -100,18 +106,34 @@ class MainActivity : Activity() {
             })
         }
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        updateText = TextView(this)
+        updateBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+        updatePrimary = Button(this).apply { isAllCaps = false }
+        updateSecondary = Button(this).apply { isAllCaps = false }
+        updateRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(0, 16, 0, 16)
+            addView(updateText)
+            addView(updateBar)
+            addView(LinearLayout(this@MainActivity).apply {
+                addView(updatePrimary)
+                addView(updateSecondary)
+            })
+        }
         val info = JSONObject(Native.deviceInfo())
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(32, 32, 32, 32)
             addView(TextView(this@MainActivity).apply {
-                text = "vphone"
+                text = "vphone ${BuildConfig.VERSION_NAME}"
                 textSize = 28f
             })
             addView(TextView(this@MainActivity).apply {
                 text = "${info.getInt("cpus")} CPU cores, ${info.getLong("totalMib") / 1024} GiB RAM, ${info.getLong("availableMib") / 1024} GiB free"
             })
             addView(banner)
+            addView(updateRow)
             addView(active)
             addView(activeLog)
             addView(resumeCreate)
@@ -121,6 +143,11 @@ class MainActivity : Activity() {
                 text = "Storage"
                 isAllCaps = false
                 setOnClickListener { startActivity(Intent(this@MainActivity, StorageActivity::class.java)) }
+            })
+            addView(Button(this@MainActivity).apply {
+                text = "Check for updates"
+                isAllCaps = false
+                setOnClickListener { Updater.check(this@MainActivity, manual = true) }
             })
             addView(importRow)
             addView(list)
@@ -161,6 +188,7 @@ class MainActivity : Activity() {
         super.onStart()
         noteDeadProcess()
         showVms()
+        Updater.checkIfDue(this)
         handler.post(poll)
     }
 
@@ -202,6 +230,7 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
+        showUpdate()
         val cleaned = StorageNative.generation()
         if (cleaned != storageGeneration) {
             storageGeneration = cleaned
@@ -243,6 +272,113 @@ class MainActivity : Activity() {
             lastRunLog = run.optString("logPath")
             banner.text = "${run.optString("vm")}: ${run.optString("message")}" + if (lastRunLog.isNotEmpty()) "\nTap for the log." else ""
         }
+    }
+
+    /** The update row: what was found, the download's progress, and the next step. */
+    private fun showUpdate() {
+        Updater.pendingConfirm?.let {
+            Updater.pendingConfirm = null
+            startActivity(it)
+        }
+        val s = Updater.state
+        if (s === shownUpdate && s !is Updater.State.Downloading) return
+        val first = shownUpdate
+        shownUpdate = s
+        fun buttons(primary: String?, onPrimary: () -> Unit, secondary: String? = null, onSecondary: () -> Unit = {}) {
+            updatePrimary.visibility = if (primary == null) View.GONE else View.VISIBLE
+            updatePrimary.text = primary
+            updatePrimary.setOnClickListener { onPrimary() }
+            updateSecondary.visibility = if (secondary == null) View.GONE else View.VISIBLE
+            updateSecondary.text = secondary
+            updateSecondary.setOnClickListener { onSecondary() }
+        }
+        updateRow.visibility = View.VISIBLE
+        updateBar.visibility = View.GONE
+        when (s) {
+            is Updater.State.Idle -> updateRow.visibility = View.GONE
+            is Updater.State.Checking -> {
+                updateText.text = "Checking for updates"
+                buttons(null, {})
+            }
+            is Updater.State.UpToDate -> {
+                updateRow.visibility = View.GONE
+                if (s.manual && first !is Updater.State.UpToDate) {
+                    Toast.makeText(this, "vphone ${BuildConfig.VERSION_NAME} is the newest release", Toast.LENGTH_SHORT).show()
+                }
+            }
+            is Updater.State.Available -> {
+                updateText.text = "vphone ${s.release.version} is available (${s.release.size / MIB} MB)"
+                buttons("Download and install", { Updater.download(this, s.release) }, "What's new", { notes(s.release) })
+            }
+            is Updater.State.Downloading -> {
+                updateBar.visibility = View.VISIBLE
+                updateBar.progress = if (s.total > 0) (1000 * s.done / s.total).toInt() else 0
+                val left = if (s.bytesPerSec > 0 && s.total > s.done) ", ${(s.total - s.done) / s.bytesPerSec} s left" else ""
+                updateText.text = "Downloading ${s.release.version}: ${s.done / MIB} of ${s.total / MIB} MB, " +
+                    "${s.bytesPerSec / MIB} MB/s$left"
+                if (first !is Updater.State.Downloading) buttons("Cancel", { Updater.cancel() })
+            }
+            is Updater.State.Ready -> {
+                updateText.text = "vphone ${s.release.version} is downloaded"
+                buttons("Install", { askInstall(s.release, s.apk) }, "What's new", { notes(s.release) })
+            }
+            is Updater.State.Installing -> {
+                updateText.text = "Installing ${s.release.version}: the app restarts when it is done"
+                buttons(null, {})
+            }
+            is Updater.State.Failed -> {
+                updateText.text = s.message
+                updateText.setTextIsSelectable(true)
+                val r = s.release
+                if (r != null) {
+                    buttons("Download", { Updater.download(this, r) }, "Copy error", { App.copy(this, s.message) })
+                } else {
+                    buttons("Try again", { Updater.check(this, manual = true) }, "Copy error", { App.copy(this, s.message) })
+                }
+            }
+        }
+    }
+
+    private fun notes(release: Updater.Release) {
+        AlertDialog.Builder(this)
+            .setTitle("vphone ${release.version}")
+            .setMessage(release.notes.ifEmpty { "No notes." })
+            .setPositiveButton("Close", null)
+            .setNeutralButton("Open on GitHub") { _, _ -> startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.page))) }
+            .show()
+    }
+
+    /** Installing replaces the app, which ends whatever its processes are running. */
+    private fun askInstall(release: Updater.Release, apk: java.io.File) {
+        if (!Updater.canInstall(this)) {
+            AlertDialog.Builder(this)
+                .setTitle("Allow vphone to install updates")
+                .setMessage("Android asks once: turn on \"Allow from this source\" for vphone, come back, and tap Install again.")
+                .setPositiveButton("Open the setting") { _, _ ->
+                    startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+            return
+        }
+        val phase = App.state().getString("phase")
+        val vmUp = phase in setOf("preparing", "booting", "unlocking", "running", "stopping")
+        val creating = Native.createPending()
+        val warning = when {
+            vmUp -> "${App.state().optString("vm")} is running. Installing ends it at once, without iOS's shutdown."
+            creating.isNotEmpty() -> "$creating is being created. Installing stops the step it is on; it continues from there when you open the app again."
+            else -> ""
+        }
+        if (warning.isEmpty()) {
+            Updater.install(this, release, apk)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Install vphone ${release.version}?")
+            .setMessage(warning)
+            .setPositiveButton("Install") { _, _ -> Updater.install(this, release, apk) }
+            .setNegativeButton("Later", null)
+            .show()
     }
 
     private fun showVms() {
