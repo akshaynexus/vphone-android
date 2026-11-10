@@ -21,7 +21,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::FromRawFd;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -345,6 +345,13 @@ pub(crate) fn load_vulkan(paths: &Paths) -> Result<*mut c_void, String> {
 
 // ------------------------------------------------------------------- QEMU's output
 
+/// The bytes QEMU's standard output has carried: the guest's serial line (`-serial mon:stdio`)
+/// and the little QEMU prints there itself.
+static SERIAL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The settings this start runs with, in words (`crate::load::tuning`), once the guest's agent
+/// has said which preferences it found.
+static TUNING: Mutex<Option<String>> = Mutex::new(None);
+
 fn capture(fd: c_int, tag: &'static str) -> Result<(), String> {
     let mut pipe = [0; 2];
     // SAFETY: pipe has room for two descriptors; dup2 and close act on ones just made.
@@ -368,6 +375,9 @@ fn capture(fd: c_int, tag: &'static str) -> Result<(), String> {
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
+                }
+                if fd == 1 {
+                    SERIAL_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 write_log(&buf[..n]);
                 partial.extend_from_slice(&buf[..n]);
@@ -481,6 +491,10 @@ fn start(name: &str) -> Result<(), String> {
         "network: off in this VM's settings; iOS has its network card with nothing on the other end".to_string()
     });
 
+    // The kernel's arguments in NVRAM, while nothing has the file open.
+    log_line(&crate::bootargs::apply(&dir.join("nvram.bin"), cfg.verbose_kernel_log));
+    *TUNING.lock().unwrap() = None;
+
     let Launch { args, env } = launcher::build(&bundle, &cfg, paths);
     log_line(&format!("starting QEMU: {}", args.join(" ")));
     // Dumps of an earlier boot would pass for this one's.
@@ -554,9 +568,10 @@ fn start(name: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot start QEMU's thread: {e}"))?;
 
     let (vcpus, refresh_hz) = (cfg.vcpus, cfg.refresh_hz);
+    let status_dir = dir.clone();
     std::thread::Builder::new()
         .name("vm-status".into())
-        .spawn(move || status_lines(vcpus, refresh_hz))
+        .spawn(move || status_lines(vcpus, refresh_hz, &status_dir))
         .map_err(|e| e.to_string())?;
     if cfg.performance_hints {
         #[cfg(target_os = "android")]
@@ -565,6 +580,8 @@ fn start(name: &str) -> Result<(), String> {
     let services = cfg.services;
     let network = cfg.network;
     let sound = cfg.sound;
+    let prefs = [cfg.lighter_visuals, cfg.longer_launch_limits];
+    let verbose_kernel = cfg.verbose_kernel_log;
     let vm_dir = dir.clone();
     std::thread::Builder::new()
         .name("vphoned-watch".into())
@@ -579,6 +596,22 @@ fn start(name: &str) -> Result<(), String> {
                     let rpc = |method: &str, params: serde_json::Value| client.rpc(method, params, Duration::from_secs(60));
                     log_line(&crate::audio::check(&rpc));
                 }
+                // What this start runs with is what the starts before it left: the services
+                // record as it is before this start's changes, and the preferences found.
+                let services_now = crate::services::Applied::load(&vm_dir).words();
+                let rpc = |method: &str, params: serde_json::Value| client.rpc(method, params, Duration::from_secs(60));
+                let (found, line) = vphone_create_steps::prefs::apply_to_vm(&rpc, &vm_dir, prefs);
+                log_line(&line);
+                if line.contains("next starts") {
+                    notice("iOS preferences changed for this VM's settings; they take effect when iOS next starts".to_string());
+                }
+                use vphone_create_steps::prefs::Group;
+                *TUNING.lock().unwrap() = Some(crate::load::tuning(
+                    &services_now,
+                    found.in_force(Group::Visuals),
+                    found.in_force(Group::Watchdogs),
+                    verbose_kernel,
+                ));
                 // After the unlock, which the user waits for; the guest's agent is up.
                 crate::services::apply(&client, &vm_dir, services, &|line| {
                     log_line(line);
@@ -732,7 +765,7 @@ fn code_line(at: u64, pc: u64, cpu: u32, words: &[u32]) -> String {
 
 /// The stack sampler's cost is two signals and one reading of the process's mappings a sample,
 /// on this thread: the first four status lines carry one, then every fourth (two minutes).
-fn status_lines(vcpus: u32, refresh_hz: u32) {
+fn status_lines(vcpus: u32, refresh_hz: u32, vm_dir: &Path) {
     let paths = Paths::get();
     let mut sampler = crate::create::vm::diag::Sampler::new(paths.files.clone()).with_stacks();
     let mut tick = 0u32;
@@ -747,6 +780,11 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
     let mut guest_latency: Option<f64> = None;
     let mut guest_sound = String::new();
     let mut guest_sound_read: Option<Instant> = None;
+    // The serial line's bytes at the last line, and when that was.
+    let mut serial_last = (SERIAL_BYTES.load(Ordering::Relaxed), Instant::now());
+    // The guest's average load under this start's settings, from a while after the unlock.
+    let mut meter: Option<crate::load::Meter> = None;
+    let mut running_since: Option<Instant> = None;
     while sleep_until_done(STATUS_EVERY) {
         let s = state();
         let elapsed = crate::create::state::now_ms().saturating_sub(s.started_ms) / 1000;
@@ -765,8 +803,11 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
         };
         let window = if *WINDOW.lock().unwrap() != 0 { "on screen" } else { "no window" };
         let clocks = crate::adpf::take_clock_summary().map_or(String::new(), |c| format!("; {c}"));
+        let serial_now = (SERIAL_BYTES.load(Ordering::Relaxed), Instant::now());
+        let serial = crate::bootargs::serial_words(serial_now.0 - serial_last.0, serial_now.1.duration_since(serial_last.1).as_secs_f64());
+        serial_last = serial_now;
         log_line(&format!(
-            "status {}:{:02} {}, {window}: {}{clocks}; {guest}",
+            "status {}:{:02} {}, {window}: {}{clocks}; {serial}; {guest}",
             elapsed / 60,
             elapsed % 60,
             format!("{:?}", s.phase).to_lowercase(),
@@ -814,9 +855,26 @@ fn status_lines(vcpus: u32, refresh_hz: u32) {
                 .and_then(vphone_create_steps::firstboot::cpu_times);
             match times {
                 Some(times) => {
+                    if s.phase == Phase::Running {
+                        running_since.get_or_insert(now);
+                    }
+                    if meter.is_none() {
+                        if let Some(tuning) = TUNING.lock().unwrap().clone() {
+                            let new = crate::load::Meter::start(vm_dir, tuning);
+                            log_line(&new.opening());
+                            meter = Some(new);
+                        }
+                    }
                     if let Some((then, before)) = &last_top {
-                        let top = vphone_create_steps::firstboot::top_line(before, &times, now.duration_since(*then).as_secs_f64());
-                        log_line(&format!("guest top {at} {top}"));
+                        let (busy, top) = vphone_create_steps::firstboot::top(before, &times, now.duration_since(*then).as_secs_f64());
+                        let mut mean = String::new();
+                        if let Some(meter) = meter.as_mut() {
+                            if running_since.is_some_and(|since| now.duration_since(since) >= crate::load::SETTLE) {
+                                meter.add(vm_dir, busy);
+                            }
+                            mean = meter.words();
+                        }
+                        log_line(&format!("guest top {at} {top}{mean}"));
                     }
                     last_top = Some((now, times));
                 }

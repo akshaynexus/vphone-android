@@ -94,6 +94,20 @@ fn common_region(data: &[u8], base: usize, length: usize) -> Option<(usize, usiz
     None
 }
 
+/// The value of `name` in the newest bank (the highest generation) that has it.
+pub fn get(data: &[u8], name: &str) -> Option<String> {
+    let mut banks = find_banks(data);
+    banks.sort_by_key(|(base, _)| std::cmp::Reverse(u32::from_le_bytes(data[base + 20..base + 24].try_into().unwrap())));
+    banks.into_iter().find_map(|(base, length)| {
+        let (start, end) = common_region(data, base, length)?;
+        data[start..end]
+            .split(|b| *b == 0)
+            .take_while(|entry| !entry.is_empty())
+            .find_map(|entry| entry.strip_prefix(name.as_bytes())?.strip_prefix(b"="))
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+    })
+}
+
 /// The argument set of `nvram-autoboot.py`.
 #[derive(Clone, Debug)]
 pub struct NvramEdit {
@@ -203,4 +217,51 @@ pub fn set_file(path: &Path, edit: &NvramEdit) -> Result<bool> {
         fs::write(path, &data).map_err(|e| Error::path(path, e))?;
     }
     Ok(changed)
+}
+
+/// An NVRAM image of one valid bank holding `env`, for tests of what edits one.
+#[doc(hidden)]
+pub fn image_for_tests(env: &[&str]) -> Vec<u8> {
+    const BASE: usize = 0x4000;
+    const LENGTH: usize = 0x80000;
+    let mut data = vec![0u8; BASE + 2 * LENGTH];
+    let bank = &mut data[BASE..BASE + LENGTH];
+    bank[0] = SIGNATURE;
+    bank[2..4].copy_from_slice(&((LENGTH / 16) as u16).to_be_bytes());
+    bank[4..9].copy_from_slice(b"nvram");
+    bank[1] = chrp_checksum(&bank[..HEADER]);
+    bank[0x20] = 0x70;
+    bank[0x22..0x24].copy_from_slice(&(((LENGTH - 0x20) / 16) as u16).to_be_bytes());
+    bank[0x24..0x2a].copy_from_slice(b"common");
+    let mut at = 0x30;
+    for entry in env {
+        bank[at..at + entry.len()].copy_from_slice(entry.as_bytes());
+        at += entry.len() + 1;
+    }
+    bank[20..24].copy_from_slice(&1u32.to_le_bytes());
+    let sum = adler32(&bank[0x14..]);
+    bank[16..20].copy_from_slice(&sum.to_le_bytes());
+    data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_variable_is_read_from_the_newest_bank_and_survives_an_edit() {
+        let mut data = image_for_tests(&["auto-boot=true", "boot-args=serial=0x13 debug=0x20146", "platform-uuid=x"]);
+        assert_eq!(get(&data, "boot-args").as_deref(), Some("serial=0x13 debug=0x20146"));
+        assert_eq!(get(&data, "auto-boot").as_deref(), Some("true"));
+        assert_eq!(get(&data, "boot"), None);
+        // Dropping boot-args keeps the rest; setting it puts it back.
+        assert!(apply(&mut data, &NvramEdit::auto_boot(true)).unwrap());
+        assert_eq!(get(&data, "boot-args"), None);
+        assert_eq!(get(&data, "platform-uuid").as_deref(), Some("x"));
+        let edit = NvramEdit { boot_args: Some("a=1 b".into()), ..NvramEdit::auto_boot(true) };
+        assert!(apply(&mut data, &edit).unwrap());
+        assert!(!apply(&mut data, &edit).unwrap());
+        assert_eq!(get(&data, "boot-args").as_deref(), Some("a=1 b"));
+        assert_eq!(get(&[0u8; 0x9000], "boot-args"), None);
+    }
 }

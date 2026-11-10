@@ -718,8 +718,8 @@ class MainActivity : Activity() {
                 android.R.layout.simple_spinner_dropdown_item,
                 listOf(
                     "As they are",
-                    "Trimmed (about 138 off: Siri, iCloud sync, analytics, Journal...)",
-                    "Fewest (experimental: also no widgets, no AirDrop)",
+                    "Trimmed (about 141 off: Siri, iCloud sync, analytics, Journal, CoreDuet...)",
+                    "Fewest (experimental: also no widgets, AirDrop, push notifications, FairPlay)",
                 ),
             )
             setSelection(servicesValues.indexOf(config.optString("services", "unchanged")).coerceAtLeast(0))
@@ -731,6 +731,20 @@ class MainActivity : Activity() {
         val sound = CheckBox(this).apply {
             text = "Sound (iOS plays through this phone's speaker or headphones; no microphone)"
             isChecked = config.optBoolean("sound", true)
+        }
+        val lighterVisuals = CheckBox(this).apply {
+            text = "Lighter iOS visuals (Reduce Motion, Reduce Transparency, no compressed or deep " +
+                "framebuffer; from iOS's next start after it is applied)"
+            isChecked = config.optBoolean("lighterVisuals", true)
+        }
+        val launchLimits = CheckBox(this).apply {
+            text = "Longer app launch limits (iOS waits four times as long before it kills a slow launch)"
+            isChecked = config.optBoolean("longerLaunchLimits", true)
+        }
+        val verboseKernel = CheckBox(this).apply {
+            text = "Verbose kernel log (iOS's kernel prints driver and debug lines on the serial " +
+                "line, which costs emulated CPU; a panic's text is printed either way)"
+            isChecked = config.optBoolean("verboseKernelLog", false)
         }
         val display = CheckBox(this).apply {
             text = "Show the screen (off: iOS runs with nothing drawn)"
@@ -778,6 +792,9 @@ class MainActivity : Activity() {
                 "applied at the VM's next start and takes effect at the start after that",
             services,
         )
+        form.addView(lighterVisuals)
+        form.addView(launchLimits)
+        form.addView(verboseKernel)
         labelled(form, "Refresh rate (iOS's display mode, and the rate asked of this phone's screen)", refresh)
         form.addView(display)
         form.addView(compression)
@@ -803,6 +820,9 @@ class MainActivity : Activity() {
                     .put("services", servicesValues[services.selectedItemPosition.coerceIn(0, 2)])
                     .put("network", network.isChecked)
                     .put("sound", sound.isChecked)
+                    .put("lighterVisuals", lighterVisuals.isChecked)
+                    .put("longerLaunchLimits", launchLimits.isChecked)
+                    .put("verboseKernelLog", verboseKernel.isChecked)
                     .put("display", display.isChecked)
                     .put("gpuCompression", compression.isChecked)
                     .put("gpuDiagnostics", diagnostics.isChecked)

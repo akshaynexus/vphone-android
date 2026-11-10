@@ -834,8 +834,8 @@ fn wait_vphoned(host: &dyn Host) -> Result<()> {
     }
 }
 
-/// `do_first_boot`: first boot, data migration, Setup Assistant, unlock,
-/// Auto-Lock Never, and the display scale's guest half with its restart and 1x logo.
+/// `do_first_boot`: first boot, data migration, Setup Assistant, unlock, the lighter
+/// preferences, Auto-Lock Never, and the display scale's guest half with its restart and 1x logo.
 pub fn first_boot(params: &FirstBoot) -> Result<()> {
     let monitor = firstboot::Monitor::new(params.host);
     std::thread::scope(|scope| {
@@ -876,6 +876,10 @@ fn first_boot_flow(params: &FirstBoot, monitor: &firstboot::Monitor) -> Result<(
         host.log("the screen did not unlock");
     }
     firstboot::phase(host, "finish");
+    // The preferences that spare the emulated CPUs (`prefs`), as a new VM's settings have them.
+    // Never fails the boot: what was not set is said, and set after the first unlock in the app.
+    let rpc = |method: &str, p: serde_json::Value| host.vphoned_rpc(method, p, Duration::from_secs(60));
+    host.log(&crate::prefs::apply_to_vm(&rpc, params.vm, [true, true]).1);
     guest::auto_lock_never(host)?;
     if params.scale == 3 {
         return Ok(());

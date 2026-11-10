@@ -165,6 +165,10 @@ done
 - vphoned also has a built-in profile, `services.profile.apply {"profile":"trimmed"}` (see vphone-cli's
   `Research/vphoned_http_api.md`). Untested with vphone-linux.
 
+The Android app has these as a setting of each VM, with a longer list and a check of each label against
+the guest's launchd: see [android/README.md](../android/README.md) (*iOS background services*, *Lighter
+iOS visuals*, *Longer app launch limits*, *Verbose kernel log*).
+
 **In Settings:**
 
 - Accessibility > Motion > **Reduce Motion** on.

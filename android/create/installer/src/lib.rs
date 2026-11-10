@@ -23,6 +23,7 @@ pub mod manifest;
 pub mod net;
 pub mod nvram;
 pub mod plist_py;
+pub mod prefs;
 pub mod progress;
 pub mod ramdisk;
 pub mod resources;
