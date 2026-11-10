@@ -473,7 +473,7 @@ fn start(name: &str) -> Result<(), String> {
 
     if cfg.performance_hints {
         #[cfg(target_os = "android")]
-        crate::adpf::start(cfg.vcpus, || QEMU_DONE.load(Ordering::SeqCst));
+        crate::adpf::start(cfg.vcpus, || QEMU_DONE.load(Ordering::SeqCst), log_line);
     }
     std::thread::Builder::new()
         .name("vphoned-watch".into())

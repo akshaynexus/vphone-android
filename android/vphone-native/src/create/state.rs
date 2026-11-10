@@ -97,7 +97,10 @@ pub struct StepStatus {
     /// "pending", "running", "done", "failed"
     pub state: String,
     pub elapsed_secs: u64,
+    /// How long this step last took on this phone, in running time; meaningful with `measured`.
     pub est_secs: u64,
+    /// Whether this step has ever finished on this phone.
+    pub measured: bool,
     pub log: String,
 }
 
@@ -124,6 +127,10 @@ pub struct Status {
     pub error: String,
     pub log: String,
     pub updated_ms: u64,
+    /// When the running step's current attempt began; 0 when none has.
+    pub step_started_ms: u64,
+    /// Why there is no `eta_secs`, in words for the screen; empty when there is one.
+    pub eta_note: String,
     /// Whether the person paused it. Read from the pause file when the status is asked for.
     pub paused: bool,
 }

@@ -6,6 +6,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use vphone_create_steps::active::ActiveInstant;
 
 const PORT: u32 = 1339;
 
@@ -18,6 +19,28 @@ fn bad(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
+/// How long one read waits before the time left is looked at again.
+const READ_SLICE: Duration = Duration::from_secs(2);
+
+/// Reads that give up when the exchange's time is over, not when one slice of it is.
+struct Patient {
+    stream: UnixStream,
+    deadline: ActiveInstant,
+}
+
+impl Read for Patient {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.stream.read(buf) {
+                Err(e)
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+                        && !self.deadline.passed() => {}
+                other => return other,
+            }
+        }
+    }
+}
+
 impl Client {
     pub fn new(socket: &Path) -> Client {
         Client {
@@ -25,6 +48,9 @@ impl Client {
         }
     }
 
+    /// `timeout` is counted on the active clock: a creation that is paused while the guest
+    /// works on an answer has used none of it when it resumes.
+    ///
     /// One HTTP exchange; the response's status and body. The write side stays open until the
     /// answer arrives: vphoned drops a half-closed connection before it answers an RPC.
     fn exchange(
@@ -35,10 +61,11 @@ impl Client {
         timeout: Duration,
     ) -> io::Result<(u32, Vec<u8>)> {
         let stream = UnixStream::connect(&self.socket)?;
-        stream.set_read_timeout(Some(timeout))?;
+        // The socket's own limit is a short slice; `Patient` decides when the answer is late.
+        stream.set_read_timeout(Some(timeout.min(READ_SLICE)))?;
         stream.set_write_timeout(Some(timeout))?;
         let mut writer = stream.try_clone()?;
-        let mut reader = BufReader::new(stream);
+        let mut reader = BufReader::new(Patient { stream, deadline: ActiveInstant::now() + timeout });
 
         writer.write_all(format!("CONNECT {PORT}\n").as_bytes())?;
         let mut ok = String::new();

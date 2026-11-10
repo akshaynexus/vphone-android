@@ -53,6 +53,8 @@ pub struct RunSpec {
     pub display_failed: String,
     /// The images whose guest flushes QEMU ignores in this boot: synced once it has ended.
     pub sync_on_exit: Vec<String>,
+    /// How many vCPU threads to ask the system's performance hints for; 0 asks for none.
+    pub hint_vcpus: u32,
 }
 
 fn spec_path(paths: &Paths) -> PathBuf {
@@ -75,7 +77,8 @@ pub fn create_config() -> VmConfig {
         .ram_mib
         .max(MIN_CREATE_RAM_MIB)
         .min((mem.total_mib.saturating_sub(3072) as u32).max(MIN_CREATE_RAM_MIB));
-    cfg.performance_hints = false;
+    // Asked for in the VM's own process; whether the system grants them is logged there.
+    cfg.performance_hints = true;
     cfg
 }
 
@@ -162,7 +165,9 @@ pub fn dfu_spec(
     if display {
         env.extend(launcher::gfx_env(paths).into_iter().map(|(k, v)| (k.to_string(), v)));
     }
-    finish_spec(args, env, run, paths, display)
+    let mut spec = finish_spec(args, env, run, paths, display);
+    spec.hint_vcpus = if cfg.performance_hints { cfg.vcpus } else { 0 };
+    spec
 }
 
 /// The first boot: the normal launcher's arguments. The GPU stays attached either way; without
@@ -183,7 +188,9 @@ pub fn first_boot_spec(
             (k.to_string(), v)
         })
         .collect();
-    finish_spec(launch.args, env, run, paths, true)
+    let mut spec = finish_spec(launch.args, env, run, paths, true);
+    spec.hint_vcpus = if cfg.performance_hints { cfg.vcpus } else { 0 };
+    spec
 }
 
 /// The file a `-drive` value opens, undoing [`opt`]'s comma doubling.
@@ -262,6 +269,7 @@ fn finish_spec(
             .map(|p| p.to_string_lossy().into_owned()),
         display_failed: at("display-failed"),
         sync_on_exit: Vec::new(),
+        hint_vcpus: 0,
     }
 }
 
@@ -307,6 +315,19 @@ pub fn run_spec_file(file: &Path) -> Result<(), String> {
     // Written last: past here, this process dying is the VM's.
     fs::write(&spec.pid_file, std::process::id().to_string()).map_err(|e| e.to_string())?;
     log(TAG, &format!("starting QEMU: {}", spec.args.join(" ")));
+    if spec.hint_vcpus > 0 {
+        // One line, in the log the step's own follows as [vm]: whether the hints took effect.
+        let threads_log = spec.threads_log.clone();
+        crate::adpf::start(spec.hint_vcpus, || false, move |line| {
+            log(TAG, line);
+            if let Ok(mut out) = fs::OpenOptions::new().append(true).open(&threads_log) {
+                use std::io::Write;
+                let _ = writeln!(out, "{line}");
+            }
+        });
+    } else {
+        log(TAG, "performance hints: not asked for in this boot");
+    }
     let qemu_thread = std::thread::Builder::new()
         .name("qemu-main".into())
         .stack_size(QEMU_STACK)

@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use vphone_create_steps::display::WidthPolicy;
 use vphone_create_steps::error::Error as InstallError;
 use vphone_create_steps::host::Host;
@@ -19,9 +19,6 @@ const GIB: u64 = 1 << 30;
 pub struct StepDef {
     pub key: &'static str,
     pub title: &'static str,
-    /// A rough time on a phone, not measured: emulated steps are scaled from the desktop's
-    /// timings by how much slower TCG runs, and corrected as completed steps come in.
-    pub est_secs: u64,
     /// Whether the time is spent running the emulated guest.
     pub emulated: bool,
     pub floor: u64,
@@ -29,16 +26,16 @@ pub struct StepDef {
 }
 
 pub static STEPS: &[StepDef] = &[
-    StepDef { key: "sanity", title: "Check the phone", est_secs: 30, emulated: false, floor: 2 * GIB, run: sanity },
-    StepDef { key: "bundle", title: "Make the VM's empty disk and files", est_secs: 300, emulated: false, floor: 2 * GIB, run: bundle },
-    StepDef { key: "firmware", title: "Download firmware from Apple", est_secs: 3600, emulated: false, floor: 2 * GIB, run: firmware },
-    StepDef { key: "gpu-driver", title: "Extract the GPU driver from cloudOS", est_secs: 9000, emulated: true, floor: 5 * GIB, run: gpu_driver },
-    StepDef { key: "prepare", title: "Merge the firmware", est_secs: 2400, emulated: false, floor: 16 * GIB, run: prepare },
-    StepDef { key: "patch", title: "Patch the firmware", est_secs: 900, emulated: false, floor: 3 * GIB, run: patch },
-    StepDef { key: "restore", title: "Restore iOS onto the VM's disk", est_secs: 10800, emulated: true, floor: RESTORE_FREE_FLOOR, run: restore },
+    StepDef { key: "sanity", title: "Check the phone", emulated: false, floor: 2 * GIB, run: sanity },
+    StepDef { key: "bundle", title: "Make the VM's empty disk and files", emulated: false, floor: 2 * GIB, run: bundle },
+    StepDef { key: "firmware", title: "Download firmware from Apple", emulated: false, floor: 2 * GIB, run: firmware },
+    StepDef { key: "gpu-driver", title: "Read the GPU driver from cloudOS", emulated: false, floor: 5 * GIB, run: gpu_driver },
+    StepDef { key: "prepare", title: "Merge the firmware", emulated: false, floor: 16 * GIB, run: prepare },
+    StepDef { key: "patch", title: "Patch the firmware", emulated: false, floor: 3 * GIB, run: patch },
+    StepDef { key: "restore", title: "Restore iOS onto the VM's disk", emulated: true, floor: RESTORE_FREE_FLOOR, run: restore },
     // Ends with the snapshot flip and the restore tree put back, as do_cfw does.
-    StepDef { key: "cfw", title: "Install the custom firmware", est_secs: 10800, emulated: true, floor: 9 * GIB, run: cfw },
-    StepDef { key: "booted", title: "First boot and setup", est_secs: 7200, emulated: true, floor: 3 * GIB, run: first_boot },
+    StepDef { key: "cfw", title: "Install the custom firmware", emulated: true, floor: 9 * GIB, run: cfw },
+    StepDef { key: "booted", title: "First boot and setup", emulated: true, floor: 3 * GIB, run: first_boot },
 ];
 
 const CLI: &str = "libvphone_cli.so";
@@ -58,7 +55,6 @@ fn run_steps(e: &Arc<Engine>, steps: &'static [StepDef]) -> Result<(), String> {
     }
     let total = steps.len();
     let mut i = 0;
-    let mut redone_after_pause: Option<&str> = None;
     while i < total {
         let def = &steps[i];
         if state::done(&e.vm, def.key) {
@@ -79,13 +75,13 @@ fn run_steps(e: &Arc<Engine>, steps: &'static [StepDef]) -> Result<(), String> {
         }
         e.wait_while_paused()?;
         e.hold_until_clear(def.floor)?;
-        e.take_paused_in_step();
         e.begin_step(def.key);
         e.append_log(&format!("▶ {} ({}/{})", def.key, i + 1, total));
         if def.key == "patch" {
             fs::write(e.vm.join(PATCH_STARTED), b"").map_err(|err| err.to_string())?;
         }
-        let started = Instant::now();
+        // On the active clock: a step's time is the time it ran, not the time it was paused.
+        let started = vphone_create_steps::active::ActiveInstant::now();
         let result = (def.run)(e);
         match &result {
             Ok(()) => {
@@ -94,14 +90,8 @@ fn run_steps(e: &Arc<Engine>, steps: &'static [StepDef]) -> Result<(), String> {
             }
             Err(m) => {
                 let cancelled = m == "cancelled";
-                if !cancelled && e.take_paused_in_step() && redone_after_pause != Some(def.key) {
-                    redone_after_pause = Some(def.key);
-                    e.append_log(&format!("step {} stopped after a pause ({m}); running it again", def.key));
-                    e.end_step(def.key, "pending", started.elapsed());
-                    let _ = e.sup.stop();
-                    e.usb_down();
-                    continue;
-                }
+                // A step that fails after a pause has failed: every time limit in it and in its
+                // helpers is counted without the paused time, so nothing here runs it again.
                 if !cancelled {
                     // A display must never cost a creation: this boot runs again without one.
                     if let Some(why) = e.sup.take_display_failure() {
@@ -337,6 +327,16 @@ fn restore(e: &Arc<Engine>) -> Result<(), String> {
         return Ok(());
     }
     let _ = fs::remove_file(&log);
+    // The guest's restore hashes the whole system volume on one CPU unless its ramdisk says to
+    // take the fast path. A VM patched by a build that did not write that keeps its ramdisk
+    // through every Resume, so it is made sure of here, and the log says which way it goes.
+    match outcome(e, vphone_create_steps::restore_options::ensure_fast_mtree(&e.vm, e.as_ref())) {
+        Ok(state) => e.append_log(&state.describe()),
+        Err(m) if m == "cancelled" => return Err(m),
+        Err(m) => e.append_log(&format!(
+            "Fast mtree: OFF (the restore ramdisk's options could not be written: {m}); the restore hashes the system volume in full, which is slower"
+        )),
+    }
     e.usb_up()?;
     reset_targets(e)?;
     e.start_vm(VmKind::Dfu, &e.vm, &run)?;
@@ -377,9 +377,37 @@ fn gpu_driver(e: &Arc<Engine>) -> Result<(), String> {
         e.append_log(&format!("GPU driver already cached: {}", gpu_bundle(e).display()));
         return Ok(());
     }
+    let (_, cloud) = fw_paths(e)?;
+    let said = |driver: &installer::GpuDriver| {
+        format!(
+            "GPU driver: {} (sha1 {}{})",
+            driver.bundle.display(),
+            driver.sha1,
+            if driver.matches_known { ", the tested driver" } else { ", NOT the tested driver" }
+        )
+    };
+    // The image inside the IPSW carries its own key on every cloudOS seen so far, so the driver
+    // is read from it directly. Which way it goes is decided by the image, once.
+    e.status(true, |s| s.message = "Decrypting the cloudOS system image".into());
+    let threads = vphone_create_steps::aea::default_threads();
+    match outcome(e, installer::gpu_driver_from_image(&cloud, &assets(e), threads, e.as_ref()))? {
+        Some((driver, took)) => {
+            e.append_log(&format!(
+                "{}; decrypted on {} threads in {:.1} s, read in {:.1} s, no VM needed",
+                said(&driver),
+                took.threads,
+                took.decrypt.as_secs_f64(),
+                took.extract.as_secs_f64()
+            ));
+            return Ok(());
+        }
+        None => e.append_log(
+            "This cloudOS's system image does not carry its key, so the driver cannot be read from the download. \
+             Restoring cloudOS into a temporary VM to read it there instead; this takes as long as a restore.",
+        ),
+    }
     e.usb_up()?;
     let rel = release(e)?;
-    let (_, cloud) = fw_paths(e)?;
     let log = e.current_log();
     let params = installer::GpuParams {
         host: e.as_ref(),
@@ -391,12 +419,7 @@ fn gpu_driver(e: &Arc<Engine>) -> Result<(), String> {
     };
     e.status(true, |s| s.message = "Restoring a temporary cloudOS VM to read its GPU driver".into());
     let driver = outcome(e, installer::gpu_driver(&params))?;
-    e.append_log(&format!(
-        "GPU driver: {} (sha1 {}{})",
-        driver.bundle.display(),
-        driver.sha1,
-        if driver.matches_known { ", the tested driver" } else { ", NOT the tested driver" }
-    ));
+    e.append_log(&said(&driver));
     Ok(())
 }
 
@@ -442,6 +465,7 @@ mod tests {
     use super::*;
     use crate::paths::Paths;
     use crate::create::vm::VmProcess;
+    use std::time::Instant;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct NoVm;
@@ -463,7 +487,7 @@ mod tests {
 
     macro_rules! def {
         ($key:expr, $run:expr) => {
-            StepDef { key: $key, title: $key, est_secs: 1, emulated: false, floor: 0, run: $run }
+            StepDef { key: $key, title: $key, emulated: false, floor: 0, run: $run }
         };
     }
 

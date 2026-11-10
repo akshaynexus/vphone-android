@@ -68,8 +68,8 @@ pub struct Preflight {
     pub warnings: Vec<String>,
     pub free_gb: u64,
     pub want_gb: u64,
-    pub low_hours: u64,
-    pub high_hours: u64,
+    /// What is known of how long it takes on this phone, in words.
+    pub estimate: String,
 }
 
 pub fn preflight(paths: &Paths, spec: &Spec) -> Preflight {
@@ -134,10 +134,28 @@ pub fn preflight(paths: &Paths, spec: &Spec) -> Preflight {
             p.errors.push(format!("{lib} is missing from the app's native libraries"));
         }
     }
-    let secs: u64 = steps::STEPS.iter().map(|s| s.est_secs).sum();
-    p.low_hours = (secs as f64 * 0.7 / 3600.0).round() as u64;
-    p.high_hours = (secs as f64 * 2.0 / 3600.0).round() as u64;
+    p.estimate = time_estimate(&engine::read_measured(paths));
     p
+}
+
+/// How long a creation takes, from the steps' times measured on this phone; nothing is guessed.
+fn time_estimate(measured: &std::collections::BTreeMap<String, u64>) -> String {
+    let known: Vec<u64> = steps::STEPS.iter().filter_map(|s| measured.get(s.key).copied()).collect();
+    let total = steps::STEPS.len();
+    if known.len() == total {
+        format!(
+            "Time: the steps last took {} in all on this phone, without the downloads if they were already here.",
+            logview::duration_text(known.iter().sum())
+        )
+    } else if known.is_empty() {
+        "Time: not measured on this phone yet, so there is no estimate. Plan for many hours; each step's time is recorded as it finishes.".to_string()
+    } else {
+        format!(
+            "Time: {} of the {total} steps have finished on this phone before and took {}; the others have no estimate yet.",
+            known.len(),
+            logview::duration_text(known.iter().sum())
+        )
+    }
 }
 
 pub fn preflight_json(paths: &Paths, spec_json: &str) -> String {
@@ -359,7 +377,15 @@ mod tests {
         let p = paths("preflight");
         let spec: Spec = serde_json::from_str(&spec_json("x")).unwrap();
         let r = preflight(&p, &spec);
-        assert!(r.low_hours >= 1 && r.high_hours > r.low_hours, "{}", r.low_hours);
+        assert!(r.estimate.starts_with("Time: not measured on this phone yet"), "{}", r.estimate);
+        // With every step measured, the estimate is their sum and says where it is from.
+        let measured = steps::STEPS.iter().map(|s| (s.key.to_string(), 600u64)).collect();
+        assert_eq!(
+            time_estimate(&measured),
+            "Time: the steps last took 1 h 30 min in all on this phone, without the downloads if they were already here."
+        );
+        let some = [("restore".to_string(), 3600u64)].into_iter().collect();
+        assert!(time_estimate(&some).starts_with("Time: 1 of the 9 steps have finished on this phone before and took 1 h 00 min"));
         assert!(r.errors.iter().all(|e| !e.contains("missing")), "{:?}", r.errors);
         let bad: Spec = serde_json::from_str(&serde_json::json!({"name": "x", "device": "iPhone11,6", "ios": "18.6"}).to_string()).unwrap();
         assert!(preflight(&p, &bad).errors.iter().any(|e| e.contains("macOS kmutil")));

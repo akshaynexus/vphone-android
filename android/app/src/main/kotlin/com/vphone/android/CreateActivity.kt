@@ -206,7 +206,7 @@ class CreateActivity : AppCompatActivity() {
     private fun updatePreflight(): JSONObject {
         val report = JSONObject(Native.createPreflight(specJson().toString()))
         val line = StringBuilder()
-        line.append("Rough estimate, not measured on this phone: ${report.optLong("lowHours")} to ${report.optLong("highHours")} hours.\n")
+        line.append(report.optString("estimate")).append("\n")
         line.append("Storage free: ${report.optLong("freeGb")} GB (about ${report.optLong("wantGb")} GB will be used).")
         val errors = report.getJSONArray("errors")
         val warnings = report.getJSONArray("warnings")
@@ -276,7 +276,7 @@ class CreateActivity : AppCompatActivity() {
             startActivity(Intent(this, CreateVmScreen::class.java))
         }
         findViewById<Button>(R.id.pause).setOnClickListener {
-            Native.createPause(name, !paused)
+            if (paused) Native.createPause(name, false) else confirmPause(name)
         }
         findViewById<Button>(R.id.cancel).setOnClickListener { confirmCancel(name) }
         findViewById<Button>(R.id.delete).setOnClickListener { confirmDelete(name) }
@@ -293,6 +293,32 @@ class CreateActivity : AppCompatActivity() {
             startActivity(Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_BOOT, name))
             finish()
         }
+    }
+
+    /** What a pause keeps and what it cannot, said before it starts rather than found out after. */
+    private fun confirmPause(name: String) {
+        val s = lastStatus
+        val key = s?.optString("step").orEmpty()
+        val steps = s?.optJSONArray("steps")
+        val title = (0 until (steps?.length() ?: 0)).map { steps!!.getJSONObject(it) }
+            .firstOrNull { it.optString("key") == key }?.optString("title").orEmpty()
+        val step = if (title.isEmpty()) "the current step" else "the current step (\u201c$title\u201d)"
+        val message = if (key == "firmware") {
+            "The download stops after the piece it is fetching and carries on from there when you resume, " +
+                "also after the app or the phone restarts. Nothing downloaded is lost."
+        } else {
+            "Kept: the VM and its tools stop exactly where they are and stay in memory. Resume carries on from " +
+                "the same point, however long the pause was: waiting does not use up any time limit.\n\n" +
+                "Not kept: if the app is closed, the phone restarts, or Android ends the app to free memory while " +
+                "it is paused, $step starts again from its beginning. Steps already finished are never redone.\n\n" +
+                "While paused, the VM still holds its memory, so other apps have less of it."
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Pause now?")
+            .setMessage(message)
+            .setPositiveButton("Pause") { _, _ -> Native.createPause(name, true) }
+            .setNegativeButton("Keep running", null)
+            .show()
     }
 
     private fun confirmCancel(name: String) {
@@ -347,13 +373,30 @@ class CreateActivity : AppCompatActivity() {
         val state = s.optString("state")
         paused = s.optBoolean("paused")
         val failed = state == "failed"
-        findViewById<TextView>(R.id.title).text = "Creating ${s.optString("name")} (${s.optString("device")}, iOS ${s.optString("ios")})"
+        findViewById<TextView>(R.id.title).text = "${s.optString("name")} \u00b7 ${s.optString("device")}, iOS ${s.optString("ios")}"
+        val all = s.optJSONArray("steps")
+        val stepList = (0 until (all?.length() ?: 0)).map { all!!.getJSONObject(it) }
+        val at = stepList.indexOfFirst { it.optString("key") == s.optString("step") }
+        findViewById<TextView>(R.id.now_step).text = when {
+            state == "done" -> "All ${stepList.size} steps finished"
+            at >= 0 -> "Step ${at + 1} of ${stepList.size} \u00b7 ${stepList[at].optString("title")}"
+            else -> "Getting ready"
+        }
+        // The time left is only ever made of times this phone measured; without them, the reason.
+        val left = s.optLong("etaSecs")
+        val estimate = when {
+            left > 0 -> "About ${durationText(left)} left, going by this phone's last run of these steps"
+            else -> s.optString("etaNote")
+        }
         findViewById<TextView>(R.id.eta).text = when (state) {
             "done" -> "Finished."
             "failed" -> "Stopped with an error."
             "cancelled" -> "Stopped. Resume it or delete it."
             "interrupted" -> if (paused) "Paused. Tap Resume to carry on." else "Interrupted. Tap Resume to continue."
-            else -> if (paused) "Paused. Tap Resume to carry on." else "Running"
+            else -> {
+                val running = if (paused) "Paused: tap Resume to carry on" else "Running"
+                if (estimate.isEmpty()) "$running." else "$running. $estimate."
+            }
         }
 
         val hold = findViewById<TextView>(R.id.hold)
@@ -381,8 +424,11 @@ class CreateActivity : AppCompatActivity() {
             val speed = s.optLong("bytesPerSec")
             if (speed > 0) "$it (${speed / MIB} MB/s)" else it
         }
-        val duplicate = s.optString("message").isEmpty() || s.optString("message") == stageText
-        findViewById<TextView>(R.id.message).visibility = if (failed || duplicate) View.GONE else View.VISIBLE
+        // The headline is what the step says it is doing; with nothing said, the stage its log is at.
+        if (s.optString("message").isEmpty()) findViewById<TextView>(R.id.message).text = stageText
+        val nothing = s.optString("message").isEmpty() && stageText.isEmpty()
+        findViewById<TextView>(R.id.message).visibility =
+            if (failed || nothing || state == "done" || state == "cancelled") View.GONE else View.VISIBLE
         findViewById<TextView>(R.id.error).apply {
             visibility = if (failed) View.VISIBLE else View.GONE
             val error = s.optString("error").ifEmpty { "No details were recorded. See the step's log." }
@@ -429,11 +475,28 @@ class CreateActivity : AppCompatActivity() {
             val st = steps.getJSONObject(i)
             val row = rows[st.getString("key")] ?: continue
             val state = st.getString("state")
-            row.findViewById<TextView>(R.id.mark).text = when (state) {
-                "done" -> "✓"
-                "running" -> "▶"
-                "failed" -> "✕"
-                else -> "·"
+            val current = st.getString("key") == s.optString("step") && state == "running"
+            row.findViewById<TextView>(R.id.mark).apply {
+                text = when (state) {
+                    "done" -> "✓"
+                    "running" -> "▶"
+                    "failed" -> "✕"
+                    else -> "·"
+                }
+                setTextColor(
+                    MaterialColors.getColor(
+                        this,
+                        when (state) {
+                            "failed" -> androidx.appcompat.R.attr.colorError
+                            "done", "running" -> androidx.appcompat.R.attr.colorPrimary
+                            else -> com.google.android.material.R.attr.colorOnSurfaceVariant
+                        },
+                    ),
+                )
+            }
+            row.findViewById<TextView>(R.id.step_title).apply {
+                setTypeface(null, if (current || state == "failed") Typeface.BOLD else Typeface.NORMAL)
+                alpha = if (state == "pending") PENDING_ALPHA else 1f
             }
         }
     }
@@ -511,6 +574,17 @@ class CreateActivity : AppCompatActivity() {
         private const val MIB = 1024L * 1024
         private const val HOT_BATTERY_TENTHS = 430
         private const val FACT_SP = 12f
+        private const val PENDING_ALPHA = 0.7f
+
+        /** As the native side writes durations: "2 h 05 min", "12 min", "40 s". */
+        fun durationText(secs: Long): String {
+            val (h, m) = secs / 3600 to (secs % 3600) / 60
+            return when {
+                h > 0 -> String.format(Locale.US, "%d h %02d min", h, m)
+                m > 0 -> "$m min"
+                else -> "$secs s"
+            }
+        }
 
         const val TIME_WARNING =
             "This makes the VM entirely on this phone: it downloads about 12 GB from Apple, patches the " +

@@ -7,20 +7,26 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// The stages of a restore, in order: a line containing the text starts that stage.
-const STAGES: [(&str, &str); 12] = [
-    ("Trying to fetch new SHSH", "Asking Apple to sign the restore"),
-    ("Sending iBSS", "Loading the first boot stage"),
-    ("Sending iBEC", "Loading the second boot stage"),
-    ("Sending RestoreRamDisk", "Loading the restore system"),
-    ("Waiting for device to enter restore mode", "Waiting for the restore system to boot"),
-    ("successfully entered restore mode", "The restore system is running"),
-    ("Creating partition map", "Preparing the virtual disk"),
-    ("Validating the filesystem", "Checking the system image"),
-    ("Sending filesystem now", "Writing the system to the disk"),
-    ("Flashing firmware", "Installing firmware"),
-    ("About to send Ap,SecurePageTableMonitor", "Installing the boot files"),
-    ("Restore Finished", "Restore finished"),
+/// The stages of a restore, in order: a line containing one of the texts starts that stage.
+///
+/// The order is that of a real restore's log. The firmware and boot files the guest asks for
+/// ("Flashing firmware", "About to send Ap,SecurePageTableMonitor"...) arrive in the first minute
+/// of the image write and are not a stage: counting them as one showed "Installing the boot
+/// files" for the whole of the write that followed.
+const STAGES: [(&[&str], &str); 13] = [
+    (&["Trying to fetch new SHSH"], "Asking Apple to sign the restore"),
+    (&["Sending iBSS"], "Loading the first boot stage"),
+    (&["Sending iBEC"], "Loading the second boot stage"),
+    (&["Sending RestoreRamDisk"], "Loading the restore system"),
+    (&["Waiting for device to enter restore mode"], "Waiting for the restore system to boot"),
+    (&["successfully entered restore mode"], "The restore system is running"),
+    (&["Creating partition map"], "Preparing the virtual disk"),
+    (&["Validating the filesystem"], "Checking the system image"),
+    (&["Sending filesystem now"], "Writing iOS to the disk"),
+    (&["Done sending filesystem", "Verifying restore"], "Checking what was written"),
+    (&["About to send KernelCache", "Installing kernelcache"], "Installing the kernel and boot files"),
+    (&["Sealing System Volume"], "Sealing the system volume"),
+    (&["Restore Finished"], "Restore finished"),
 ];
 
 pub const STAGE_COUNT: u64 = STAGES.len() as u64;
@@ -29,8 +35,19 @@ pub const STAGE_COUNT: u64 = STAGES.len() as u64;
 pub fn stage_of(line: &str) -> Option<(u64, &'static str)> {
     STAGES
         .iter()
-        .position(|(needle, _)| line.contains(needle))
+        .position(|(needles, _)| needles.iter().any(|needle| line.contains(needle)))
         .map(|i| (i as u64 + 1, STAGES[i].1))
+}
+
+/// What the guest's restore says of its fast mtree path, when a line says it: on or not.
+pub fn fast_mtree_said(line: &str) -> Option<bool> {
+    if line.contains("Fast mtree path enabled") {
+        Some(true)
+    } else if line.contains("Fast mtree path not enabled") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// The MiB the USB link reports having sent: `vusbd: sent 16 MiB in 3.2 s`.
@@ -201,7 +218,7 @@ mod tests {
     use std::io::Write;
 
     /// Lines in the order a real cloudOS restore wrote them.
-    const REAL: &str = "idevicerestore 1.1.0\nTrying to fetch new SHSH blob\nSending iBSS (380445 bytes)...\nSending iBEC (380475 bytes)...\nSending RestoreRamDisk (232789583 bytes)...\nWaiting for device to enter restore mode...\nDevice 0000FE01 has successfully entered restore mode\nCreating partition map (11)\nMounting filesystems (16)\nValidating the filesystem\nSending filesystem now...\nFlashing firmware (18)\nAbout to send Ap,SecurePageTableMonitor...\nStatus: Restore Finished\n";
+    const REAL: &str = "idevicerestore 1.1.0\nTrying to fetch new SHSH blob\nSending iBSS (380445 bytes)...\nSending iBEC (380475 bytes)...\nSending RestoreRamDisk (232789583 bytes)...\nWaiting for device to enter restore mode...\nDevice 0000FE01 has successfully entered restore mode\nCreating partition map (11)\nMounting filesystems (16)\nValidating the filesystem\nSending filesystem now...\nRestoring image (13)\nFlashing firmware (18)\nAbout to send Ap,SecurePageTableMonitor...\nSending Ap,SecurePageTableMonitor now (115812 bytes)...\nAbout to send SystemVolume...\nSending SystemVolume now (5911 bytes)...\nRestoring image (13)\nDone sending filesystem\nVerifying restore (14)\nAbout to send KernelCache...\nInstalling kernelcache (27)\nSealing System Volume (77)\nStatus: Restore Finished\n";
 
     #[test]
     fn a_real_restore_moves_forward_through_every_stage() {
@@ -209,6 +226,24 @@ mod tests {
         let seen: Vec<u64> = REAL.lines().filter_map(|l| m.advance(l).map(|s| s.0)).collect();
         assert_eq!(seen, (1..=STAGE_COUNT).collect::<Vec<_>>());
         assert_eq!(m.advance("Sending iBSS (380445 bytes)..."), None, "it never goes back");
+    }
+
+    #[test]
+    fn what_the_guest_asks_for_during_the_write_is_not_a_stage() {
+        // These arrive in the first minute of the image write, which then goes on for much longer.
+        for line in ["Flashing firmware (18)", "About to send Ap,SecurePageTableMonitor...", "Sending SystemVolume now (5911 bytes)...", "Restoring image (13)"] {
+            assert_eq!(stage_of(line), None, "{line}");
+        }
+        assert_eq!(stage_of("Sending filesystem now...").unwrap().1, "Writing iOS to the disk");
+        assert_eq!(stage_of("Verifying restore (14)").unwrap().1, "Checking what was written");
+        assert_eq!(stage_of("Sealing System Volume (77)").unwrap().1, "Sealing the system volume");
+    }
+
+    #[test]
+    fn the_guests_word_on_its_fast_mtree_path_is_read() {
+        assert_eq!(fast_mtree_said("[guest] Fast mtree path enabled."), Some(true));
+        assert_eq!(fast_mtree_said("Fast mtree path not enabled."), Some(false));
+        assert_eq!(fast_mtree_said("executing /usr/sbin/mtree"), None);
     }
 
     #[test]

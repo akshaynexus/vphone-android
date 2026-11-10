@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use vphone_create_steps::active;
 use vphone_create_steps::host::{BackgroundHelper, Host};
 use vphone_create_steps::progress::Progress;
 
@@ -35,6 +36,52 @@ const MUX_LOG: &str = "usbmuxd.log";
 pub const RESTORE_FREE_FLOOR: u64 = 25 * GIB;
 const GENERAL_FREE_FLOOR: u64 = 3 * GIB;
 const VM_FREE_FLOOR: u64 = 2 * GIB;
+
+/// Where the steps' measured times are kept, for every VM made on this phone.
+pub fn measured_file(paths: &Paths) -> PathBuf {
+    paths.files.join("create").join("step-times.json")
+}
+
+pub fn read_measured(paths: &Paths) -> BTreeMap<String, u64> {
+    fs::read(measured_file(paths))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// A step that ended at once had its work done already (a cached download, a driver read before):
+/// that says nothing new about how long the work takes, so an earlier, longer time is kept.
+fn kept_measurement(before: Option<u64>, now: u64) -> u64 {
+    const NO_WORK_SECS: u64 = 5;
+    match before {
+        Some(before) if now < NO_WORK_SECS && before >= NO_WORK_SECS => before,
+        _ => now,
+    }
+}
+
+/// The time left and, when there is none to give, why. `running_secs` is how long the step
+/// `current` has run.
+pub fn estimate(steps: &[StepStatus], current: &str, running_secs: u64) -> (u64, String) {
+    let left: Vec<&StepStatus> = steps.iter().filter(|st| st.state != "done").collect();
+    if left.is_empty() {
+        return (0, String::new());
+    }
+    let unmeasured = left.iter().filter(|st| !st.measured).count();
+    if unmeasured > 0 {
+        let which = match (unmeasured, left.len()) {
+            (1, 1) => "the step left has never finished on this phone".to_string(),
+            (u, l) if u == l => format!("none of the {l} steps left has finished on this phone before"),
+            (1, l) => format!("1 of the {l} steps left has never finished on this phone"),
+            (u, l) => format!("{u} of the {l} steps left have never finished on this phone"),
+        };
+        return (0, format!("No time estimate yet: {which}"));
+    }
+    let secs = left
+        .iter()
+        .map(|st| if st.key == current { st.est_secs.saturating_sub(running_secs) } else { st.est_secs })
+        .sum();
+    (secs, String::new())
+}
 
 pub fn free_bytes(dir: &Path) -> u64 {
     let Ok(c) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) else {
@@ -56,12 +103,13 @@ pub struct Engine {
     pub sup: Supervisor,
     status: Mutex<Status>,
     status_written: Mutex<Instant>,
-    step_started: Mutex<Instant>,
+    step_started: Mutex<active::ActiveInstant>,
     times: Mutex<BTreeMap<String, u64>>,
+    /// How long each step last took on this phone, in running time; what estimates are made of.
+    measured: Mutex<BTreeMap<String, u64>>,
     step_log: Mutex<Option<File>>,
     usb: Mutex<Vec<Background>>,
     pause: Mutex<bool>,
-    paused_in_step: AtomicBool,
     mirror: Mutex<Vec<Followed>>,
     restore_rate: Mutex<mirror::RestoreRate>,
     /// The logs [`Engine::mirror_log`] follows, for the watchdog's "any output yet?".
@@ -91,13 +139,15 @@ impl Engine {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let measured = read_measured(&paths);
         let steps = STEPS
             .iter()
             .map(|d| StepStatus {
                 key: d.key.into(),
                 title: d.title.into(),
                 state: if state::done(&vm, d.key) { "done".into() } else { "pending".into() },
-                est_secs: d.est_secs,
+                est_secs: measured.get(d.key).copied().unwrap_or(0),
+                measured: measured.contains_key(d.key),
                 log: state::step_log(&vm, d.key).to_string_lossy().into_owned(),
                 ..Default::default()
             })
@@ -118,12 +168,12 @@ impl Engine {
             sup,
             status: Mutex::new(status),
             status_written: Mutex::new(Instant::now() - Duration::from_secs(60)),
-            step_started: Mutex::new(Instant::now()),
+            step_started: Mutex::new(active::ActiveInstant::now()),
             times: Mutex::new(times),
+            measured: Mutex::new(measured),
             step_log: Mutex::new(None),
             usb: Mutex::new(Vec::new()),
             pause: Mutex::new(false),
-            paused_in_step: AtomicBool::new(false),
             mirror: Mutex::new(Vec::new()),
             restore_rate: Mutex::new(mirror::RestoreRate::new()),
             followed_paths: Mutex::new(Vec::new()),
@@ -143,12 +193,6 @@ impl Engine {
             std::thread::sleep(Duration::from_millis(500));
         }
         Ok(())
-    }
-
-    /// Whether a pause happened since this was last asked. A long pause can run out a time-out
-    /// inside a step, so a step that fails after one is run again instead of reported.
-    pub fn take_paused_in_step(&self) -> bool {
-        self.paused_in_step.swap(false, Ordering::SeqCst)
     }
 
     fn cancelled_now(&self) -> bool {
@@ -180,10 +224,11 @@ impl Engine {
             .append(true)
             .open(&log_path)
             .ok();
-        *self.step_started.lock().unwrap() = Instant::now();
+        *self.step_started.lock().unwrap() = active::ActiveInstant::now();
         let path = log_path.to_string_lossy().into_owned();
         self.status(true, |s| {
             s.step = key.to_string();
+            s.step_started_ms = state::now_ms();
             s.state = "running".into();
             s.message.clear();
             s.hold.clear();
@@ -213,53 +258,41 @@ impl Engine {
             }
             total
         };
+        // A step that finished is a measurement of this phone, for the next estimate.
+        let measured = (state_text == "done").then(|| {
+            let mut m = self.measured.lock().unwrap();
+            let secs = kept_measurement(m.get(key).copied(), elapsed.as_secs());
+            m.insert(key.to_string(), secs);
+            if let Ok(json) = serde_json::to_vec(&*m) {
+                let file = measured_file(&self.paths);
+                let _ = fs::create_dir_all(file.parent().unwrap_or(&self.paths.files));
+                let _ = state::write_atomic(&file, &json);
+            }
+            secs
+        });
         self.status(true, |s| {
             for st in &mut s.steps {
                 if st.key == key {
                     st.state = state_text.to_string();
                     st.elapsed_secs = total;
+                    if let Some(secs) = measured {
+                        st.est_secs = secs;
+                        st.measured = true;
+                    }
                 }
             }
-            s.eta_secs = self.eta(s);
+            self.set_eta(s);
         });
     }
 
-    /// Remaining seconds. Steps yet to run use their estimate, scaled by how the emulated
-    /// steps have compared with theirs so far; a step in progress subtracts its elapsed time.
-    fn eta(&self, s: &Status) -> u64 {
-        let times = self.times.lock().unwrap();
-        let mut ratio = 1.0f64;
-        let (mut ran, mut est) = (0u64, 0u64);
-        for def in STEPS.iter().filter(|d| d.emulated) {
-            if let Some(t) = times.get(def.key) {
-                if state::done(&self.vm, def.key) && *t > 0 {
-                    ran += *t;
-                    est += def.est_secs;
-                }
-            }
-        }
-        if est > 0 {
-            ratio = (ran as f64 / est as f64).clamp(0.3, 4.0);
-        }
-        let mut left = 0f64;
-        for (def, st) in STEPS.iter().zip(&s.steps) {
-            if st.state == "done" {
-                continue;
-            }
-            let mut this = def.est_secs as f64;
-            if def.emulated {
-                this *= ratio;
-            }
-            if st.key == s.step {
-                this -= self.step_started.lock().unwrap().elapsed().as_secs_f64();
-            }
-            left += this.max(0.0);
-        }
-        left as u64
-    }
-
-    pub fn tick_eta(&self) {
-        self.status(false, |s| s.eta_secs = self.eta(s));
+    /// The time left, from how long each step still to run last took on this phone. With a step
+    /// among them that has never finished here there is no estimate, and the note says so:
+    /// numbers that were not measured would only mislead.
+    fn set_eta(&self, s: &mut Status) {
+        let running = self.step_started.lock().unwrap().elapsed().as_secs();
+        let (secs, note) = estimate(&s.steps, &s.step, running);
+        s.eta_secs = secs;
+        s.eta_note = note;
     }
 
     /// Follows a helper's own log into the step's, with what the VM and the USB link say beside
@@ -319,6 +352,21 @@ impl Engine {
                 }
                 if let Some(percent) = mirror::asr_percent(&line) {
                     self.show_restore_progress(percent);
+                }
+                if let Some(on) = mirror::fast_mtree_said(&line) {
+                    self.append_log(if on {
+                        "Fast mtree: the guest's restore confirms it is ON (the system volume is sealed from the manifest)"
+                    } else {
+                        "Fast mtree: the guest's restore says it is NOT enabled; it hashes every system file now, on one CPU"
+                    });
+                    if on {
+                        self.status(true, |s| {
+                            s.done_bytes = 0;
+                            s.total_bytes = 0;
+                            s.bytes_per_sec = 0;
+                            s.message = "Sealing the system volume (fast path)".into();
+                        });
+                    }
                 }
                 if let Some(text) = mirror::guest_stage(&line) {
                     self.status(true, |s| {
@@ -532,6 +580,7 @@ impl Engine {
                 if matches!(me.snapshot().state.as_str(), "done" | "failed" | "cancelled") {
                     if *paused {
                         super::exec::freeze(false);
+                        active::hold(false);
                     }
                     return;
                 }
@@ -540,15 +589,18 @@ impl Engine {
                 let free = free_bytes(&me.paths.files);
                 let hot = alive && super::ctl::thermal() >= super::ctl::THERMAL_CRITICAL;
                 let low = alive && free < VM_FREE_FLOOR;
-                let want = by_person || hot || low;
+                // A cancel lets everything run again, so that what is waiting can end.
+                let want = !me.cancelled_now() && (by_person || hot || low);
                 if want && !*paused {
                     if alive && crate::qmp::command(&me.paths.qmp_socket(), "stop").is_err() {
                         continue;
                     }
                     super::exec::freeze(true);
+                    // This process keeps running: its own waits on the guest (SSH commands, the
+                    // guest's RPC) stop counting here, as the stopped helpers' do by themselves.
+                    active::hold(true);
                     *paused = true;
                     me.vm_held.store(true, Ordering::SeqCst);
-                    me.paused_in_step.store(true, Ordering::SeqCst);
                     let (hold, message) = if by_person {
                         ("", "Paused".to_string())
                     } else if low {
@@ -565,6 +617,7 @@ impl Engine {
                     if alive && crate::qmp::command(&me.paths.qmp_socket(), "cont").is_err() {
                         continue;
                     }
+                    active::hold(false);
                     super::exec::freeze(false);
                     *paused = false;
                     me.vm_held.store(false, Ordering::SeqCst);
@@ -660,7 +713,7 @@ impl Gate for Engine {
             s.bytes_per_sec = speed;
             s.message = message;
             s.hold.clear();
-            s.eta_secs = self.eta(s);
+            self.set_eta(s);
         });
     }
     fn hold(&self, message: &str) {
@@ -704,7 +757,7 @@ impl Progress for Engine {
             s.total_bytes = total;
             s.bytes_per_sec = 0;
             s.message = message;
-            s.eta_secs = self.eta(s);
+            self.set_eta(s);
         });
     }
     /// Every long in-process job asks this often, so a pause stops them here.
@@ -913,6 +966,38 @@ impl Host for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_estimate_is_only_made_of_measured_steps() {
+        let step = |key: &str, state: &str, secs: u64, measured: bool| StepStatus {
+            key: key.into(),
+            state: state.into(),
+            est_secs: secs,
+            measured,
+            ..Default::default()
+        };
+        // Everything left was measured: the running step's own time comes off its measurement.
+        let all = [step("patch", "done", 60, true), step("restore", "running", 3000, true), step("cfw", "pending", 1800, true)];
+        assert_eq!(estimate(&all, "restore", 1000), (3800, String::new()));
+        assert_eq!(estimate(&all, "restore", 9000), (1800, String::new()), "a step that overruns leaves the rest");
+        // One never finished here: no number at all, and the reason.
+        let some = [step("restore", "running", 3000, true), step("cfw", "pending", 0, false), step("booted", "pending", 900, true)];
+        assert_eq!(estimate(&some, "restore", 10), (0, "No time estimate yet: 1 of the 3 steps left has never finished on this phone".into()));
+        let none = [step("restore", "running", 0, false), step("cfw", "pending", 0, false)];
+        assert_eq!(estimate(&none, "restore", 10).1, "No time estimate yet: none of the 2 steps left has finished on this phone before");
+        let last = [step("patch", "done", 60, true), step("booted", "running", 0, false)];
+        assert_eq!(estimate(&last, "booted", 10).1, "No time estimate yet: the step left has never finished on this phone");
+        assert_eq!(estimate(&[step("a", "done", 1, true)], "", 0), (0, String::new()));
+    }
+
+    #[test]
+    fn a_step_with_nothing_to_do_does_not_replace_a_real_measurement() {
+        assert_eq!(kept_measurement(None, 0), 0);
+        assert_eq!(kept_measurement(Some(3240), 0), 3240, "the driver was cached this time");
+        assert_eq!(kept_measurement(Some(3240), 2), 3240);
+        assert_eq!(kept_measurement(Some(3240), 2700), 2700, "a real run replaces the last one");
+        assert_eq!(kept_measurement(Some(1), 2), 2);
+    }
 
     struct NoVm;
     impl VmProcess for NoVm {

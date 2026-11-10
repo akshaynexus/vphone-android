@@ -139,7 +139,7 @@ fn restored_operation(body: &str) -> Option<&str> {
 
 /// What the VM's serial output says it is doing. The first four are in the logs of real restores;
 /// the kernel's are XNU's own messages, which appear once a boot has the serial console on.
-const GUEST_MARKS: [(&str, &str); 7] = [
+const GUEST_MARKS: [(&str, &str); 10] = [
     ("OpenBootROM:", "VM boot ROM"),
     ("======== Start of iBoot", "VM iBoot"),
     ("Entering recovery mode", "VM iBoot recovery mode"),
@@ -147,6 +147,9 @@ const GUEST_MARKS: [(&str, &str); 7] = [
     ("Darwin Kernel Version", "VM kernel started"),
     ("BSD root:", "VM kernel mounting its root"),
     ("Still waiting for root device", "VM kernel waiting for its root device"),
+    ("Fast mtree path enabled", "Restore takes the fast mtree path"),
+    ("Fast mtree path not enabled", "Restore has no fast mtree path: hashing every system file"),
+    ("executing /usr/sbin/mtree", "Restore is hashing every system file (mtree, one CPU)"),
 ];
 
 #[derive(Debug, PartialEq, Clone)]
@@ -257,18 +260,21 @@ pub struct Stamper {
 }
 
 impl Stamper {
+    /// What the logs hold when this is called was written before anyone was timing it; the look
+    /// that decides that happens here, before the caller writes its first line.
     pub fn spawn(dir: PathBuf) -> Stamper {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let mut seen = HashMap::new();
+        stamp_once(&dir, &mut seen, true);
         let thread = std::thread::Builder::new()
             .name("create-stamps".into())
             .spawn(move || {
-                let mut seen = HashMap::new();
                 while !flag.load(Ordering::SeqCst) {
-                    stamp_once(&dir, &mut seen);
+                    stamp_once(&dir, &mut seen, false);
                     std::thread::sleep(Duration::from_millis(500));
                 }
-                stamp_once(&dir, &mut seen);
+                stamp_once(&dir, &mut seen, false);
             })
             .ok();
         Stamper { stop, thread }
@@ -297,7 +303,9 @@ fn last_stamped(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn stamp_once(dir: &Path, seen: &mut HashMap<PathBuf, u64>) {
+/// `first` is the look at what was there before the timing began; a log that appears after it is
+/// new from its first byte.
+fn stamp_once(dir: &Path, seen: &mut HashMap<PathBuf, u64>, first: bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -313,7 +321,7 @@ fn stamp_once(dir: &Path, seen: &mut HashMap<PathBuf, u64>) {
         let stamps = stamps_path(&path);
         let last = match seen.get(&path) {
             Some(last) => *last,
-            None => {
+            None if first => {
                 // What a log already holds was written before anyone was timing it.
                 let stamped = last_stamped(&stamps);
                 if size > stamped {
@@ -322,6 +330,7 @@ fn stamp_once(dir: &Path, seen: &mut HashMap<PathBuf, u64>) {
                 seen.insert(path.clone(), size);
                 size
             }
+            None => last_stamped(&stamps).min(size),
         };
         if size < last {
             let _ = File::create(&stamps);
@@ -473,6 +482,13 @@ impl LogIndex {
             _ => self.tool_line(body),
         }
         let mark = self.tracker.mark(source, body);
+        // What was being sent, and how much had gone over USB, belong to the stage they were in.
+        if mark.as_ref().is_some_and(|m| m.level == 0) {
+            if sending_of(body).is_none() {
+                self.sending = None;
+            }
+            self.sent = None;
+        }
         if self.stages.is_empty() && mark.is_none() {
             self.add_stage(start, n, "Start of the log".into(), 0, "tool", false);
         }
@@ -499,6 +515,8 @@ impl LogIndex {
     fn tool_line(&mut self, body: &str) {
         if let Some(sending) = sending_of(body) {
             self.sending = Some(sending);
+        } else if body.starts_with("Done sending") {
+            self.sending = None;
         }
         if let Some(rest) = body.strip_prefix("step ") {
             let ended = if rest.ends_with(" failed") {
@@ -1093,10 +1111,14 @@ pub fn progress_facts(status: &Status, index: &LogIndex, now: u64) -> Vec<Fact> 
     let mut out = Vec::new();
     let live = is_live(status);
     let attempt = index.stages.iter().rposition(|s| s.attempt).unwrap_or(0);
-    let current = index.stages[attempt.min(index.stages.len().saturating_sub(1))..].iter();
-    let tool = current.clone().rfind(|s| s.level == 0 && s.kind != "step");
-    let guest = current.clone().rfind(|s| s.kind == "vm");
-    let detail = current.clone().rfind(|s| s.level == 1 && s.kind != "vm");
+    let current = &index.stages[attempt.min(index.stages.len().saturating_sub(1))..];
+    let tool_at = current.iter().rposition(|s| s.level == 0 && s.kind != "step");
+    let tool = tool_at.map(|i| &current[i]);
+    // Only what was said within the stage shown: the VM's word on an earlier one (its kernel
+    // mounting its root, a file that was sent) would read as what it is doing now.
+    let within = &current[tool_at.unwrap_or(0)..];
+    let guest = within.iter().rfind(|s| s.kind == "vm");
+    let detail = within.iter().rfind(|s| s.level == 1 && s.kind != "vm");
 
     let mut stage = fact(
         "Stage",
@@ -1116,15 +1138,19 @@ pub fn progress_facts(status: &Status, index: &LogIndex, now: u64) -> Vec<Fact> 
         f.wide = true;
         out.push(f);
     }
-    let since = |s: Option<&Stage>| -> String {
-        match s.and_then(|s| index.stage_start(s)) {
+    let since = |start: Option<u64>| -> String {
+        match start {
             Some(start) => duration_text(ago(now, start)),
             None => "not recorded".to_string(),
         }
     };
-    out.push(fact("In this stage", if live || status.paused { since(tool) } else { "stopped".to_string() }));
-    let step_start = index.stages.get(attempt);
-    out.push(fact("This attempt", since(step_start)));
+    let stage_start = tool.and_then(|s| index.stage_start(s));
+    out.push(fact("In this stage", if live || status.paused { since(stage_start) } else { "stopped".to_string() }));
+    // The engine notes when it starts a step; the log's own times cover a status without that.
+    let attempt_start = (status.step_started_ms != 0)
+        .then_some(status.step_started_ms)
+        .or_else(|| index.stages.get(attempt).and_then(|s| index.stage_start(s)));
+    out.push(fact("This attempt", since(attempt_start)));
 
     let mut line = fact("Last log line", "none yet");
     if let Some(ms) = index.last_line_ms() {
@@ -1287,17 +1313,28 @@ fn step_times(status: &Status, index: &LogIndex, now: u64) -> HashMap<String, St
         .iter()
         .map(|st| {
             let took = duration_text(st.elapsed_secs);
+            // What this step took the last time it finished on this phone, when it ever has.
+            let last_time = if st.measured {
+                format!(" \u{b7} took {} last time on this phone", duration_text(st.est_secs))
+            } else {
+                " \u{b7} no estimate yet".to_string()
+            };
             let text = match st.state.as_str() {
                 "done" if st.elapsed_secs > 0 => format!("took {took}"),
                 "done" => "done".to_string(),
                 "failed" if st.elapsed_secs > 0 => format!("failed after {took}"),
                 "failed" => "failed".to_string(),
-                "running" if st.key == status.step => match attempt.and_then(|s| index.stage_start(s)) {
-                    Some(start) => format!("running for {}", duration_text(ago(now, start))),
-                    None => "running".to_string(),
-                },
+                "running" if st.key == status.step => {
+                    let start = (status.step_started_ms != 0)
+                        .then_some(status.step_started_ms)
+                        .or_else(|| attempt.and_then(|s| index.stage_start(s)));
+                    match start {
+                        Some(start) => format!("running for {}{last_time}", duration_text(ago(now, start))),
+                        None => format!("running{last_time}"),
+                    }
+                }
                 "running" => "stopped".to_string(),
-                _ => "not started".to_string(),
+                _ => format!("not started{last_time}"),
             };
             (st.key.clone(), text)
         })
@@ -1478,9 +1515,9 @@ mod tests {
         let log = d.join("restore.log");
         write(&log, "from an earlier run\n");
         let mut seen = HashMap::new();
-        stamp_once(&d, &mut seen);
+        stamp_once(&d, &mut seen, true);
         append(&log, "new line\n");
-        stamp_once(&d, &mut seen);
+        stamp_once(&d, &mut seen, false);
         let mut stamps = Stamps::default();
         stamps.refresh(&stamps_path(&log));
         assert_eq!(stamps.entries.len(), 2);
@@ -1488,8 +1525,23 @@ mod tests {
         assert!(stamps.time_at(25).is_some());
         // A log cut short starts its record again.
         write(&log, "x\n");
-        stamp_once(&d, &mut seen);
+        stamp_once(&d, &mut seen, false);
         assert_eq!(fs::metadata(stamps_path(&log)).unwrap().len(), 0);
+    }
+
+    /// A step's log that appears once the timing has begun is timed from its first line: the
+    /// "▶" of a step, which is what "This attempt" counts from.
+    #[test]
+    fn a_log_made_after_the_stamper_started_is_timed_from_its_first_byte() {
+        let d = fixture("stamper-new");
+        let mut seen = HashMap::new();
+        stamp_once(&d, &mut seen, true);
+        let log = d.join("restore.log");
+        write(&log, "▶ restore (7/9)\n");
+        stamp_once(&d, &mut seen, false);
+        let mut stamps = Stamps::default();
+        stamps.refresh(&stamps_path(&log));
+        assert!(stamps.time_at(0).is_some(), "{:?}", stamps.entries);
     }
 
     #[test]
@@ -1656,8 +1708,9 @@ mod tests {
         let facts = progress_facts(&status("gpu-driver"), &index, last + 2000);
         assert_eq!(get(&facts, "Stage").unwrap().value, "Waiting for the restore system to boot");
         assert_eq!(get(&facts, "VM says").unwrap().value, "VM boot ROM");
-        assert_eq!(get(&facts, "Sent over USB").unwrap().value, "8 MiB, 1.1 MiB/s");
-        assert_eq!(get(&facts, "Sending").unwrap().value, "RestoreRamDisk, 222 MiB");
+        // The upload belonged to the stage before: it is not shown as what is happening now.
+        assert_eq!(get(&facts, "Sent over USB"), None);
+        assert_eq!(get(&facts, "Sending"), None);
         assert_eq!(get(&facts, "Last log line").unwrap().value, "2 s ago");
         assert!(!get(&facts, "Last log line").unwrap().warn);
         let quiet = progress_facts(&status("gpu-driver"), &index, last + 400_000);
@@ -1690,7 +1743,7 @@ mod tests {
         let mut s = status("firmware");
         s.done_bytes = 5;
         s.total_bytes = mirror::STAGE_COUNT;
-        assert!(progress_facts(&s, &index, 1).iter().any(|f| f.label == "Restore stage" && f.value == "5 of 12"));
+        assert!(progress_facts(&s, &index, 1).iter().any(|f| f.label == "Restore stage" && f.value == "5 of 13"));
         s.done_bytes = 3 << 30;
         s.total_bytes = 12 << 30;
         s.bytes_per_sec = 32 << 20;
@@ -1740,7 +1793,34 @@ mod tests {
         s.steps = vec![step("patch", "done", 3700), step("restore", "running", 0), step("cfw", "pending", 0)];
         let times = step_times(&s, &index, 1);
         assert_eq!(times["patch"], "took 1 h 01 min");
-        assert_eq!(times["cfw"], "not started");
+        assert_eq!(times["cfw"], "not started \u{b7} no estimate yet");
         assert!(times["restore"].starts_with("running"));
+        s.steps[2].measured = true;
+        s.steps[2].est_secs = 1500;
+        s.step_started_ms = 1_000_000;
+        let times = step_times(&s, &index, 1_090_000);
+        assert_eq!(times["cfw"], "not started \u{b7} took 25 min 00 s last time on this phone");
+        assert_eq!(times["restore"], "running for 1 min 30 s \u{b7} no estimate yet");
+    }
+
+    /// The log of a real restore on the phone, at the point the screen showed "Installing the boot
+    /// files", the VM's kernel "mounting its root" and "Sending: SystemVolume" during the write.
+    #[test]
+    fn during_the_image_write_the_facts_are_about_the_image_write() {
+        let d = fixture("write-facts");
+        let log = d.join("s.log");
+        write(&log, "▶ restore (7/9)\nSending RestoreRamDisk (232789583 bytes)...\n[usb] vusbd: sent 222 MiB in 60.0 s\nWaiting for device to enter restore mode...\n[guest] Darwin Kernel Version 25.4.0\n[guest] BSD root: md0, major 2, minor 0\nDevice 0000FE01 has successfully entered restore mode\nCreating partition map (11)\nValidating the filesystem\nSending filesystem now...\nRestoring image (13)\nFlashing firmware (18)\nAbout to send Ap,SecurePageTableMonitor...\nSending Ap,SecurePageTableMonitor now (115812 bytes)...\nDone sending Ap,SecurePageTableMonitor\nAbout to send SystemVolume...\nSending SystemVolume now (5911 bytes)...\nDone sending SystemVolume\nRestoring image (13)\n[guest] ASR RESTORE PROGRESS: 7%\n");
+        let mut index = LogIndex::new(&log);
+        index.refresh(Duration::from_secs(1));
+        let mut s = status("restore");
+        s.step_started_ms = 5_000;
+        let facts = progress_facts(&s, &index, 65_000);
+        let get = |label: &str| facts.iter().find(|f| f.label == label).map(|f| f.value.clone());
+        assert_eq!(get("Stage").as_deref(), Some("Writing iOS to the disk"));
+        assert_eq!(get("VM says"), None, "the kernel mounted its root four stages ago");
+        assert_eq!(get("Sending"), None, "that file was sent and acknowledged");
+        assert_eq!(get("Sent over USB"), None);
+        assert_eq!(get("Latest step").as_deref(), Some("Restoring image"));
+        assert_eq!(get("This attempt").as_deref(), Some("1 min 00 s"));
     }
 }

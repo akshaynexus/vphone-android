@@ -361,7 +361,8 @@ fn busy_list(rows: &[(Thread, f64)]) -> String {
 
 /// Starts the monitor: `log` keeps the history, `now` the latest list, for the app to read.
 pub fn spawn(log: PathBuf, now: PathBuf, files: PathBuf) {
-    let Ok(mut out) = File::create(&log) else {
+    // Appending, as the performance-hint line is written to this file from another handle.
+    let Ok(mut out) = File::create(&log).and_then(|_| fs::OpenOptions::new().append(true).open(&log)) else {
         return;
     };
     CRASH_FD.store(out.as_raw_fd(), Ordering::SeqCst);

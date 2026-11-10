@@ -4704,15 +4704,21 @@ dependencies = [
 name = "vphone-create-steps"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "apple-codesign",
  "base64 0.22.1",
+ "ctr",
  "flate2",
  "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
  "image",
  "libc",
  "log",
+ "lzfse_rust",
  "plist",
  "rand 0.8.8",
+ "rayon",
  "russh",
  "russh-sftp",
  "serde",
@@ -4724,6 +4730,7 @@ dependencies = [
  "tokio",
  "ureq 2.12.1",
  "vphone-apfs",
+ "vusb-common",
  "vusb-portfwd",
  "zip",
 ]
@@ -4741,6 +4748,10 @@ dependencies = [
  "ureq 3.5.1",
  "vphone-create-steps",
 ]
+
+[[package]]
+name = "vusb-common"
+version = "0.1.0"
 
 [[package]]
 name = "vusb-portfwd"

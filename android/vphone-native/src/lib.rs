@@ -14,7 +14,6 @@ pub mod qmp;
 pub mod runtime;
 pub mod vphoned;
 
-#[cfg(target_os = "android")]
 mod adpf;
 #[cfg(target_os = "android")]
 mod jni_api;

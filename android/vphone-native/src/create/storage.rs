@@ -42,6 +42,8 @@ const TRASH_DIR: &str = ".storage-trash";
 const TEMP_VM_PREFIX: &str = "gpu-recovery-";
 const RUNS_PREFIX: &str = ".runs-";
 const GPU_EXTRACT: &str = ".gpu-driver-extract";
+/// The decrypted cloudOS system image the GPU driver is read from; left only by a killed run.
+const GPU_IMAGE: &str = ".gpu-driver-system.img";
 const RELEASE_DIR: &str = "release";
 /// A download's own files, listed with the image they belong to.
 const DOWNLOAD_SUFFIXES: &[&str] = &[".part.ok", ".part.tmp", ".part", ".meta"];
@@ -907,6 +909,7 @@ fn firmware_items(ctx: &Ctx, live: &Live) -> Vec<FirmwareItem> {
         let whole = cache.join(&name);
         let part = cache.join(format!("{name}.part"));
         let unfinished_tree = name == GPU_EXTRACT
+            || name == GPU_IMAGE
             || (name == RELEASE_DIR && whole.is_dir() && !whole.join(".unpacked").exists());
         let partial = (part.exists() && !whole.is_file()) || unfinished_tree;
         let mut notes = Vec::new();
