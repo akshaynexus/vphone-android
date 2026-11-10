@@ -310,6 +310,10 @@ class MainActivity : Activity() {
             text = "Performance hints"
             isChecked = config.getBoolean("performanceHints")
         }
+        val display = CheckBox(this).apply {
+            text = "Show the screen (off: iOS runs with nothing drawn)"
+            isChecked = config.optBoolean("display", true)
+        }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 0)
@@ -318,6 +322,7 @@ class MainActivity : Activity() {
         labelled(form, "RAM (MiB)", ram)
         labelled(form, "Code cache (MiB)", tb)
         form.addView(hints)
+        form.addView(display)
         AlertDialog.Builder(this)
             .setTitle(name)
             .setView(form)
@@ -327,6 +332,7 @@ class MainActivity : Activity() {
                     .put("ramMib", ram.text.toString().toIntOrNull() ?: 0)
                     .put("tbMib", tb.text.toString().toIntOrNull() ?: 0)
                     .put("performanceHints", hints.isChecked)
+                    .put("display", display.isChecked)
                 val error = Native.saveVmConfig(name, saved.toString())
                 if (error.isNotEmpty()) Toast.makeText(this, error, Toast.LENGTH_LONG).show()
                 showVms()

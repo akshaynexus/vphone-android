@@ -91,7 +91,14 @@ pub fn build(b: &Bundle, cfg: &VmConfig, paths: &Paths) -> Launch {
         ("QEMU_TLB_UNSYNCED", "2".to_string()),
         ("VPHONE_XHCI_NONREMOVABLE", "0x1fe".to_string()),
     ];
-    env.extend(gfx_env(paths));
+    env.extend(gfx_env(paths).into_iter().map(|(key, value)| {
+        // Without the screen the GPU device is the same and draws nowhere.
+        if key == "REIMS_VGPU_WINDOW" && !cfg.display {
+            (key, "0".to_string())
+        } else {
+            (key, value)
+        }
+    }));
     env.extend([
         ("TMPDIR", dir(paths.cache.join("tmp"))),
         ("HOME", dir(paths.files.join("home"))),
@@ -159,6 +166,7 @@ mod tests {
             ram_mib: 4096,
             tb_mib: 1024,
             performance_hints: false,
+            display: true,
         }
     }
 
@@ -188,6 +196,19 @@ mod tests {
         assert!(line.contains("-qmp unix:/data/files/qmp.sock,server=on,wait=off"));
         assert!(l.env.contains(&("QEMU_TLB_UNSYNCED", "2".to_string())));
         assert!(l.env.contains(&("REIMS_VGPU_WINDOW", "1".to_string())));
+    }
+
+    #[test]
+    fn a_vm_with_its_screen_off_draws_nowhere() {
+        let dir = fixture("no-screen");
+        let bundle = Bundle::open(&dir).unwrap();
+        let on = build(&bundle, &cfg(), &paths());
+        let off = build(&bundle, &VmConfig { display: false, ..cfg() }, &paths());
+        assert!(off.env.contains(&("REIMS_VGPU_WINDOW", "0".to_string())));
+        assert!(!off.env.contains(&("REIMS_VGPU_WINDOW", "1".to_string())));
+        // Nothing else differs: the GPU device and its memory are the same.
+        assert_eq!(on.args, off.args);
+        assert_eq!(on.env.len(), off.env.len());
     }
 
     #[test]

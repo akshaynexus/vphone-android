@@ -2019,18 +2019,21 @@ index 2171847691413350cce816dcb0f8b8082a518e7f..c5fb2407960c06be2478e02dfade5298
  static QemuThread io_thread;
  
 diff --git a/system/main.c b/system/main.c
-index a1782a8507d2b4b8799cf177120e2a9a96e554de..5dbfc59fbfb61693e0502c815c02c3046d9d9fc3 100644
+index a1782a8507d2b4b8799cf177120e2a9a96e554de..5ab54d8fdc6bdce484d91906d25477c23ee84428 100644
 --- a/system/main.c
 +++ b/system/main.c
-@@ -23,6 +23,7 @@
+@@ -23,8 +23,10 @@
   */
  
  #include "qemu/osdep.h"
 +#include "qemu/atomic.h"
  #include "qemu-main.h"
  #include "qemu/main-loop.h"
++#include "qemu/rcu.h"
  #include "system/replay.h"
-@@ -66,6 +67,32 @@ static int os_darwin_cfrunloop_main(void)
+ #include "system/system.h"
+ 
+@@ -66,6 +68,40 @@ static int os_darwin_cfrunloop_main(void)
  int (*qemu_main)(void) = os_darwin_cfrunloop_main;
  #endif
  
@@ -2051,19 +2054,27 @@ index a1782a8507d2b4b8799cf177120e2a9a96e554de..5dbfc59fbfb61693e0502c815c02c304
 +        return 1;
 +    }
 +
++    /*
++     * This thread is QEMU's main thread, and an RCU reader like any other
++     * that runs device and memory code: rcu_init() did not register the
++     * thread that loaded the library (util/rcu.c).
++     */
++    rcu_register_thread();
++
 +    /* qemu_init leaves the BQL and the replay mutex held for this thread. */
 +    qemu_init(argc, argv);
 +    status = qemu_main_loop();
 +    qemu_cleanup(status);
 +    bql_unlock();
 +    replay_mutex_unlock();
++    rcu_unregister_thread();
 +    return status;
 +}
 +#else
  int main(int argc, char **argv)
  {
      qemu_init(argc, argv);
-@@ -94,3 +121,4 @@ int main(int argc, char **argv)
+@@ -94,3 +130,4 @@ int main(int argc, char **argv)
          assert_not_reached();
      }
  }
@@ -4094,3 +4105,57 @@ index 22b4a77f16bba26e4cb90e92a64905b600e58eda..5d18826d162f84f35fe3d501ee1af0d2
      /* TODO avoid SIGBUS loss on macOS */
      pthread_sigmask(SIG_SETMASK, &set, &oldset);
  
+diff --git a/util/rcu.c b/util/rcu.c
+index b703c86f15a36fc95d5e34f1f8513bf8ede9c0d5..fbc350260947b20e6ac096db099c440e4d02bdeb 100644
+--- a/util/rcu.c
++++ b/util/rcu.c
+@@ -399,7 +399,12 @@ void rcu_remove_force_rcu_notifier(Notifier *n)
+     qemu_mutex_unlock(&rcu_registry_lock);
+ }
+ 
+-static void rcu_init_complete(void)
++/*
++ * @register_self: the calling thread is a reader for as long as the process
++ * lives. Its registration is a node in its thread-local storage, which the
++ * registry would keep pointing at after the thread ended.
++ */
++static void rcu_init_complete(bool register_self)
+ {
+     QemuThread thread;
+ 
+@@ -415,7 +420,9 @@ static void rcu_init_complete(void)
+     qemu_thread_create(&thread, "call_rcu", call_rcu_thread,
+                        NULL, QEMU_THREAD_DETACHED);
+ 
+-    rcu_register_thread();
++    if (register_self) {
++        rcu_register_thread();
++    }
+ }
+ 
+ static int atfork_depth = 1;
+@@ -458,7 +465,7 @@ static void rcu_init_child(void)
+     }
+ 
+     memset(&registry, 0, sizeof(registry));
+-    rcu_init_complete();
++    rcu_init_complete(true);
+ }
+ #endif
+ 
+@@ -468,5 +475,14 @@ static void __attribute__((__constructor__)) rcu_init(void)
+ #ifdef CONFIG_POSIX
+     pthread_atfork(rcu_init_lock, rcu_init_unlock, rcu_init_child);
+ #endif
+-    rcu_init_complete();
++#ifdef CONFIG_ANDROID
++    /*
++     * This runs on whichever of the app's threads loads the library, which is
++     * not the thread that runs QEMU and may end long before it does.
++     * qemu_android_main() registers the thread it is called on.
++     */
++    rcu_init_complete(false);
++#else
++    rcu_init_complete(true);
++#endif
+ }

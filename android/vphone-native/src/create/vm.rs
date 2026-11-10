@@ -872,6 +872,7 @@ mod tests {
             ram_mib: 6144,
             tb_mib: 1024,
             performance_hints: false,
+            display: true,
         }
     }
 

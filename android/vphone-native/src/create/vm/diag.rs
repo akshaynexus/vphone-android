@@ -23,6 +23,34 @@ static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
 static STACK_TID: AtomicI32 = AtomicI32::new(0);
 static STACK_DONE: AtomicBool = AtomicBool::new(false);
 static STACK_LEN: AtomicUsize = AtomicUsize::new(0);
+/// The sampled thread's stack, `[low, high)`, for the frame walk; 0 when it was not found.
+static STACK_LOW: AtomicUsize = AtomicUsize::new(0);
+static STACK_HIGH: AtomicUsize = AtomicUsize::new(0);
+
+/// A thread's writable stack: bionic names each thread's mapping `stack_and_tls:<tid>`, and the
+/// process's first thread has `[stack]`.
+fn thread_stack(tid: i32) -> Option<(usize, usize)> {
+    stack_in_maps(&fs::read_to_string("/proc/self/maps").ok()?, tid)
+}
+
+fn stack_in_maps(maps: &str, tid: i32) -> Option<(usize, usize)> {
+    let name = format!("[anon:stack_and_tls:{tid}]");
+    // SAFETY: getpid has no preconditions.
+    let main = tid == unsafe { libc::getpid() };
+    maps.lines().find_map(|l| {
+        let mut f = l.split_ascii_whitespace();
+        let range = f.next()?;
+        if !f.next()?.starts_with("rw") {
+            return None;
+        }
+        let path = l.split_ascii_whitespace().nth(5).unwrap_or("");
+        if path != name && !(main && path == "[stack]") {
+            return None;
+        }
+        let (a, b) = range.split_once('-')?;
+        Some((usize::from_str_radix(a, 16).ok()?, usize::from_str_radix(b, 16).ok()?))
+    })
+}
 static mut STACK: [usize; FRAMES] = [0; FRAMES];
 
 #[derive(Clone)]
@@ -118,6 +146,7 @@ impl Line {
 struct Registers {
     pc: u64,
     lr: u64,
+    fp: u64,
     x8: u64,
     x: [u64; 4],
 }
@@ -155,14 +184,14 @@ mod stack {
     #[cfg(target_arch = "aarch64")]
     unsafe fn registers(context: *const libc::ucontext_t) -> Registers {
         let m = &(*context).uc_mcontext;
-        Registers { pc: m.pc, lr: m.regs[30], x8: m.regs[8], x: [m.regs[0], m.regs[1], m.regs[2], m.regs[3]] }
+        Registers { pc: m.pc, lr: m.regs[30], fp: m.regs[29], x8: m.regs[8], x: [m.regs[0], m.regs[1], m.regs[2], m.regs[3]] }
     }
 
     #[cfg(target_arch = "x86_64")]
     unsafe fn registers(context: *const libc::ucontext_t) -> Registers {
         let g = &(*context).uc_mcontext.gregs;
         let at = |i: i32| g[i as usize] as u64;
-        Registers { pc: at(libc::REG_RIP), lr: 0, x8: at(libc::REG_R8), x: [at(libc::REG_RDI), at(libc::REG_RSI), at(libc::REG_RDX), at(libc::REG_RCX)] }
+        Registers { pc: at(libc::REG_RIP), lr: 0, fp: 0, x8: at(libc::REG_R8), x: [at(libc::REG_RDI), at(libc::REG_RSI), at(libc::REG_RDX), at(libc::REG_RCX)] }
     }
 
     /// SIGSYS sent by this monitor (`tgkill`) asks for a stack: QEMU's threads block every signal
@@ -174,15 +203,89 @@ mod stack {
             // SAFETY: gettid has no preconditions.
             if unsafe { libc::gettid() } == STACK_TID.load(Ordering::SeqCst) {
                 STACK_LEN.store(0, Ordering::SeqCst);
-                // Only the registers. libunwind authenticates the return addresses it reads, and
-                // one that fails on a live thread is a SIGILL that ends the VM.
+                // Not libunwind: it authenticates the return addresses it reads, and one that
+                // fails on a live thread is a SIGILL that ends the VM. The registers, then the
+                // frame records, read only inside the thread's own stack.
                 push(r.pc as usize);
                 push(strip_pac(r.lr) as usize);
+                walk_frames(r.fp);
                 STACK_DONE.store(true, Ordering::SeqCst);
             }
             return;
         }
+        if APP_ONLY.load(Ordering::SeqCst) {
+            // In the app's process the crash signals stay Android's; a SIGSYS that is not a
+            // sample (seccomp's) goes where it went before.
+            // SAFETY: the kernel's arguments, passed on unchanged.
+            unsafe { pass_on(signal, info, context) };
+            return;
+        }
         crash(signal, code, unsafe { (*info).si_addr() } as u64, &r);
+    }
+
+    /// The frame records from `fp` (x29) up: each is the caller's x29, then the return address.
+    /// Every read is checked against the sampled thread's stack, so a frame without a record
+    /// (a leaf, or JIT code) ends the walk instead of faulting.
+    fn walk_frames(mut fp: u64) {
+        let (low, high) = (STACK_LOW.load(Ordering::SeqCst) as u64, STACK_HIGH.load(Ordering::SeqCst) as u64);
+        if low == 0 {
+            return;
+        }
+        while fp >= low && fp % 16 == 0 && fp + 16 <= high {
+            // SAFETY: [fp, fp + 16) lies inside the thread's mapped, writable stack.
+            let (next, ret) = unsafe { (*(fp as *const u64), *((fp + 8) as *const u64)) };
+            if ret == 0 || !push(strip_pac(ret) as usize) || next <= fp {
+                break;
+            }
+            fp = next;
+        }
+    }
+
+    static APP_ONLY: AtomicBool = AtomicBool::new(false);
+    static mut PREVIOUS: Option<libc::sigaction> = None;
+
+    /// The handler SIGSYS had before [`install_sampler`].
+    unsafe fn pass_on(signal: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
+        // SAFETY: written once, before the handler that reads it was installed.
+        let previous = unsafe { *std::ptr::addr_of!(PREVIOUS) };
+        match previous {
+            Some(old) if old.sa_flags & libc::SA_SIGINFO != 0 && old.sa_sigaction > 1 => {
+                let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
+                    // SAFETY: an SA_SIGINFO handler has this signature.
+                    unsafe { std::mem::transmute(old.sa_sigaction) };
+                f(signal, info, context);
+            }
+            Some(old) if old.sa_sigaction > 1 => {
+                // SAFETY: a plain handler has this signature.
+                let f: extern "C" fn(c_int) = unsafe { std::mem::transmute(old.sa_sigaction) };
+                f(signal);
+            }
+            _ => {
+                // SAFETY: restores the default action and re-raises.
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                }
+            }
+        }
+    }
+
+    /// Only the sampling signal, for the app's own process: ART owns the crash signals there.
+    pub fn install_sampler() -> c_int {
+        // SAFETY: sigaction with a zeroed, then filled, struct; PREVIOUS is written before the
+        // handler that reads it can run.
+        unsafe {
+            APP_ONLY.store(true, Ordering::SeqCst);
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGSYS, std::ptr::null(), &mut old);
+            *std::ptr::addr_of_mut!(PREVIOUS) = Some(old);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART | libc::SA_ONSTACK;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut());
+            libc::SIGSYS
+        }
     }
 
     /// The header goes out first and needs nothing but this stack, so a process too damaged for
@@ -263,6 +366,9 @@ mod stack {
     }
 
     pub fn capture(signal: c_int, tid: i32) -> Vec<usize> {
+        let (low, high) = thread_stack(tid).unwrap_or((0, 0));
+        STACK_LOW.store(low, Ordering::SeqCst);
+        STACK_HIGH.store(high, Ordering::SeqCst);
         STACK_DONE.store(false, Ordering::SeqCst);
         STACK_TID.store(tid, Ordering::SeqCst);
         // SAFETY: tgkill to a thread of this process.
@@ -392,6 +498,18 @@ fn busy_list(rows: &[(Thread, f64)]) -> String {
     out.join(", ")
 }
 
+/// Whose stacks to read: the busiest `threads` of `busy`, then each of `all` named in `always`
+/// that is not among them, at 0%.
+fn stack_targets(busy: &[(Thread, f64)], all: &[Thread], threads: usize, always: &[&str]) -> Vec<(Thread, f64)> {
+    let mut out: Vec<(Thread, f64)> = busy.iter().take(threads).cloned().collect();
+    for t in all.iter().filter(|t| always.contains(&t.name.as_str())) {
+        if !out.iter().any(|(o, _)| o.tid == t.tid) {
+            out.push((t.clone(), 0.0));
+        }
+    }
+    out
+}
+
 /// CPU use per thread since the last sample, with the process's memory and mappings. Reads only
 /// `/proc`, so it can run in the app's own process, where the crash handler of [`spawn`] must not
 /// go (ART handles SIGSEGV itself).
@@ -401,13 +519,27 @@ pub struct Sampler {
     files: PathBuf,
     last: Vec<Thread>,
     at: Instant,
+    /// The threads [`Sampler::line`] found busy, for [`Sampler::stacks`].
+    busy: Vec<(Thread, f64)>,
+    /// The sampling signal, once [`Sampler::with_stacks`] installed its handler.
+    signal: Option<std::os::raw::c_int>,
 }
 
 impl Sampler {
     pub fn new(files: PathBuf) -> Sampler {
         // SAFETY: sysconf has no preconditions.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
-        Sampler { hz, limit: max_map_count(), files, last: threads(), at: Instant::now() }
+        Sampler { hz, limit: max_map_count(), files, last: threads(), at: Instant::now(), busy: Vec::new(), signal: None }
+    }
+
+    /// Also able to read busy threads' stacks: installs a handler for the sampling signal only,
+    /// which is safe beside ART (the crash signals stay Android's).
+    pub fn with_stacks(mut self) -> Sampler {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.signal = Some(stack::install_sampler());
+        }
+        self
     }
 
     /// The busy threads, busiest first, with their share of a core since the last call.
@@ -432,7 +564,35 @@ impl Sampler {
         let rows = self.rows();
         let total: f64 = rows.iter().map(|r| r.1).sum();
         let shown: Vec<(Thread, f64)> = rows.into_iter().take(top).collect();
+        self.busy = shown.iter().filter(|(_, p)| *p >= BUSY_PERCENT).cloned().collect();
         format!("{} total {:.0}%: {}", resources(&self.files, self.limit), total, busy_list(&shown))
+    }
+
+    /// `stack qemu-rcu (tid 123, 100%): libqemu-vphone.so+0x1a2b < ...` for the busiest `threads`
+    /// of the last [`Sampler::line`], and for every thread named in `always` however idle: the
+    /// pc, the return address and the frame records above.
+    pub fn stacks(&self, threads: usize, always: &[&str]) -> Vec<String> {
+        let Some(_signal) = self.signal else {
+            return Vec::new();
+        };
+        let _targets = stack_targets(&self.busy, &self.last, threads, always);
+        #[cfg(not(target_arch = "aarch64"))]
+        return Vec::new();
+        #[cfg(target_arch = "aarch64")]
+        {
+            let maps = read_maps();
+            _targets
+                .iter()
+                .map(|(t, p)| {
+                    let frames: Vec<String> = stack::capture(_signal, t.tid).iter().map(|pc| symbol(&maps, *pc)).collect();
+                    if frames.is_empty() {
+                        format!("stack {} (tid {}, {:.0}%): could not be read", t.name, t.tid, p)
+                    } else {
+                        format!("stack {} (tid {}, {:.0}%): {}", t.name, t.tid, p, frames.join(" < "))
+                    }
+                })
+                .collect()
+        }
     }
 }
 
@@ -494,6 +654,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finds_a_thread_s_writable_stack_by_its_bionic_name() {
+        let maps = "\
+7000000000-7000001000 ---p 00000000 00:00 0                              [anon:stack_and_tls:4321]
+7000001000-7000101000 rw-p 00000000 00:00 0                              [anon:stack_and_tls:4321]
+7000101000-7000201000 rw-p 00000000 00:00 0                              [anon:stack_and_tls:43210]";
+        assert_eq!(stack_in_maps(maps, 4321), Some((0x7000001000, 0x7000101000)));
+        assert_eq!(stack_in_maps(maps, 999), None);
+    }
+
+    #[test]
+    fn stacks_are_read_of_the_busiest_threads_and_of_the_ones_asked_for_by_name() {
+        let t = |tid, name: &str| Thread { tid, name: name.into(), state: 'S', ticks: 0 };
+        let all = [t(1, "main"), t(2, "qemu-main"), t(3, "qemu-rcu"), t(4, "CPU 0/TCG"), t(5, "CPU 1/TCG")];
+        let busy = [(t(3, "qemu-rcu"), 100.0), (t(4, "CPU 0/TCG"), 60.0), (t(5, "CPU 1/TCG"), 50.0)];
+        let names = |v: Vec<(Thread, f64)>| v.into_iter().map(|(t, p)| (t.tid, p as u32)).collect::<Vec<_>>();
+        assert_eq!(names(stack_targets(&busy, &all, 2, &[])), [(3, 100), (4, 60)]);
+        // A blocked main loop is read too, and a thread already listed is listed once.
+        assert_eq!(names(stack_targets(&busy, &all, 2, &["qemu-main", "qemu-rcu"])), [(3, 100), (4, 60), (2, 0)]);
+        assert_eq!(names(stack_targets(&[], &all, 2, &["qemu-main"])), [(2, 0)]);
+        assert!(stack_targets(&[], &all, 2, &["absent"]).is_empty());
+    }
+
+    #[test]
     fn reads_a_thread_s_state_and_cpu_past_a_name_with_spaces() {
         let stat = "123 (CPU 0/TCG) R 1 2 3 4 5 6 7 8 9 10 700 300 14 15";
         assert_eq!(parse_stat(stat), Some(('R', 1000)));
@@ -510,7 +693,7 @@ mod tests {
     #[test]
     fn a_crash_header_needs_only_its_buffer_and_keeps_the_format_shown() {
         let mut out = Line::new();
-        let r = Registers { pc: 0x1234, lr: 0xabc, x8: 0xdd, x: [0, 1, 2, u64::MAX] };
+        let r = Registers { pc: 0x1234, lr: 0xabc, fp: 0, x8: 0xdd, x: [0, 1, 2, u64::MAX] };
         crash_header(&mut out, "SIGSEGV", -6, b"CPU 0/TCG", 77, 0x10, &r);
         assert_eq!(
             String::from_utf8_lossy(out.bytes()),

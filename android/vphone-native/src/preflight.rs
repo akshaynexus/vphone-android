@@ -94,6 +94,7 @@ mod tests {
             ram_mib: 4096,
             tb_mib: 1024,
             performance_hints: true,
+            display: true,
         };
         let mut r = Report::default();
         check_memory(

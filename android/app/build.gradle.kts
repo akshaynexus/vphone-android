@@ -10,8 +10,8 @@ android {
         applicationId = "com.vphone.android"
         minSdk = 35
         targetSdk = 37
-        versionCode = 26
-        versionName = "0.5.4"
+        versionCode = 27
+        versionName = "0.5.5"
         ndk {
             abiFilters += "arm64-v8a"
         }

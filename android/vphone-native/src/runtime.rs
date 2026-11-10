@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 const TAG: &str = "vphone";
 const QEMU_STACK: usize = 64 << 20;
+/// The thread QEMU's main loop runs on.
+const QEMU_THREAD: &str = "qemu-main";
 /// Longer than start-vm.sh's 15 minutes: a phone's cores run TCG several times slower.
 const HEALTH_ATTEMPTS: u32 = 240;
 const LOG_LIMIT: u64 = 64 << 20;
@@ -232,12 +234,31 @@ fn dlsym(handle: *mut c_void, name: &CStr) -> Result<*mut c_void, String> {
     Ok(sym)
 }
 
+/// What the thread QEMU makes as its library loads is called: its `call_rcu` thread, which frees
+/// what the others have stopped using. QEMU names no thread that early, so it takes the name of
+/// the thread that loads the library.
+pub(crate) const LOADER_NAME: &CStr = c"qemu-rcu";
+
+/// [`dlopen`] with the calling thread named `name` for as long as the library's constructors run.
+fn dlopen_as(name: &CStr, path: &Path) -> Result<*mut c_void, String> {
+    let mut own = [0u8; 16];
+    // SAFETY: PR_GET_NAME writes at most 16 bytes; PR_SET_NAME reads a NUL-terminated string.
+    unsafe {
+        libc::prctl(libc::PR_GET_NAME, own.as_mut_ptr());
+        libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+    }
+    let handle = dlopen(path);
+    // SAFETY: `own` is the NUL-terminated name read above.
+    unsafe { libc::prctl(libc::PR_SET_NAME, own.as_ptr()) };
+    handle
+}
+
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn load_qemu(paths: &Paths) -> Result<&'static Qemu, String> {
     if let Some(q) = QEMU.get() {
         return Ok(q);
     }
-    let h = dlopen(&paths.lib("libqemu-vphone.so"))?;
+    let h = dlopen_as(LOADER_NAME, &paths.lib("libqemu-vphone.so"))?;
     // SAFETY: these symbols have the signatures of the app's shared contract with libqemu-vphone.
     let q = unsafe {
         Qemu {
@@ -416,6 +437,9 @@ fn start(name: &str) -> Result<(), String> {
     for w in report.warnings {
         notice(w);
     }
+    if !cfg.display {
+        notice("This VM's screen is off in its settings: iOS runs, and nothing is drawn".into());
+    }
 
     let Launch { args, env } = launcher::build(&bundle, &cfg, paths);
     log_line(&format!("starting QEMU: {}", args.join(" ")));
@@ -450,7 +474,7 @@ fn start(name: &str) -> Result<(), String> {
     let run_name = name.to_string();
     let run_log = log_path;
     std::thread::Builder::new()
-        .name("qemu-main".into())
+        .name(QEMU_THREAD.into())
         .stack_size(QEMU_STACK)
         .spawn(move || {
             let code = run_qemu(qemu, args);
@@ -523,13 +547,16 @@ const STATUS_EVERY: Duration = Duration::from_secs(30);
 /// (EL1), one running its daemons (EL0), or one that has stopped moving.
 fn status_lines(vcpus: u32) {
     let paths = Paths::get();
-    let mut sampler = crate::create::vm::diag::Sampler::new(paths.files.clone());
+    let mut sampler = crate::create::vm::diag::Sampler::new(paths.files.clone()).with_stacks();
+    let mut tick = 0u32;
     let mut last: Vec<qmp::Vcpu> = Vec::new();
     let mut still = 0u32;
     while sleep_until_done(STATUS_EVERY) {
         let s = state();
         let elapsed = crate::create::state::now_ms().saturating_sub(s.started_ms) / 1000;
-        let guest = match qmp::sample_vcpus(&paths.qmp_socket(), vcpus) {
+        let sample = qmp::sample_vcpus(&paths.qmp_socket(), vcpus);
+        let answered = sample.is_ok();
+        let guest = match sample {
             Ok(now) => {
                 still = if !now.is_empty() && now == last { still + 1 } else { 0 };
                 let text = guest_summary(&now, still, STATUS_EVERY);
@@ -546,6 +573,16 @@ fn status_lines(vcpus: u32) {
             format!("{:?}", s.phase).to_lowercase(),
             sampler.line(4),
         ));
+        // A boot that is not moving says where it is stuck: the first minutes, then every few.
+        // QEMU's main loop not answering is a boot not moving whatever the CPU use, so its
+        // thread's stack and the reclaimer's are read even when they are blocked.
+        tick += 1;
+        if tick <= 4 || tick % 4 == 0 {
+            let stuck: &[&str] = if answered { &[] } else { &[QEMU_THREAD, LOADER_NAME.to_str().unwrap_or("")] };
+            for line in sampler.stacks(2, stuck) {
+                log_line(&line);
+            }
+        }
     }
 }
 
@@ -811,6 +848,28 @@ mod tests {
         assert_eq!(text, "guest cpu0 EL1 0xfffffe0007a1b2c0, cpu1 EL0 0x1a2b (1 of 2 in user space)");
         assert!(guest_summary(&[v(0, 1, 4)], 2, STATUS_EVERY).ends_with("no vCPU has moved in 60 s"));
         assert_eq!(guest_summary(&[], 0, STATUS_EVERY), "guest: no vCPU registers");
+    }
+
+    /// The loading thread lends its name only while the library loads, and gets it back even
+    /// when the library is not there.
+    #[test]
+    fn the_loader_keeps_its_own_name() {
+        let name = || {
+            let mut buf = [0u8; 16];
+            // SAFETY: PR_GET_NAME writes at most 16 bytes.
+            unsafe { libc::prctl(libc::PR_GET_NAME, buf.as_mut_ptr()) };
+            CStr::from_bytes_until_nul(&buf).unwrap().to_owned()
+        };
+        std::thread::Builder::new()
+            .name("vm-boot".into())
+            .spawn(move || {
+                assert!(dlopen_as(LOADER_NAME, Path::new("/nonexistent/libqemu-vphone.so")).is_err());
+                assert_eq!(name().as_c_str(), c"vm-boot");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(LOADER_NAME.to_bytes().len() < 16);
     }
 
     #[test]

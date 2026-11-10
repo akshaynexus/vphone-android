@@ -18,6 +18,9 @@ pub struct VmConfig {
     pub tb_mib: u32,
     /// Report the vCPU threads' load to the system's Performance Hint service.
     pub performance_hints: bool,
+    /// Draw the guest's screen in the app's window. Off, the GPU device still runs and draws
+    /// nowhere (`REIMS_VGPU_WINDOW=0`), as a setup boot with its display off does.
+    pub display: bool,
 }
 
 impl Default for VmConfig {
@@ -43,6 +46,7 @@ impl VmConfig {
             ram_mib,
             tb_mib,
             performance_hints: true,
+            display: true,
         }
     }
 
@@ -105,9 +109,21 @@ mod tests {
             ram_mib: 4096,
             tb_mib: 1024,
             performance_hints: true,
+            display: true,
         };
         assert!(c.validate(8, 11000).is_err());
         assert_eq!(VmConfig { vcpus: 6, ..c }.ram_arg(), "4G");
         assert_eq!(VmConfig { ram_mib: 5000, ..c }.ram_arg(), "5000M");
+    }
+
+    /// Settings saved before the screen had a switch keep their screen.
+    #[test]
+    fn a_file_without_the_screen_setting_shows_the_screen() {
+        let old: VmConfig = serde_json::from_str(r#"{"vcpus":4,"ramMib":4096,"tbMib":512,"performanceHints":false}"#).unwrap();
+        assert!(old.display);
+        assert_eq!((old.vcpus, old.performance_hints), (4, false));
+        let off: VmConfig = serde_json::from_str(r#"{"display":false}"#).unwrap();
+        assert!(!off.display);
+        assert!(serde_json::to_string(&off).unwrap().contains(r#""display":false"#));
     }
 }
